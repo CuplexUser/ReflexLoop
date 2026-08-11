@@ -83,7 +83,19 @@ CREATE TABLE IF NOT EXISTS runs (
   duration_ms INTEGER,
   started_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  occurred_at TEXT NOT NULL
+);
 `;
+
+// How many recent activity-feed events to keep around -- this is a live
+// narration log for the dashboard, not an audit trail (that's actions/runs),
+// so it's fine to trim it rather than grow it forever.
+const EVENTS_KEEP = 500;
 
 const now = () => new Date().toISOString();
 
@@ -340,6 +352,25 @@ export class MemoryStore {
   totalRunCost(): number {
     const row = this.db.prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS total FROM runs`).get() as { total: number };
     return row.total;
+  }
+
+  // ---- events (persisted activity feed, so a page reload doesn't lose it) --
+
+  logEvent(type: string, payload: unknown): { id: number; occurredAt: string } {
+    const occurredAt = now();
+    const result = this.db
+      .prepare(`INSERT INTO events (type, payload, occurred_at) VALUES (?, ?, ?)`)
+      .run(type, safeJson(payload), occurredAt);
+    const id = Number(result.lastInsertRowid);
+    this.db.prepare(`DELETE FROM events WHERE id <= ?`).run(id - EVENTS_KEEP);
+    return { id, occurredAt };
+  }
+
+  listRecentEvents(limit = EVENTS_KEEP) {
+    const rows = this.db
+      .prepare(`SELECT id, payload, occurred_at FROM events ORDER BY id DESC LIMIT ?`)
+      .all(limit) as { id: number; payload: string; occurred_at: string }[];
+    return rows.reverse().map((r) => ({ id: r.id, occurredAt: r.occurred_at, event: JSON.parse(r.payload) as unknown }));
   }
 }
 

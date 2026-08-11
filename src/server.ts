@@ -65,6 +65,10 @@ export function startServer(store: MemoryStore, domains: string[], port: number)
     res.json(store.listRuns());
   });
 
+  app.get("/api/events", (_req, res) => {
+    res.json(store.listRecentEvents());
+  });
+
   // Serve the built frontend, if present (npm run build in web/). In dev,
   // the Vite dev server (with a proxy to this port) serves the UI instead.
   const distDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "web", "dist");
@@ -77,7 +81,8 @@ export function startServer(store: MemoryStore, domains: string[], port: number)
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
   onAgentEvent((event: AgentEvent) => {
-    const payload = JSON.stringify(event);
+    const { id, occurredAt } = store.logEvent(event.type, event);
+    const payload = JSON.stringify({ id, occurredAt, event });
     for (const client of wss.clients) {
       if (client.readyState === WebSocket.OPEN) client.send(payload);
     }

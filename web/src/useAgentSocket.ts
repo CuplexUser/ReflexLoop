@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useRef } from 'react'
-import type { AgentEvent, FeedEntry, ProposalRow } from './types'
+import type { AgentEvent, FeedEntry, PersistedEvent, ProposalRow } from './types'
+import { api } from './api'
 
 const FEED_LIMIT = 400
 
@@ -7,6 +8,8 @@ interface SocketState {
   connection: 'connecting' | 'open' | 'closed'
   domains: string[]
   feed: FeedEntry[]
+  /** Server-assigned event ids already folded into `feed` -- de-dupes the REST history fetch against whatever already arrived live over the socket. */
+  seenIds: Set<number>
   /** Proposals currently awaiting a decision -- several can be pending review at once. */
   pendingProposals: ProposalRow[]
   runningPhase: { phase: string; proposalId: number | null } | null
@@ -22,20 +25,18 @@ const HISTORY_CHANGING_EVENTS = new Set<AgentEvent['type']>([
   'phase_done',
 ])
 
-type Action = { type: 'connection'; connection: SocketState['connection'] } | { type: 'event'; event: AgentEvent }
+type Action =
+  | { type: 'connection'; connection: SocketState['connection'] }
+  | { type: 'event'; id: number; occurredAt: string; event: AgentEvent }
+  | { type: 'seed'; entries: PersistedEvent[] }
 
-let seq = 0
+function toFeedEntry(id: number, occurredAt: string, event: AgentEvent): FeedEntry {
+  return { key: `e${id}`, at: new Date(occurredAt).getTime(), event }
+}
 
-function reducer(state: SocketState, action: Action): SocketState {
-  if (action.type === 'connection') {
-    return { ...state, connection: action.connection }
-  }
-
-  const event = action.event
-  const feed: FeedEntry[] = [...state.feed, { key: `e${seq++}`, at: Date.now(), event }].slice(-FEED_LIMIT)
+function applyEvent(state: SocketState, event: AgentEvent): SocketState {
   const next: SocketState = {
     ...state,
-    feed,
     historyVersion: HISTORY_CHANGING_EVENTS.has(event.type) ? state.historyVersion + 1 : state.historyVersion,
   }
 
@@ -63,16 +64,50 @@ function reducer(state: SocketState, action: Action): SocketState {
   }
 }
 
+function reducer(state: SocketState, action: Action): SocketState {
+  if (action.type === 'connection') {
+    return { ...state, connection: action.connection }
+  }
+
+  if (action.type === 'seed') {
+    // Older-than-anything-seen-live only: any event the socket already
+    // delivered has a higher id than what a REST snapshot taken around the
+    // same time can contain, so prepending here keeps chronological order.
+    const fresh = action.entries.filter((e) => !state.seenIds.has(e.id))
+    if (fresh.length === 0) return state
+    const seenIds = new Set(state.seenIds)
+    for (const e of fresh) seenIds.add(e.id)
+    const feed = [...fresh.map((e) => toFeedEntry(e.id, e.occurredAt, e.event)), ...state.feed].slice(-FEED_LIMIT)
+    return fresh.reduce((s, e) => applyEvent(s, e.event), { ...state, feed, seenIds })
+  }
+
+  if (state.seenIds.has(action.id)) return state // already folded in via the REST seed
+  const seenIds = new Set(state.seenIds)
+  seenIds.add(action.id)
+  const feed: FeedEntry[] = [...state.feed, toFeedEntry(action.id, action.occurredAt, action.event)].slice(-FEED_LIMIT)
+  return applyEvent({ ...state, feed, seenIds }, action.event)
+}
+
 export function useAgentSocket() {
   const [state, dispatch] = useReducer(reducer, {
     connection: 'connecting',
     domains: [],
     feed: [],
+    seenIds: new Set<number>(),
     pendingProposals: [],
     runningPhase: null,
     historyVersion: 0,
   })
   const retryDelay = useRef(1000)
+
+  useEffect(() => {
+    api
+      .events()
+      .then((entries) => dispatch({ type: 'seed', entries }))
+      .catch(() => {
+        // transient during a backend restart; live events still arrive over the socket
+      })
+  }, [])
 
   useEffect(() => {
     let socket: WebSocket
@@ -90,7 +125,8 @@ export function useAgentSocket() {
       }
       socket.onmessage = (msg) => {
         try {
-          dispatch({ type: 'event', event: JSON.parse(msg.data) as AgentEvent })
+          const { id, occurredAt, event } = JSON.parse(msg.data) as { id: number; occurredAt: string; event: AgentEvent }
+          dispatch({ type: 'event', id, occurredAt, event })
         } catch {
           // ignore malformed frames
         }

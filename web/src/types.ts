@@ -89,3 +89,10 @@ export interface FeedEntry {
   at: number
   event: AgentEvent
 }
+
+/** An event as persisted server-side and returned by GET /api/events. */
+export interface PersistedEvent {
+  id: number
+  occurredAt: string
+  event: AgentEvent
+}

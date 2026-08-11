@@ -5,9 +5,15 @@
 // Deliberately fails soft: with no VOYAGE_API_KEY set, or on any request
 // error, embed() resolves to null rather than throwing, so callers can fall
 // back to the old LIKE-based search instead of breaking research/reflect.
+//
+// A key only authenticates against the endpoint it was issued for -- a key
+// from dashboard.voyageai.com works at api.voyageai.com; a MongoDB
+// Atlas-issued "Model API key" only works at ai.mongodb.com (same request/
+// response schema either way). VOYAGE_API_BASE_URL picks which one to call.
 
 const VOYAGE_MODEL = "voyage-3.5";
 const API_KEY = process.env.VOYAGE_API_KEY;
+const API_BASE_URL = process.env.VOYAGE_API_BASE_URL ?? "https://api.voyageai.com/v1";
 
 export const embeddingsAvailable = Boolean(API_KEY);
 
@@ -19,7 +25,7 @@ async function requestEmbeddings(texts: string[], inputType: "document" | "query
   if (!API_KEY || texts.length === 0) return null;
 
   try {
-    const res = await fetch("https://api.voyageai.com/v1/embeddings", {
+    const res = await fetch(`${API_BASE_URL}/embeddings`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${API_KEY}`,
