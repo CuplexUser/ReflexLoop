@@ -6,6 +6,7 @@ import {
   DashboardOutlined,
   ExperimentOutlined,
   FileTextOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons'
 import { useAgentSocket } from './useAgentSocket'
 import { api } from './api'
@@ -13,11 +14,12 @@ import { StatusBar } from './components/StatusBar'
 import { DashboardPage } from './pages/DashboardPage'
 import { LiveFeedPage } from './pages/LiveFeedPage'
 import { ProposalsPage } from './pages/ProposalsPage'
+import { ActionsPage } from './pages/ActionsPage'
 import { LessonsPage } from './pages/LessonsPage'
 import { ResearchPage } from './pages/ResearchPage'
 import type { OutcomeRow, ProposalRow, StatusResponse } from './types'
 
-type PageKey = 'dashboard' | 'live' | 'proposals' | 'lessons' | 'research'
+type PageKey = 'dashboard' | 'live' | 'proposals' | 'actions' | 'lessons' | 'research'
 
 function App() {
   const socket = useAgentSocket()
@@ -68,6 +70,7 @@ function App() {
                 </Badge>
               ),
             },
+            { key: 'actions', icon: <ThunderboltOutlined />, label: 'Actions' },
             { key: 'lessons', icon: <BulbOutlined />, label: 'Lessons' },
             { key: 'research', icon: <ExperimentOutlined />, label: 'Research notes' },
           ]}
@@ -96,6 +99,7 @@ function App() {
           )}
           {page === 'live' && <LiveFeedPage feed={socket.feed} />}
           {page === 'proposals' && <ProposalsPage proposals={proposals} outcomes={outcomes} />}
+          {page === 'actions' && <ActionsPage historyVersion={socket.historyVersion} />}
           {page === 'lessons' && <LessonsPage historyVersion={socket.historyVersion} />}
           {page === 'research' && <ResearchPage historyVersion={socket.historyVersion} />}
         </Layout.Content>

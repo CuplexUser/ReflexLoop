@@ -47,6 +47,7 @@ const MEMORY_TOOLS = [
   "mcp__memory__lesson_reinforce",
   "mcp__memory__proposal_status",
   "mcp__memory__outcome_record",
+  "mcp__memory__action_history_search",
 ];
 
 // Act-phase-only integration tools a proposal can request by exact
@@ -149,6 +150,7 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
     prompt: [
       `Domains to research this cycle (pick whichever look most promising -- you don't need to cover all of them evenly): ${DOMAINS.join("; ")}.`,
       `Before anything else, call lesson_search and research_note_search for each domain/topic you're about to look into -- don't re-research what's already known. lesson_search does semantic matching now, so it can surface relevant lessons even when your domain's wording doesn't exactly match a past one.`,
+      `Also call action_history_search for each domain -- it shows what's actually been built/deployed/committed on approved proposals so far, so you don't propose duplicate work (e.g. a second repo for something already shipped). Prefer proposing the next step on existing work over starting over.`,
       `You can use the read-only tools github_read_repo, github_read_file, github_search_repos, vercel_list_projects, vercel_get_project, netlify_list_sites, netlify_get_site to check the existing landscape (competing projects, your own prior projects) before proposing.`,
       `Research for concrete, boundable opportunities to earn money. Use WebSearch/WebFetch and the read-only integration tools above. Save distilled findings with research_note_add as you go.`,
       `When you have specific ideas, call proposal_create for each one worth a human's attention -- typically 1, up to 3 per cycle if multiple domains turned up genuinely strong, distinct opportunities. Don't pad the count with weak ideas just to fill a quota.`,

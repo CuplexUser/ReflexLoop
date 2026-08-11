@@ -1,5 +1,6 @@
 import type {
   ActionRow,
+  ActionWithProposal,
   LessonRow,
   OutcomeRow,
   PersistedEvent,
@@ -24,6 +25,7 @@ export const api = {
   researchNotes: () => getJson<ResearchNoteRow[]>('/api/research-notes'),
   runs: () => getJson<RunRow[]>('/api/runs'),
   events: () => getJson<PersistedEvent[]>('/api/events'),
+  actions: () => getJson<ActionWithProposal[]>('/api/actions'),
 
   async decide(id: number, approved: boolean, notes?: string): Promise<void> {
     const res = await fetch(`/api/proposals/${id}/decision`, {

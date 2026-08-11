@@ -68,10 +68,13 @@ export async function deploy(siteId: string, files: DeployFile[]) {
     byPath.set(normalizedPath, f.content);
   }
 
-  const deployResult = await nf<{ id: string; required: string[] }>(`/sites/${siteId}/deploys`, {
-    method: "POST",
-    body: JSON.stringify({ files: digests }),
-  });
+  const deployResult = await nf<{ id: string; required: string[]; deploy_ssl_url?: string; ssl_url?: string }>(
+    `/sites/${siteId}/deploys`,
+    {
+      method: "POST",
+      body: JSON.stringify({ files: digests }),
+    }
+  );
 
   for (const sha of deployResult.required ?? []) {
     const path = Object.keys(digests).find((p) => digests[p] === sha);
@@ -84,5 +87,6 @@ export async function deploy(siteId: string, files: DeployFile[]) {
     });
   }
 
-  return { id: deployResult.id, siteId };
+  const url = deployResult.deploy_ssl_url ?? deployResult.ssl_url;
+  return { id: deployResult.id, siteId, ...(url ? { url } : {}) };
 }

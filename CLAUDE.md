@@ -41,8 +41,9 @@ rebuilding `web/dist` on every change.
 `.env` (copy from `.env.example`): `ANTHROPIC_API_KEY` (skip if logged in via `claude setup-token`),
 `AGENT_DOMAINS`, `AGENT_DB_PATH`, `AGENT_CYCLE_INTERVAL_MS`, `AGENT_MAX_PENDING_PROPOSALS`,
 `AGENT_SERVER_PORT`, and optional integration keys `GITHUB_TOKEN` / `VERCEL_TOKEN` /
-`NETLIFY_AUTH_TOKEN` / `VOYAGE_API_KEY` — each integration or feature is simply unavailable, not a
-startup error, when its key is missing.
+`NETLIFY_AUTH_TOKEN` / `VOYAGE_API_KEY` (+ `VOYAGE_API_BASE_URL`, only needed for a MongoDB
+Atlas-issued Voyage key) — each integration or feature is simply unavailable, not a startup error,
+when its key is missing.
 
 ## Architecture
 
@@ -53,7 +54,8 @@ Each cycle: **research + plan → human review → act → outcome + reflect**.
 - **research + plan** (`researchAndPlanPhase`) — runs with `permissionMode: "bypassPermissions"` since
   every tool available to it is read-only or writes only to the agent's own memory DB. Can span multiple
   `AGENT_DOMAINS` per cycle and create 0-3 proposals; not forced to cover domains evenly. Calls
-  `lesson_search`/`research_note_search` first so it doesn't re-research what's already known.
+  `lesson_search`/`research_note_search` first so it doesn't re-research what's already known, and
+  `action_history_search` to see what's already been built/deployed so it doesn't propose duplicate work.
 - **human review** (`humanReviewPhase`) — emits a `proposal_pending` event and blocks on
   `waitForDecision()` (`review-gateway.ts`), resolved when a person clicks Approve/Reject in the web UI
   (`POST /api/proposals/:id/decision`). Multiple proposals can be under review concurrently, each on its
@@ -77,22 +79,31 @@ API cost (`total_cost_usd` from the SDK) is recorded — spend counts against pr
 
 - `memory-server.ts` — SQLite-backed memory (`data/agent.db`) plus the MCP tools the model can call:
   `research_note_add`, `research_note_search`, `lesson_search`, `lesson_add`, `lesson_reinforce`,
-  `proposal_create`, `proposal_status`, `outcome_record`. Approving proposals, logging actions, and
-  marking a run successful are deliberately *not* model-callable tools — those stay with the
-  orchestrator and the human. Notes/lessons are embedded and ranked by cosine similarity when embeddings
-  are available, falling back to `LIKE` text matching otherwise.
+  `proposal_create`, `proposal_status`, `outcome_record`, `action_history_search`. Approving proposals,
+  logging actions, and marking a run successful are deliberately *not* model-callable tools — those stay
+  with the orchestrator and the human. Notes/lessons are embedded and ranked by cosine similarity when
+  embeddings are available, falling back to `LIKE` text matching otherwise. Also owns the `events` table
+  (persisted activity feed, capped at `EVENTS_KEEP`) and `action_history_search`'s backing query, which
+  joins `actions` to `proposals` to answer "what's already been done" for research/plan — restricted to
+  `phase = 'act'` on `status = 'approved'` proposals to stay low-noise, unlike the Actions page below
+  which shows every phase.
 - `embeddings.ts` — Voyage AI (`voyage-3.5`) client for semantic search. Fails soft: no `VOYAGE_API_KEY`,
   or any request error, and `embed()` resolves to `null` so callers fall back to `LIKE`-based search
-  instead of throwing.
+  instead of throwing. `VOYAGE_API_BASE_URL` (default `api.voyageai.com`) exists because a key only
+  authenticates against the endpoint it was issued for — a MongoDB Atlas-issued "Model API key" needs
+  `ai.mongodb.com` instead; same request/response schema either way.
 - `integrations/{github,vercel,netlify}.ts` + `integrations-server.ts` — thin API wrappers and their MCP
   tools. Read-only tools (`github_read_repo`, `vercel_list_projects`, etc.) are free for the research
   phase to call. Write tools (`github_create_repo`, `vercel_deploy`, `netlify_deploy`, etc.) only work in
-  `actPhase`, and only when named in the approved proposal's `required_tools`.
+  `actPhase`, and only when named in the approved proposal's `required_tools`. Each write tool that
+  creates/deploys something returns a plain `url` field on success — `memory-server.ts`'s
+  `extractResultUrl` pulls that out generically (by field name, not per-tool switching) to back the
+  Actions page's browsable result links.
 - `events.ts` / `review-gateway.ts` / `server.ts` — the live layer under the web UI. `events.ts` is an
-  in-process bus the orchestrator emits to; `server.ts` rebroadcasts those events over WebSocket and
-  serves the REST API (including proposal history), and in production also serves the built `web/dist`
-  static files; `review-gateway.ts` resolves a proposal's pending approval promise when a decision comes
-  in via the API.
+  in-process bus the orchestrator emits to; `server.ts` persists each event via `store.logEvent()` *then*
+  rebroadcasts it over WebSocket with the same `{id, occurredAt}` the DB assigned, and serves the REST API
+  (proposal/action/event history), and in production also serves the built `web/dist` static files;
+  `review-gateway.ts` resolves a proposal's pending approval promise when a decision comes in via the API.
 - `smoke-test.ts` — exercises `MemoryStore` directly against a throwaway DB, no API key needed.
 
 ### Frontend (`web/`)
@@ -102,11 +113,22 @@ oxlint, talking to `src/server.ts` over REST (`web/src/api.ts`) and WebSocket
 (`web/src/useAgentSocket.ts`). Pages live in `web/src/pages/`: Dashboard (pending proposals + stat tiles
 + recent activity), Live feed (full filterable activity stream), Proposals (full history; click a row to
 open `ProposalDialog` with full description/stats/tool calls and Approve/Reject for pending ones),
-Lessons, Research notes.
+Actions (every tool call on an *approved* proposal — action type, an input-derived description, and a
+browsable result URL when the tool returned one; phase-filterable, click a row for full input/output
+JSON via `ActionDialog`), Lessons, Research notes.
+
+Table cells that need to show long free text (a proposal description, a lesson, etc.) use the column's
+own `ellipsis: true` (plain CSS truncation + native title tooltip) and a click-to-open dialog for the
+full text — not AntD's `Typography.Text ellipsis={{tooltip}}`, which double-measures against the
+column's own truncation and visibly flickers on hover. Keep new long-text columns consistent with this.
 
 `useAgentSocket.ts` tracks a `historyVersion` counter that bumps on state-changing WebSocket events
-(`proposal_decided`, etc.); `App.tsx` refetches `/api/proposals` and `/api/outcomes` whenever it changes,
-so REST-fetched state stays in sync with what the WebSocket reports without polling.
+(`proposal_decided`, etc.); `App.tsx`/page components refetch their REST data (`/api/proposals`,
+`/api/outcomes`, `/api/actions`, etc.) whenever it changes, so REST-fetched state stays in sync with what
+the WebSocket reports without polling. The activity feed itself is seeded from `GET /api/events` on
+mount and merged with live WebSocket events by server-assigned id (de-duped, ordered) so a page reload
+doesn't lose history — replaying that same event log is also what reconstructs `pendingProposals` and
+`runningPhase` on load, not just the visible feed.
 
 The web console has **no authentication** — `server.ts` binds on all interfaces with nothing gating
 `/api/proposals/:id/decision`. Fine on localhost; don't expose it beyond that without adding auth first.

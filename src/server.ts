@@ -69,6 +69,10 @@ export function startServer(store: MemoryStore, domains: string[], port: number)
     res.json(store.listRecentEvents());
   });
 
+  app.get("/api/actions", (_req, res) => {
+    res.json(store.listActionsForApprovedProposals());
+  });
+
   // Serve the built frontend, if present (npm run build in web/). In dev,
   // the Vite dev server (with a proxy to this port) serves the UI instead.
   const distDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "web", "dist");

@@ -239,6 +239,47 @@ export class MemoryStore {
       .all(proposalId);
   }
 
+  /** Every action taken on an approved proposal, across all its phases -- backs the Actions page. */
+  listActionsForApprovedProposals(limit = 1000) {
+    const rows = this.db
+      .prepare(
+        `SELECT a.id, a.proposal_id, a.phase, a.tool_name, a.tool_input, a.tool_output, a.occurred_at,
+                p.domain AS proposal_domain, p.description AS proposal_description
+         FROM actions a JOIN proposals p ON p.id = a.proposal_id
+         WHERE p.status = 'approved'
+         ORDER BY a.occurred_at DESC LIMIT ?`
+      )
+      .all(limit) as unknown as ActionWithProposalRow[];
+    return rows.map((r) => ({ ...r, result_url: extractResultUrl(r.tool_output) }));
+  }
+
+  /**
+   * What's actually been done (act-phase, side-effecting tool calls only) on approved
+   * proposals -- what the agent itself calls via action_history_search so research/plan
+   * can check for existing work before proposing something that duplicates it.
+   */
+  listActionHistory(domain?: string, limit = 20) {
+    const base = `SELECT a.tool_name, a.tool_input, a.tool_output, a.occurred_at, a.proposal_id,
+                          p.domain, p.description AS proposal_description
+                   FROM actions a JOIN proposals p ON p.id = a.proposal_id
+                   WHERE p.status = 'approved' AND a.phase = 'act'`;
+    const rows = (
+      domain
+        ? this.db.prepare(`${base} AND p.domain = ? ORDER BY a.occurred_at DESC LIMIT ?`).all(domain, limit)
+        : this.db.prepare(`${base} ORDER BY a.occurred_at DESC LIMIT ?`).all(limit)
+    ) as unknown as ActionHistoryRow[];
+
+    return rows.map((r) => ({
+      proposalId: r.proposal_id,
+      domain: r.domain,
+      proposalDescription: r.proposal_description,
+      tool: r.tool_name.replace(/^mcp__(memory|integrations)__/, ""),
+      input: safeParseJson(r.tool_input),
+      resultUrl: extractResultUrl(r.tool_output),
+      occurredAt: r.occurred_at,
+    }));
+  }
+
   // ---- outcomes -----------------------------------------------------------
 
   recordOutcome(o: {
@@ -424,6 +465,57 @@ function safeJson(v: unknown) {
   }
 }
 
+function safeParseJson(raw: string | null): unknown {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * Tool results that create/deploy something (github_create_repo, github_create_pr,
+ * vercel_deploy, netlify_create_site, netlify_deploy) all return a plain `url` field.
+ * tool_output is stored as the raw PostToolUse `tool_response` -- an MCP content-block
+ * array whose text is itself a JSON-stringified result object -- so this unwraps both
+ * layers and pulls `url` out generically rather than switching on tool name.
+ */
+function extractResultUrl(toolOutput: string | null): string | null {
+  if (!toolOutput) return null;
+  try {
+    const content = JSON.parse(toolOutput) as { type?: string; text?: string }[];
+    const text = Array.isArray(content) ? content.find((c) => c?.type === "text")?.text : undefined;
+    if (!text) return null;
+    const data = JSON.parse(text) as { url?: unknown };
+    return typeof data?.url === "string" ? data.url : null;
+  } catch {
+    return null;
+  }
+}
+
+interface ActionWithProposalRow {
+  id: number;
+  proposal_id: number;
+  phase: string;
+  tool_name: string;
+  tool_input: string | null;
+  tool_output: string | null;
+  occurred_at: string;
+  proposal_domain: string;
+  proposal_description: string;
+}
+
+interface ActionHistoryRow {
+  proposal_id: number;
+  domain: string;
+  proposal_description: string;
+  tool_name: string;
+  tool_input: string | null;
+  tool_output: string | null;
+  occurred_at: string;
+}
+
 // ---- MCP tool definitions ----------------------------------------------
 //
 // These are the only memory operations the agent itself can call. Notice
@@ -516,6 +608,19 @@ export function buildMemoryServer(store: MemoryStore): McpSdkServerConfigWithIns
     }
   );
 
+  const actionHistorySearch = tool(
+    "action_history_search",
+    "See real-world actions already taken on approved proposals (repos created, sites deployed, files committed, etc.), optionally filtered to one domain. Call this before proposing new work so you don't duplicate something already built or deployed.",
+    {
+      domain: z.string().optional().describe("Filter to one domain; omit to see recent action history across all domains"),
+      limit: z.number().int().positive().max(50).optional(),
+    },
+    async ({ domain, limit }) => {
+      const rows = store.listActionHistory(domain, limit ?? 20);
+      return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }] };
+    }
+  );
+
   const proposalStatus = tool(
     "proposal_status",
     "Check whether a previously created proposal has been approved, rejected, or is still pending.",
@@ -557,6 +662,7 @@ export function buildMemoryServer(store: MemoryStore): McpSdkServerConfigWithIns
       proposalCreate,
       proposalStatus,
       outcomeRecord,
+      actionHistorySearch,
     ],
   });
 }

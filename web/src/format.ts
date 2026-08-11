@@ -27,3 +27,75 @@ export const PHASE_LABEL: Record<string, string> = {
   act: 'Act',
   reflect: 'Reflect',
 }
+
+const ACTION_LABEL: Record<string, string> = {
+  github_read_repo: 'Read repo',
+  github_read_file: 'Read file',
+  github_search_repos: 'Search repos',
+  github_create_repo: 'Create repo',
+  github_create_branch: 'Create branch',
+  github_commit_file: 'Commit file',
+  github_create_pr: 'Open PR',
+  vercel_list_projects: 'List projects',
+  vercel_get_project: 'Get project',
+  vercel_deploy: 'Deploy',
+  netlify_list_sites: 'List sites',
+  netlify_get_site: 'Get site',
+  netlify_create_site: 'Create site',
+  netlify_deploy: 'Deploy',
+  WebSearch: 'Web search',
+  WebFetch: 'Web fetch',
+}
+
+function shortToolName(toolName: string): string {
+  return toolName.replace(/^mcp__(memory|integrations)__/, '')
+}
+
+/** Short, human "type of action" label for a tool call, e.g. "Create repo". */
+export function actionLabel(toolName: string): string {
+  const short = shortToolName(toolName)
+  return ACTION_LABEL[short] ?? short.replace(/_/g, ' ')
+}
+
+/** One-line description filled in from the tool's actual input, e.g. `"my-repo" — a landing page`. */
+export function actionDescription(toolName: string, inputRaw: string | null): string {
+  const short = shortToolName(toolName)
+  let input: Record<string, unknown> = {}
+  try {
+    input = inputRaw ? JSON.parse(inputRaw) : {}
+  } catch {
+    // fall through to the raw-preview default below
+  }
+
+  switch (short) {
+    case 'github_read_repo':
+    case 'github_read_file':
+      return `${input.owner}/${input.repo}${input.path ? `: ${input.path}` : ''}`
+    case 'github_search_repos':
+      return String(input.query ?? '')
+    case 'github_create_repo':
+      return `"${input.name}"${input.description ? ` — ${input.description}` : ''}`
+    case 'github_create_branch':
+      return `${input.owner}/${input.repo} → ${input.branch}`
+    case 'github_commit_file':
+      return `${input.owner}/${input.repo}@${input.branch}: ${input.path}`
+    case 'github_create_pr':
+      return `${input.owner}/${input.repo}: "${input.title}" (${input.head} → ${input.base})`
+    case 'vercel_get_project':
+      return String(input.idOrName ?? '')
+    case 'vercel_deploy':
+      return `${input.projectName} (${input.target ?? 'preview'})`
+    case 'netlify_get_site':
+      return String(input.siteId ?? '')
+    case 'netlify_create_site':
+      return String(input.name ?? '')
+    case 'netlify_deploy':
+      return `site ${input.siteId}`
+    case 'WebSearch':
+      return String(input.query ?? '')
+    case 'WebFetch':
+      return String(input.url ?? '')
+    default:
+      return preview(inputRaw, 140)
+  }
+}

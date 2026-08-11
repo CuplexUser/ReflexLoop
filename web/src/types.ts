@@ -65,6 +65,20 @@ export interface ActionRow {
   occurred_at: string
 }
 
+/** An action taken on an approved proposal, with the proposal's context and a browsable result URL if the tool produced one. */
+export interface ActionWithProposal {
+  id: number
+  proposal_id: number
+  phase: string
+  tool_name: string
+  tool_input: string | null
+  tool_output: string | null
+  occurred_at: string
+  proposal_domain: string
+  proposal_description: string
+  result_url: string | null
+}
+
 export interface StatusResponse {
   domains: string[]
   totalCostUsd: number

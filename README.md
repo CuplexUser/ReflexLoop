@@ -26,11 +26,14 @@ there.
 - `src/memory-server.ts` — SQLite-backed memory (`data/agent.db`) plus the
   MCP tools the agent can call: `research_note_add`, `research_note_search`,
   `lesson_search`, `lesson_add`, `lesson_reinforce`, `proposal_create`,
-  `proposal_status`, `outcome_record`. Approving proposals, logging actions,
-  and marking a run successful are deliberately *not* tools the model has —
-  those stay with the orchestrator and with you. Research notes and lessons
-  are embedded (see Semantic search below) and ranked by similarity instead
-  of exact/`LIKE` text matching, when embeddings are available.
+  `proposal_status`, `outcome_record`, `action_history_search`. Approving
+  proposals, logging actions, and marking a run successful are deliberately
+  *not* tools the model has — those stay with the orchestrator and with you.
+  Research notes and lessons are embedded (see Semantic search below) and
+  ranked by similarity instead of exact/`LIKE` text matching, when embeddings
+  are available. `action_history_search` lets research/plan see what's
+  already been built/deployed/committed on approved proposals (per domain or
+  overall) so it doesn't propose duplicate work.
 - `src/orchestrator.ts` — the main loop and its four phases. Every tool call
   is logged automatically via a `PostToolUse` hook, and every phase's Claude
   API cost is recorded so spend counts against profit.
@@ -98,11 +101,17 @@ npm run web:dev     # Vite dev server, proxies /api and /ws to the backend
 ## The web console
 
 - **Dashboard** — pending proposals (if any), spend/revenue/net stat tiles,
-  and a live activity feed.
+  and a live activity feed. The activity feed is persisted server-side
+  (`events` table) and reloaded on page load, so a refresh doesn't lose it.
 - **Live feed** — the full activity stream, filterable by phase: every tool
   call and model narration as it happens.
-- **Proposals** — full history with status, expandable to the outcome and
-  every tool call a given proposal's act phase made.
+- **Proposals** — full history with status; click a row to open a dialog with
+  the full description, stats, tool calls, and Approve/Reject for pending
+  ones.
+- **Actions** — every tool call made on an *approved* proposal, across its
+  act and reflect phases: action type, a per-tool description filled in from
+  the actual input, and a browsable result URL when the tool produced one
+  (repo/PR/deployment link). Click a row for the full input/output JSON.
 - **Lessons** / **Research notes** — the accumulated memory, browsable.
 
 Approving or rejecting a proposal calls `POST /api/proposals/:id/decision`,
