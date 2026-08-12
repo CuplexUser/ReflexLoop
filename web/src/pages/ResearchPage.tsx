@@ -1,14 +1,16 @@
-import { useEffect, useState } from 'react'
-import { Progress, Table } from 'antd'
+import { useEffect, useMemo, useState } from 'react'
+import { Input, Progress, Space, Table } from 'antd'
 import type { ResearchNoteRow } from '../types'
 import { api } from '../api'
 import { timeAgo } from '../format'
 import { ResearchNoteDialog } from '../components/ResearchNoteDialog'
+import { useResizableColumns } from '../hooks/useResizableColumns'
 
 export function ResearchPage({ historyVersion }: { historyVersion: number }) {
   const [notes, setNotes] = useState<ResearchNoteRow[]>([])
   const [loading, setLoading] = useState(true)
   const [selected, setSelected] = useState<ResearchNoteRow | null>(null)
+  const [search, setSearch] = useState('')
 
   useEffect(() => {
     api
@@ -17,41 +19,79 @@ export function ResearchPage({ historyVersion }: { historyVersion: number }) {
       .finally(() => setLoading(false))
   }, [historyVersion])
 
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    if (!q) return notes
+    return notes.filter((n) => `${n.topic} ${n.finding} ${n.source ?? ''}`.toLowerCase().includes(q))
+  }, [notes, search])
+
+  const { columns, components } = useResizableColumns<ResearchNoteRow>([
+    {
+      title: 'Topic',
+      dataIndex: 'topic',
+      width: 220,
+      ellipsis: true,
+      sorter: (a, b) => a.topic.localeCompare(b.topic),
+    },
+    {
+      title: 'Finding',
+      dataIndex: 'finding',
+      ellipsis: true,
+      sorter: (a, b) => a.finding.localeCompare(b.finding),
+    },
+    {
+      title: 'Source',
+      dataIndex: 'source',
+      width: 220,
+      ellipsis: true,
+      sorter: (a, b) => (a.source ?? '').localeCompare(b.source ?? ''),
+      render: (v: string | null) =>
+        v ? (
+          <a href={v} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
+            {v}
+          </a>
+        ) : (
+          '—'
+        ),
+    },
+    {
+      title: 'Confidence',
+      dataIndex: 'confidence',
+      width: 120,
+      sorter: (a, b) => (a.confidence ?? -1) - (b.confidence ?? -1),
+      render: (v: number | null) => (v == null ? '—' : <Progress percent={Math.round(v * 100)} size="small" />),
+    },
+    {
+      title: 'Fetched',
+      dataIndex: 'fetched_at',
+      width: 110,
+      sorter: (a, b) => new Date(a.fetched_at).getTime() - new Date(b.fetched_at).getTime(),
+      defaultSortOrder: 'descend',
+      render: (v: string) => timeAgo(v),
+    },
+  ])
+
   return (
-    <>
-      <Table
-        rowKey="id"
-        loading={loading}
-        dataSource={notes}
-        pagination={{ pageSize: 10 }}
-        onRow={(n) => ({ onClick: () => setSelected(n), style: { cursor: 'pointer' } })}
-        columns={[
-          { title: 'Topic', dataIndex: 'topic', width: 220, ellipsis: true },
-          { title: 'Finding', dataIndex: 'finding', ellipsis: true },
-          {
-            title: 'Source',
-            dataIndex: 'source',
-            width: 220,
-            ellipsis: true,
-            render: (v: string | null) =>
-              v ? (
-                <a href={v} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
-                  {v}
-                </a>
-              ) : (
-                '—'
-              ),
-          },
-          {
-            title: 'Confidence',
-            dataIndex: 'confidence',
-            width: 120,
-            render: (v: number | null) => (v == null ? '—' : <Progress percent={Math.round(v * 100)} size="small" />),
-          },
-          { title: 'Fetched', dataIndex: 'fetched_at', width: 110, render: (v: string) => timeAgo(v) },
-        ]}
+    <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Input.Search
+        allowClear
+        placeholder="Search topic, finding, or source…"
+        style={{ maxWidth: 360 }}
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
       />
+      <div style={{ overflowX: 'auto' }}>
+        <Table
+          rowKey="id"
+          loading={loading}
+          dataSource={filtered}
+          pagination={{ pageSize: 10 }}
+          components={components}
+          onRow={(n) => ({ onClick: () => setSelected(n), style: { cursor: 'pointer' } })}
+          columns={columns}
+        />
+      </div>
       <ResearchNoteDialog note={selected} open={selected !== null} onClose={() => setSelected(null)} />
-    </>
+    </Space>
   )
 }

@@ -45,6 +45,21 @@ body {
   background: transparent;
 }
 
+.col-resize-handle {
+  position: absolute;
+  top: 0;
+  right: -4px;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  z-index: 1;
+  touch-action: none;
+}
+.col-resize-handle:hover,
+.col-resize-handle:active {
+  background: #6c8cff33;
+}
+
 @keyframes pulse-ring {
   0% {
     box-shadow: 0 0 0 0 rgba(232, 163, 61, 0.45);
