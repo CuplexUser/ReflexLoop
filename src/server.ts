@@ -49,6 +49,21 @@ export function startServer(store: MemoryStore, domains: string[], port: number)
     res.json({ ok: true });
   });
 
+  app.post("/api/proposals/:id/review", (req, res) => {
+    const id = Number(req.params.id);
+    const { reviewStatus } = req.body as { reviewStatus?: "mvp_done" | "needs_refinement" | null };
+    if (reviewStatus !== null && reviewStatus !== "mvp_done" && reviewStatus !== "needs_refinement") {
+      res.status(400).json({ error: "Body must include `reviewStatus`: 'mvp_done', 'needs_refinement', or null." });
+      return;
+    }
+    if (!store.getProposal(id)) {
+      res.status(404).json({ error: "No such proposal." });
+      return;
+    }
+    store.setProposalReview(id, reviewStatus);
+    res.json({ ok: true });
+  });
+
   app.get("/api/outcomes", (_req, res) => {
     res.json(store.listOutcomes());
   });

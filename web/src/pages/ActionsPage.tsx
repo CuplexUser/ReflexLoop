@@ -1,15 +1,88 @@
 import { useEffect, useMemo, useState } from 'react'
 import { LinkOutlined } from '@ant-design/icons'
-import { Input, Segmented, Space, Table, Tag, Typography } from 'antd'
-import type { ActionWithProposal } from '../types'
+import { Input, Segmented, Select, Space, Table, Tag, Typography } from 'antd'
+import type { ActionWithProposal, OutcomeRow, ProposalRow } from '../types'
 import { api } from '../api'
 import { PHASE_LABEL, actionDescription, actionLabel, timeAgo } from '../format'
 import { ActionDialog } from '../components/ActionDialog'
 import { useResizableColumns } from '../hooks/useResizableColumns'
 
 type PhaseFilter = 'all' | 'act' | 'reflect'
+type ReviewStatus = ProposalRow['review_status']
 
-export function ActionsPage({ historyVersion }: { historyVersion: number }) {
+interface ProposalGroup {
+  proposal: ProposalRow
+  outcome?: OutcomeRow
+  actions: ActionWithProposal[]
+  lastActivity: string
+}
+
+const REVIEW_OPTIONS: { value: NonNullable<ReviewStatus> | 'unreviewed'; label: string }[] = [
+  { value: 'unreviewed', label: 'Unreviewed' },
+  { value: 'mvp_done', label: '✓ MVP done' },
+  { value: 'needs_refinement', label: '⚠ Needs refinement' },
+]
+
+function reviewRank(status: ReviewStatus): number {
+  if (status === 'mvp_done') return 2
+  if (status === 'needs_refinement') return 1
+  return 0
+}
+
+/** The action list for one proposal, shown inline when its group row is expanded. */
+function ExpandedActions({
+  actions,
+  onSelect,
+}: {
+  actions: ActionWithProposal[]
+  onSelect: (a: ActionWithProposal) => void
+}) {
+  const sorted = useMemo(() => [...actions].sort((a, b) => b.occurred_at.localeCompare(a.occurred_at)), [actions])
+
+  const { columns, components } = useResizableColumns<ActionWithProposal>([
+    { title: 'Action', dataIndex: 'tool_name', width: 140, render: (v: string) => actionLabel(v) },
+    { title: 'Description', ellipsis: true, render: (_, a) => actionDescription(a.tool_name, a.tool_input) },
+    {
+      title: 'Result',
+      width: 110,
+      render: (_, a) =>
+        a.result_url ? (
+          <a href={a.result_url} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
+            <LinkOutlined /> open
+          </a>
+        ) : (
+          <Typography.Text type="secondary">—</Typography.Text>
+        ),
+    },
+    { title: 'When', width: 110, render: (_, a) => timeAgo(a.occurred_at) },
+  ])
+
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      <Table
+        rowKey="id"
+        size="small"
+        pagination={false}
+        dataSource={sorted}
+        components={components}
+        columns={columns}
+        onRow={(a) => ({ onClick: () => onSelect(a), style: { cursor: 'pointer' } })}
+      />
+    </div>
+  )
+}
+
+export function ActionsPage({
+  historyVersion,
+  proposals,
+  outcomes,
+  onSetReview,
+}: {
+  historyVersion: number
+  proposals: ProposalRow[]
+  outcomes: OutcomeRow[]
+  onSetReview: (id: number, reviewStatus: ReviewStatus) => void
+}) {
   const [actions, setActions] = useState<ActionWithProposal[]>([])
   const [loading, setLoading] = useState(true)
   const [phase, setPhase] = useState<PhaseFilter>('all')
@@ -23,75 +96,128 @@ export function ActionsPage({ historyVersion }: { historyVersion: number }) {
       .finally(() => setLoading(false))
   }, [historyVersion])
 
-  const byPhase = phase === 'all' ? actions : actions.filter((a) => a.phase === phase)
-
-  const filtered = useMemo(() => {
+  const filteredActions = useMemo(() => {
+    let rows = phase === 'all' ? actions : actions.filter((a) => a.phase === phase)
     const q = search.trim().toLowerCase()
-    if (!q) return byPhase
-    return byPhase.filter((a) =>
-      `${a.proposal_domain} ${actionLabel(a.tool_name)} ${actionDescription(a.tool_name, a.tool_input)}`
-        .toLowerCase()
-        .includes(q),
-    )
-  }, [byPhase, search])
+    if (q) {
+      rows = rows.filter((a) =>
+        `${a.proposal_domain} ${a.proposal_description} ${actionLabel(a.tool_name)} ${actionDescription(a.tool_name, a.tool_input)}`
+          .toLowerCase()
+          .includes(q),
+      )
+    }
+    return rows
+  }, [actions, phase, search])
+
+  const groups = useMemo<ProposalGroup[]>(() => {
+    const byProposal = new Map<number, ActionWithProposal[]>()
+    for (const a of filteredActions) {
+      const list = byProposal.get(a.proposal_id)
+      if (list) list.push(a)
+      else byProposal.set(a.proposal_id, [a])
+    }
+    const proposalById = new Map(proposals.map((p) => [p.id, p]))
+    const outcomeByProposal = new Map(outcomes.map((o) => [o.proposal_id, o]))
+
+    const result: ProposalGroup[] = []
+    for (const [proposalId, groupActions] of byProposal) {
+      const proposal = proposalById.get(proposalId)
+      if (!proposal) continue
+      const lastActivity = groupActions.reduce((max, a) => (a.occurred_at > max ? a.occurred_at : max), groupActions[0].occurred_at)
+      result.push({ proposal, outcome: outcomeByProposal.get(proposalId), actions: groupActions, lastActivity })
+    }
+    return result
+  }, [filteredActions, proposals, outcomes])
 
   const domainFilters = useMemo(
-    () => [...new Set(actions.map((a) => a.proposal_domain))].sort().map((d) => ({ text: d, value: d })),
-    [actions],
-  )
-  const actionFilters = useMemo(
-    () => [...new Set(actions.map((a) => a.tool_name))].sort().map((t) => ({ text: actionLabel(t), value: t })),
-    [actions],
+    () => [...new Set(groups.map((g) => g.proposal.domain))].sort().map((d) => ({ text: d, value: d })),
+    [groups],
   )
 
-  const { columns, components } = useResizableColumns<ActionWithProposal>([
+  const { columns, components } = useResizableColumns<ProposalGroup>([
     {
-      title: 'Proposal',
-      width: 260,
-      ellipsis: true,
-      sorter: (a, b) => a.proposal_id - b.proposal_id,
-      filters: domainFilters,
-      onFilter: (value, record) => record.proposal_domain === value,
-      render: (_, a) => (
-        <span>
-          <Tag color="default">#{a.proposal_id}</Tag> {a.proposal_domain}
-        </span>
-      ),
+      title: '#',
+      width: 70,
+      sorter: (a, b) => a.proposal.id - b.proposal.id,
+      render: (_, g) => <span className="mono">#{g.proposal.id}</span>,
     },
     {
-      title: 'Action',
-      dataIndex: 'tool_name',
-      width: 140,
-      sorter: (a, b) => a.tool_name.localeCompare(b.tool_name),
-      filters: actionFilters,
-      onFilter: (value, record) => record.tool_name === value,
-      render: (v: string) => actionLabel(v),
+      title: 'Domain',
+      width: 200,
+      ellipsis: true,
+      sorter: (a, b) => a.proposal.domain.localeCompare(b.proposal.domain),
+      filters: domainFilters,
+      onFilter: (value, record) => record.proposal.domain === value,
+      render: (_, g) => g.proposal.domain,
     },
     {
       title: 'Description',
       ellipsis: true,
-      render: (_, a) => actionDescription(a.tool_name, a.tool_input),
+      sorter: (a, b) => a.proposal.description.localeCompare(b.proposal.description),
+      render: (_, g) => g.proposal.description,
     },
     {
-      title: 'Result',
-      width: 130,
-      sorter: (a, b) => Number(Boolean(a.result_url)) - Number(Boolean(b.result_url)),
-      render: (_, a) =>
-        a.result_url ? (
-          <a href={a.result_url} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
-            <LinkOutlined /> open
-          </a>
+      title: 'Actions',
+      width: 90,
+      sorter: (a, b) => a.actions.length - b.actions.length,
+      render: (_, g) => <Tag>{g.actions.length}</Tag>,
+    },
+    {
+      title: 'Expected',
+      width: 190,
+      sorter: (a, b) => a.proposal.expected_upside - b.proposal.expected_upside,
+      render: (_, g) => (
+        <span className="mono" style={{ fontSize: 12 }}>
+          ${g.proposal.expected_cost} · {g.proposal.expected_time_hours}h · ${g.proposal.expected_upside}
+        </span>
+      ),
+    },
+    {
+      title: 'Actual',
+      width: 230,
+      sorter: (a, b) => (a.outcome?.actual_revenue ?? -Infinity) - (b.outcome?.actual_revenue ?? -Infinity),
+      render: (_, g) =>
+        g.outcome ? (
+          <span className="mono" style={{ fontSize: 12 }}>
+            <Tag color={g.outcome.success ? 'success' : 'error'} style={{ marginRight: 4 }}>
+              {g.outcome.success ? 'ok' : 'failed'}
+            </Tag>
+            ${g.outcome.actual_revenue} · ${g.outcome.actual_cost} · {g.outcome.actual_time_hours ?? '—'}h
+          </span>
         ) : (
-          <Typography.Text type="secondary">—</Typography.Text>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            no outcome yet
+          </Typography.Text>
         ),
     },
     {
-      title: 'When',
-      dataIndex: 'occurred_at',
-      width: 110,
-      sorter: (a, b) => new Date(a.occurred_at).getTime() - new Date(b.occurred_at).getTime(),
+      title: 'Review',
+      width: 180,
+      sorter: (a, b) => reviewRank(a.proposal.review_status) - reviewRank(b.proposal.review_status),
+      filters: [
+        { text: 'Unreviewed', value: 'unreviewed' },
+        { text: 'MVP done', value: 'mvp_done' },
+        { text: 'Needs refinement', value: 'needs_refinement' },
+      ],
+      onFilter: (value, record) => (record.proposal.review_status ?? 'unreviewed') === value,
+      render: (_, g) => (
+        <div onClick={(e) => e.stopPropagation()}>
+          <Select<'unreviewed' | 'mvp_done' | 'needs_refinement'>
+            size="small"
+            style={{ width: 168 }}
+            value={g.proposal.review_status ?? 'unreviewed'}
+            onChange={(v) => onSetReview(g.proposal.id, v === 'unreviewed' ? null : v)}
+            options={REVIEW_OPTIONS}
+          />
+        </div>
+      ),
+    },
+    {
+      title: 'Last activity',
+      width: 130,
+      sorter: (a, b) => a.lastActivity.localeCompare(b.lastActivity),
       defaultSortOrder: 'descend',
-      render: (v: string) => timeAgo(v),
+      render: (_, g) => timeAgo(g.lastActivity),
     },
   ])
 
@@ -117,14 +243,17 @@ export function ActionsPage({ historyVersion }: { historyVersion: number }) {
       </Space>
       <div style={{ overflowX: 'auto' }}>
         <Table
-          rowKey="id"
+          rowKey={(g) => g.proposal.id}
           loading={loading}
-          dataSource={filtered}
+          dataSource={groups}
           pagination={{ pageSize: 20 }}
           components={components}
-          onRow={(a) => ({ onClick: () => setSelected(a), style: { cursor: 'pointer' } })}
-          locale={{ emptyText: 'No actions taken on approved proposals yet' }}
           columns={columns}
+          locale={{ emptyText: 'No actions taken on approved proposals yet' }}
+          expandable={{
+            expandRowByClick: true,
+            expandedRowRender: (g) => <ExpandedActions actions={g.actions} onSelect={setSelected} />,
+          }}
         />
       </div>
       <ActionDialog action={selected} open={selected !== null} onClose={() => setSelected(null)} />

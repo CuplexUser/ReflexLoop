@@ -38,4 +38,16 @@ export const api = {
       throw new Error(body.error ?? `Decision failed: ${res.status}`)
     }
   },
+
+  async setProposalReview(id: number, reviewStatus: ProposalRow['review_status']): Promise<void> {
+    const res = await fetch(`/api/proposals/${id}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reviewStatus }),
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error ?? `Review update failed: ${res.status}`)
+    }
+  },
 }

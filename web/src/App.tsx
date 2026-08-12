@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Badge, Layout, Menu, Typography } from 'antd'
+import { App as AntApp, Badge, Layout, Menu, Typography } from 'antd'
 import {
   BulbOutlined,
   CodeOutlined,
@@ -22,6 +22,7 @@ import type { OutcomeRow, ProposalRow, StatusResponse } from './types'
 type PageKey = 'dashboard' | 'live' | 'proposals' | 'actions' | 'lessons' | 'research'
 
 function App() {
+  const { message } = AntApp.useApp()
   const socket = useAgentSocket()
   const [page, setPage] = useState<PageKey>('dashboard')
   const [status, setStatus] = useState<StatusResponse | null>(null)
@@ -41,6 +42,15 @@ function App() {
   }, [socket.historyVersion])
 
   const pendingCount = Math.max(proposals.filter((p) => p.status === 'pending').length, socket.pendingProposals.length)
+
+  async function setProposalReview(id: number, reviewStatus: ProposalRow['review_status']) {
+    try {
+      await api.setProposalReview(id, reviewStatus)
+      setProposals((prev) => prev.map((p) => (p.id === id ? { ...p, review_status: reviewStatus } : p)))
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : 'Review update failed')
+    }
+  }
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
@@ -99,7 +109,14 @@ function App() {
           )}
           {page === 'live' && <LiveFeedPage feed={socket.feed} />}
           {page === 'proposals' && <ProposalsPage proposals={proposals} outcomes={outcomes} />}
-          {page === 'actions' && <ActionsPage historyVersion={socket.historyVersion} />}
+          {page === 'actions' && (
+            <ActionsPage
+              historyVersion={socket.historyVersion}
+              proposals={proposals}
+              outcomes={outcomes}
+              onSetReview={setProposalReview}
+            />
+          )}
           {page === 'lessons' && <LessonsPage historyVersion={socket.historyVersion} />}
           {page === 'research' && <ResearchPage historyVersion={socket.historyVersion} />}
         </Layout.Content>

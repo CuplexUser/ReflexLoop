@@ -112,6 +112,9 @@ export class MemoryStore {
     // EXISTS` since that syntax isn't supported by every SQLite build.
     this.ensureColumn("research_notes", "embedding", "TEXT");
     this.ensureColumn("lessons", "embedding", "TEXT");
+    // Human-only verdict on an approved proposal's actual deliverable -- separate from
+    // the model's self-reported outcome.success, and never settable by the model itself.
+    this.ensureColumn("proposals", "review_status", "TEXT");
   }
 
   private ensureColumn(table: string, column: string, type: string) {
@@ -221,6 +224,11 @@ export class MemoryStore {
     this.db
       .prepare(`UPDATE proposals SET status = ?, human_notes = ?, decided_at = ? WHERE id = ?`)
       .run(status, humanNotes ?? null, now(), id);
+  }
+
+  /** Human-only verdict on whether an approved proposal's deliverable is MVP-done or needs more work. */
+  setProposalReview(id: number, reviewStatus: "mvp_done" | "needs_refinement" | null) {
+    this.db.prepare(`UPDATE proposals SET review_status = ? WHERE id = ?`).run(reviewStatus, id);
   }
 
   // ---- actions (written by orchestrator hooks, not by the model) --------
@@ -455,6 +463,7 @@ export interface ProposalRow {
   human_notes: string | null;
   created_at: string;
   decided_at: string | null;
+  review_status: "mvp_done" | "needs_refinement" | null;
 }
 
 function safeJson(v: unknown) {

@@ -10,6 +10,8 @@ export interface ProposalRow {
   human_notes: string | null
   created_at: string
   decided_at: string | null
+  /** Human-only verdict on the actual deliverable, set after the fact -- independent of outcome.success. */
+  review_status: 'mvp_done' | 'needs_refinement' | null
 }
 
 export interface OutcomeRow {
