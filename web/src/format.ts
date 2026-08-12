@@ -22,6 +22,44 @@ export function timeAgo(iso: string): string {
   return `${d}d ago`
 }
 
+/** Same idea as timeAgo but for a future timestamp, e.g. a proposal's next_run_at. */
+export function inWords(iso: string): string {
+  const diffMs = new Date(iso).getTime() - Date.now()
+  if (diffMs <= 0) return 'due now'
+  const s = Math.round(diffMs / 1000)
+  if (s < 60) return `in ${s}s`
+  const m = Math.round(s / 60)
+  if (m < 60) return `in ${m}m`
+  const h = Math.round(m / 60)
+  if (h < 24) return `in ${h}h`
+  const d = Math.round(h / 24)
+  return `in ${d}d`
+}
+
+/** Short human label for a recurrence interval, e.g. "every 6h", "daily", "weekly". */
+export function recurrenceLabel(ms: number): string {
+  const hours = ms / 3_600_000
+  if (hours === 24) return 'daily'
+  if (hours === 24 * 7) return 'weekly'
+  if (hours === 1) return 'hourly'
+  if (hours < 1) return `every ${Math.round(ms / 60_000)}m`
+  return `every ${hours % 1 === 0 ? hours : hours.toFixed(1)}h`
+}
+
+export const PRIORITY_LABEL: Record<'low' | 'normal' | 'high' | 'urgent', string> = {
+  low: 'Low',
+  normal: 'Normal',
+  high: 'High',
+  urgent: 'Urgent',
+}
+
+export const PRIORITY_TAG_COLOR: Record<'low' | 'normal' | 'high' | 'urgent', string> = {
+  low: 'default',
+  normal: 'blue',
+  high: 'orange',
+  urgent: 'red',
+}
+
 export const PHASE_LABEL: Record<string, string> = {
   research_plan: 'Research + Plan',
   act: 'Act',

@@ -2,8 +2,9 @@ import { useState } from 'react'
 import { App, Button, Card, Input, Space, Statistic, Tag, Typography } from 'antd'
 import { CheckCircleOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons'
 import type { ProposalRow } from '../types'
-import { api } from '../api'
+import { api, type ScheduleOptions } from '../api'
 import { palette } from '../theme'
+import { SchedulePriorityFields } from './SchedulePriorityFields'
 
 const { Title, Paragraph, Text } = Typography
 
@@ -12,11 +13,13 @@ export function ProposalReviewCard({ proposal }: { proposal: ProposalRow }) {
   const [rejecting, setRejecting] = useState(false)
   const [notes, setNotes] = useState('')
   const [submitting, setSubmitting] = useState<'approve' | 'reject' | null>(null)
+  const [showSchedule, setShowSchedule] = useState(false)
+  const [schedule, setSchedule] = useState<ScheduleOptions>({})
 
   async function decide(approved: boolean) {
     setSubmitting(approved ? 'approve' : 'reject')
     try {
-      await api.decide(proposal.id, approved, notes || undefined)
+      await api.decide(proposal.id, approved, notes || undefined, approved ? schedule : undefined)
       message.success(approved ? `Approved proposal #${proposal.id}` : `Rejected proposal #${proposal.id}`)
     } catch (err) {
       message.error(err instanceof Error ? err.message : 'Decision failed')
@@ -79,6 +82,19 @@ export function ProposalReviewCard({ proposal }: { proposal: ProposalRow }) {
             onChange={(e) => setNotes(e.target.value)}
             autoSize={{ minRows: 2, maxRows: 4 }}
           />
+        )}
+
+        {!rejecting && (
+          <div>
+            <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setShowSchedule((v) => !v)}>
+              {showSchedule ? 'Hide schedule & priority' : 'Schedule & priority…'}
+            </Button>
+            {showSchedule && (
+              <div style={{ marginTop: 8 }}>
+                <SchedulePriorityFields onChange={setSchedule} />
+              </div>
+            )}
+          </div>
         )}
 
         <Space>

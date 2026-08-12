@@ -1,3 +1,5 @@
+export type Priority = 'low' | 'normal' | 'high' | 'urgent'
+
 export interface ProposalRow {
   id: number
   domain: string
@@ -12,6 +14,12 @@ export interface ProposalRow {
   decided_at: string | null
   /** Human-only verdict on the actual deliverable, set after the fact -- independent of outcome.success. */
   review_status: 'mvp_done' | 'needs_refinement' | null
+  /** Set by the human at approval time -- never by the model. */
+  priority: Priority
+  scheduled_at: string | null
+  recurrence_ms: number | null
+  /** Orchestrator-maintained: when this proposal's act phase is next due, or null if nothing is pending. */
+  next_run_at: string | null
 }
 
 export interface OutcomeRow {
@@ -96,6 +104,8 @@ export type AgentEvent =
   | { type: 'phase_done'; phase: string; proposalId: number | null; costUsd: number; durationMs: number }
   | { type: 'proposal_pending'; proposal: ProposalRow }
   | { type: 'proposal_decided'; proposal: ProposalRow }
+  | { type: 'proposal_scheduled'; proposal: ProposalRow }
+  | { type: 'scheduled_run_starting'; proposal: ProposalRow }
   | { type: 'outcome_recorded'; proposalId: number }
   | { type: 'lesson_saved'; domain: string }
   | { type: 'cycle_idle'; nextCycleAt: string }

@@ -31,6 +31,25 @@ console.log("pending:", store.listPendingProposals());
 store.decideProposal(proposalId, "approved", "looks reasonable, try it");
 console.log("after decide:", store.getProposal(proposalId));
 
+store.scheduleApprovedProposal(proposalId, { priority: "high", scheduledAt: null, recurrenceMs: null });
+const scheduledNow = store.getProposal(proposalId)!;
+if (scheduledNow.priority !== "high" || !scheduledNow.next_run_at) {
+  throw new Error("scheduleApprovedProposal did not set priority/next_run_at as expected");
+}
+const due = store.listDueProposals(new Date().toISOString());
+if (!due.some((p) => p.id === proposalId)) {
+  throw new Error("listDueProposals did not surface a proposal due right now");
+}
+store.advanceOrClearSchedule(proposalId, { recurring: true, recurrenceMs: 600_000 });
+if (!store.getProposal(proposalId)!.next_run_at) {
+  throw new Error("advanceOrClearSchedule(recurring) should have rescheduled next_run_at, not cleared it");
+}
+store.cancelSchedule(proposalId);
+if (store.getProposal(proposalId)!.next_run_at !== null) {
+  throw new Error("cancelSchedule did not clear next_run_at");
+}
+console.log("scheduling round-trip OK");
+
 store.logAction(proposalId, "act", "WebSearch", { query: "pod niches" }, { results: 3 });
 
 const outcomeId = store.recordOutcome({

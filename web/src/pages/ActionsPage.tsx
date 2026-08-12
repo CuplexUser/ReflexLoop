@@ -1,14 +1,25 @@
 import { useEffect, useMemo, useState } from 'react'
 import { LinkOutlined } from '@ant-design/icons'
 import { Input, Segmented, Select, Space, Table, Tag, Typography } from 'antd'
-import type { ActionWithProposal, OutcomeRow, ProposalRow } from '../types'
+import type { ActionWithProposal, OutcomeRow, Priority, ProposalRow } from '../types'
 import { api } from '../api'
-import { PHASE_LABEL, actionDescription, actionLabel, timeAgo } from '../format'
+import {
+  PHASE_LABEL,
+  PRIORITY_LABEL,
+  PRIORITY_TAG_COLOR,
+  actionDescription,
+  actionLabel,
+  inWords,
+  recurrenceLabel,
+  timeAgo,
+} from '../format'
 import { ActionDialog } from '../components/ActionDialog'
 import { useResizableColumns } from '../hooks/useResizableColumns'
 
 type PhaseFilter = 'all' | 'act' | 'reflect'
 type ReviewStatus = ProposalRow['review_status']
+
+const PRIORITY_RANK: Record<Priority, number> = { urgent: 3, high: 2, normal: 1, low: 0 }
 
 interface ProposalGroup {
   proposal: ProposalRow
@@ -161,6 +172,30 @@ export function ActionsPage({
       width: 90,
       sorter: (a, b) => a.actions.length - b.actions.length,
       render: (_, g) => <Tag>{g.actions.length}</Tag>,
+    },
+    {
+      title: 'Priority',
+      width: 110,
+      sorter: (a, b) => PRIORITY_RANK[a.proposal.priority] - PRIORITY_RANK[b.proposal.priority],
+      filters: (['urgent', 'high', 'normal', 'low'] as Priority[]).map((p) => ({ text: PRIORITY_LABEL[p], value: p })),
+      onFilter: (value, record) => record.proposal.priority === value,
+      render: (_, g) => <Tag color={PRIORITY_TAG_COLOR[g.proposal.priority]}>{PRIORITY_LABEL[g.proposal.priority]}</Tag>,
+    },
+    {
+      title: 'Schedule',
+      width: 170,
+      sorter: (a, b) => (a.proposal.next_run_at ?? '').localeCompare(b.proposal.next_run_at ?? ''),
+      render: (_, g) =>
+        g.proposal.next_run_at ? (
+          <span style={{ fontSize: 12 }}>
+            {inWords(g.proposal.next_run_at)}
+            {g.proposal.recurrence_ms ? ` · ${recurrenceLabel(g.proposal.recurrence_ms)}` : ''}
+          </span>
+        ) : (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            —
+          </Typography.Text>
+        ),
     },
     {
       title: 'Expected',

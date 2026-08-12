@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
-import { Input, Space, Table, Tag } from 'antd'
-import type { OutcomeRow, ProposalRow } from '../types'
+import { Input, Space, Table, Tag, Typography } from 'antd'
+import type { OutcomeRow, Priority, ProposalRow } from '../types'
 import { ProposalDialog } from '../components/ProposalDialog'
-import { timeAgo } from '../format'
+import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, recurrenceLabel, timeAgo } from '../format'
 import { useResizableColumns } from '../hooks/useResizableColumns'
 
 const STATUS_COLOR: Record<ProposalRow['status'], string> = {
@@ -10,6 +10,8 @@ const STATUS_COLOR: Record<ProposalRow['status'], string> = {
   approved: 'success',
   rejected: 'error',
 }
+
+const PRIORITY_RANK: Record<Priority, number> = { urgent: 3, high: 2, normal: 1, low: 0 }
 
 export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[]; outcomes: OutcomeRow[] }) {
   const outcomeByProposal = new Map(outcomes.map((o) => [o.proposal_id, o]))
@@ -56,6 +58,31 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
       ],
       onFilter: (value, record) => record.status === value,
       render: (status: ProposalRow['status']) => <Tag color={STATUS_COLOR[status]}>{status}</Tag>,
+    },
+    {
+      title: 'Priority',
+      dataIndex: 'priority',
+      width: 110,
+      sorter: (a, b) => PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority],
+      filters: (['urgent', 'high', 'normal', 'low'] as Priority[]).map((p) => ({ text: PRIORITY_LABEL[p], value: p })),
+      onFilter: (value, record) => record.priority === value,
+      render: (p: Priority) => <Tag color={PRIORITY_TAG_COLOR[p]}>{PRIORITY_LABEL[p]}</Tag>,
+    },
+    {
+      title: 'Schedule',
+      width: 170,
+      sorter: (a, b) => (a.next_run_at ?? '').localeCompare(b.next_run_at ?? ''),
+      render: (_, p) =>
+        p.next_run_at ? (
+          <span style={{ fontSize: 12 }}>
+            {inWords(p.next_run_at)}
+            {p.recurrence_ms ? ` · ${recurrenceLabel(p.recurrence_ms)}` : ''}
+          </span>
+        ) : (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            —
+          </Typography.Text>
+        ),
     },
     {
       title: 'Expected',

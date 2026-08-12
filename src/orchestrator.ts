@@ -17,10 +17,11 @@
 
 import "dotenv/config";
 import { query, type Options, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { MemoryStore, buildMemoryServer, type ProposalRow } from "./memory-server.js";
+import { MemoryStore, buildMemoryServer, type Priority, type ProposalRow } from "./memory-server.js";
 import { buildIntegrationsServer, READONLY_INTEGRATION_TOOLS } from "./integrations-server.js";
 import { emitAgentEvent } from "./events.js";
 import { waitForDecision } from "./review-gateway.js";
+import { onReactiveTrigger } from "./reactive-triggers.js";
 import { startServer } from "./server.js";
 
 const DOMAINS = (process.env.AGENT_DOMAINS ?? "micro-SaaS tool for developers (self-built and self-hosted),Chrome extension for developers,VS Code extension for developers")
@@ -31,6 +32,10 @@ const DB_PATH = process.env.AGENT_DB_PATH ?? "./data/agent.db";
 const CYCLE_INTERVAL_MS = Number(process.env.AGENT_CYCLE_INTERVAL_MS ?? 1000 * 60 * 60); // 1h default
 const SERVER_PORT = Number(process.env.AGENT_SERVER_PORT ?? 4001);
 const MAX_PENDING_PROPOSALS = Number(process.env.AGENT_MAX_PENDING_PROPOSALS ?? 5);
+// How often the scheduler checks for approved proposals whose next_run_at has
+// arrived (scheduled/recurring ones -- immediate approvals skip this and run
+// right away, see humanReviewPhase). Default: 15s.
+const SCHEDULER_TICK_MS = Number(process.env.AGENT_SCHEDULER_TICK_MS ?? 15_000);
 
 const store = new MemoryStore(DB_PATH);
 const memoryServer = buildMemoryServer(store);
@@ -141,6 +146,39 @@ async function runPhase(opts: {
 // to propose evenly across AGENT_DOMAINS, and can surface more than one
 // idea per cycle when several are genuinely strong.
 
+// Shared by the periodic research cycle and the reactive (needs_refinement)
+// pass below -- same read-only/memory tool grant either way, only the prompt
+// differs. Reused as-is so the two can't drift apart on what's allowed.
+//
+// IMPORTANT: `allowedTools` alone only skips the permission *prompt* for the
+// tools named in it -- per the SDK's own docs, restricting which tools are
+// actually available requires `canUseTool` (or the `tools` option). Without
+// this callback the model had the full default toolset (Bash, Read, Write,
+// Edit, ...) available here, permission-bypassed, despite the tool list
+// below suggesting otherwise -- confirmed live via a Bash call during a
+// research_plan run. Mirrors actPhase's canUseTool pattern instead of
+// `permissionMode: "bypassPermissions"`, which is what actually restricts
+// this phase to exactly the tools in RESEARCH_ALLOWED_TOOLS.
+const RESEARCH_ALLOWED_TOOLS = [
+  ...MEMORY_TOOLS,
+  "mcp__memory__proposal_create",
+  "WebSearch",
+  "WebFetch",
+  ...READONLY_INTEGRATION_TOOLS,
+];
+const RESEARCH_OPTIONS: Options = {
+  mcpServers,
+  allowedTools: RESEARCH_ALLOWED_TOOLS,
+  canUseTool: async (toolName) => {
+    const allowed = RESEARCH_ALLOWED_TOOLS.includes(toolName);
+    return allowed
+      ? { behavior: "allow" as const }
+      : { behavior: "deny" as const, message: `${toolName} is not available in the research phase` };
+  },
+  maxTurns: 60,
+  // No `agents` option set -> no Agent/Task tool -> this run cannot spawn subagents.
+};
+
 async function researchAndPlanPhase(): Promise<ProposalRow[]> {
   const beforeIds = new Set(store.listPendingProposals().map((p) => p.id));
 
@@ -158,16 +196,54 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
       `Then stop -- do not act on any proposal, a human reviews each one next.`,
       `If nothing concrete and boundable comes out of the research, don't force a proposal -- just stop.`,
     ].join("\n"),
-    options: {
-      mcpServers,
-      allowedTools: [...MEMORY_TOOLS, "mcp__memory__proposal_create", "WebSearch", "WebFetch", ...READONLY_INTEGRATION_TOOLS],
-      permissionMode: "bypassPermissions", // safe: every tool here is read-only or writes to our own memory DB
-      maxTurns: 60,
-      // No `agents` option set -> no Agent/Task tool -> this run cannot spawn subagents.
-    },
+    options: RESEARCH_OPTIONS,
   });
 
   return store.listPendingProposals().filter((p) => !beforeIds.has(p.id));
+}
+
+// ---- reactive: a human action (marking a proposal "needs refinement") -----
+//
+// Feeds straight back into research+plan instead of sitting inert -- but
+// still only ever produces a *proposal*, gated behind the exact same human
+// review as everything else. Guarded against duplicate/overlapping runs for
+// the same proposal (in-flight set + a cooldown after each run).
+
+const REACTIVE_COOLDOWN_MS = 60 * 60 * 1000; // 1h
+const reactiveInFlight = new Set<number>();
+const reactiveLastRunAt = new Map<number, number>();
+
+async function handleReactiveTrigger(proposalId: number): Promise<void> {
+  if (reactiveInFlight.has(proposalId)) return;
+  const lastRun = reactiveLastRunAt.get(proposalId);
+  if (lastRun && Date.now() - lastRun < REACTIVE_COOLDOWN_MS) return;
+
+  const proposal = store.getProposal(proposalId);
+  if (!proposal) return;
+
+  reactiveInFlight.add(proposalId);
+  try {
+    const beforeIds = new Set(store.listPendingProposals().map((p) => p.id));
+
+    await runPhase({
+      phase: "research_plan",
+      proposalId: proposal.id,
+      prompt: [
+        `Proposal #${proposal.id} in domain "${proposal.domain}" was marked "needs refinement" by a human reviewer after its deliverable was built: ${proposal.description}`,
+        `Call lesson_search and research_note_search for this domain first -- don't re-research what's already known.`,
+        `Investigate what's likely missing or broken -- re-read the shipped repo with github_read_repo/github_read_file if that helps.`,
+        `If you find something concrete and boundable, call proposal_create for a tightly-scoped follow-up fix addressing the refinement need.`,
+        `If there isn't enough signal yet to propose something concrete, save a research_note explaining what's unclear and stop -- don't force a proposal.`,
+      ].join("\n"),
+      options: RESEARCH_OPTIONS,
+    });
+
+    const created = store.listPendingProposals().filter((p) => !beforeIds.has(p.id));
+    for (const p of created) enqueueForReview(p);
+  } finally {
+    reactiveInFlight.delete(proposalId);
+    reactiveLastRunAt.set(proposalId, Date.now());
+  }
 }
 
 // ---- phase 2: human review -------------------------------------------------
@@ -193,8 +269,30 @@ async function humanReviewPhase(proposal: ProposalRow): Promise<ProposalRow> {
   const decision = await waitForDecision(proposal.id);
 
   store.decideProposal(proposal.id, decision.approved ? "approved" : "rejected", decision.notes);
+
+  if (decision.approved) {
+    // Priority/schedule/recurrence are set by the human right here, at the moment
+    // they already approve the proposal -- never by the model, and never editable
+    // after the fact except via cancelSchedule.
+    store.scheduleApprovedProposal(proposal.id, {
+      priority: decision.priority ?? "normal",
+      scheduledAt: decision.scheduledAt ?? null,
+      recurrenceMs: decision.recurrenceMs ?? null,
+    });
+  }
+
   const updated = store.getProposal(proposal.id)!;
   emitAgentEvent({ type: "proposal_decided", proposal: updated });
+
+  if (decision.approved) {
+    if (decision.scheduledAt && new Date(decision.scheduledAt).getTime() > Date.now()) {
+      emitAgentEvent({ type: "proposal_scheduled", proposal: updated });
+    } else {
+      // No future schedule -- run right away, same as before this feature existed.
+      enqueueDue(updated, false);
+    }
+  }
+
   return updated;
 }
 
@@ -244,26 +342,93 @@ async function reflectPhase(proposal: ProposalRow): Promise<void> {
     options: {
       mcpServers: { memory: memoryServer },
       allowedTools: [...MEMORY_TOOLS],
-      permissionMode: "bypassPermissions",
+      // See the comment on RESEARCH_OPTIONS above -- bypassPermissions + allowedTools
+      // does not restrict the toolset, only canUseTool does.
+      canUseTool: async (toolName) => {
+        const allowed = MEMORY_TOOLS.includes(toolName);
+        return allowed
+          ? { behavior: "allow" as const }
+          : { behavior: "deny" as const, message: `${toolName} is not available in the reflect phase` };
+      },
       maxTurns: 10,
     },
   });
 }
 
-// ---- concurrency: parallel review, serialized act+reflect -------------------
+// ---- concurrency: parallel review, priority-ordered serialized act+reflect --
+//
+// Execution stays fully serialized -- one real side-effecting run at a time,
+// same safety property as before -- but which approved proposal goes next now
+// respects priority (then earliest due) instead of pure arrival order. A
+// proposal lands in runQueue either immediately on approval (humanReviewPhase,
+// when it's due right now) or later via the scheduler tick (schedulerTick,
+// for anything with a future scheduled_at or a recurring next_run_at).
 
-let actChainTail: Promise<void> = Promise.resolve();
+const PRIORITY_RANK: Record<Priority, number> = { urgent: 3, high: 2, normal: 1, low: 0 };
 
-/** Runs act+reflect for one proposal after whatever's already queued finishes -- never concurrently with another. */
-function scheduleActAndReflect(proposal: ProposalRow): Promise<void> {
-  const run = actChainTail
-    .then(() => actPhase(proposal))
-    .then(() => reflectPhase(proposal))
-    .catch((err) => {
-      console.error(`[act] proposal #${proposal.id} failed:`, err);
+interface QueuedRun {
+  proposal: ProposalRow;
+  /** True when this run was woken by the scheduler (a future schedule or a repeat) rather than an immediate approval. */
+  wasScheduled: boolean;
+}
+
+const runQueue: QueuedRun[] = [];
+let workerBusy = false;
+let runningProposalId: number | null = null;
+
+function isQueuedOrRunning(id: number): boolean {
+  return runningProposalId === id || runQueue.some((r) => r.proposal.id === id);
+}
+
+/** Adds a due proposal to the run queue (no-op if it's already queued or running) and kicks the worker. */
+function enqueueDue(proposal: ProposalRow, wasScheduled: boolean): void {
+  if (isQueuedOrRunning(proposal.id)) return;
+  runQueue.push({ proposal, wasScheduled });
+  void drainQueue();
+}
+
+function pickNext(): QueuedRun | undefined {
+  if (runQueue.length === 0) return undefined;
+  runQueue.sort((a, b) => {
+    const rankDiff = PRIORITY_RANK[b.proposal.priority] - PRIORITY_RANK[a.proposal.priority];
+    if (rankDiff !== 0) return rankDiff;
+    return (a.proposal.next_run_at ?? "").localeCompare(b.proposal.next_run_at ?? "");
+  });
+  return runQueue.shift();
+}
+
+/** The single worker: runs the best-ranked queued proposal, then recurses to drain anything else already due. */
+async function drainQueue(): Promise<void> {
+  if (workerBusy) return;
+  const next = pickNext();
+  if (!next) return;
+
+  workerBusy = true;
+  runningProposalId = next.proposal.id;
+  try {
+    if (next.wasScheduled) {
+      emitAgentEvent({ type: "scheduled_run_starting", proposal: next.proposal });
+    }
+    await actPhase(next.proposal);
+    await reflectPhase(next.proposal);
+  } catch (err) {
+    console.error(`[act] proposal #${next.proposal.id} failed:`, err);
+  } finally {
+    store.advanceOrClearSchedule(next.proposal.id, {
+      recurring: Boolean(next.proposal.recurrence_ms),
+      recurrenceMs: next.proposal.recurrence_ms,
     });
-  actChainTail = run;
-  return run;
+    workerBusy = false;
+    runningProposalId = null;
+  }
+  void drainQueue();
+}
+
+/** Checks for approved proposals whose next_run_at has arrived and queues them -- the wake-up for scheduled/recurring work. */
+function schedulerTick(): void {
+  for (const p of store.listDueProposals(new Date().toISOString())) {
+    enqueueDue(p, true);
+  }
 }
 
 /** Fire-and-forget: waits for this proposal's review independently of any others in flight. */
@@ -272,9 +437,7 @@ function enqueueForReview(proposal: ProposalRow): void {
     const decided = await humanReviewPhase(proposal);
     if (decided.status !== "approved") {
       console.log(`Proposal #${decided.id} rejected. Reason: ${decided.human_notes ?? "(none given)"}`);
-      return;
     }
-    await scheduleActAndReflect(decided);
   })();
 }
 
@@ -283,6 +446,7 @@ function enqueueForReview(proposal: ProposalRow): void {
 async function mainLoop() {
   console.log(`Agent runner started. Domains: ${DOMAINS.join("; ")}. DB: ${DB_PATH}`);
   startServer(store, DOMAINS, SERVER_PORT);
+  onReactiveTrigger((t) => void handleReactiveTrigger(t.proposalId));
   emitAgentEvent({ type: "run_started", domains: DOMAINS });
 
   // Pick up any proposals left pending from a previous run -- all queued for
@@ -290,6 +454,11 @@ async function mainLoop() {
   for (const leftover of store.listPendingProposals()) {
     enqueueForReview(leftover);
   }
+
+  // Catch up on anything already due (scheduled/recurring proposals whose time
+  // arrived while the process was down), then keep checking on an interval.
+  schedulerTick();
+  setInterval(schedulerTick, SCHEDULER_TICK_MS);
 
   while (true) {
     const pendingCount = store.listPendingProposals().length;

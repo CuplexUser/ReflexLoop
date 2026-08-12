@@ -16,6 +16,8 @@ export type AgentEvent =
   | { type: "phase_done"; phase: string; proposalId: number | null; costUsd: number; durationMs: number }
   | { type: "proposal_pending"; proposal: ProposalRow }
   | { type: "proposal_decided"; proposal: ProposalRow }
+  | { type: "proposal_scheduled"; proposal: ProposalRow }
+  | { type: "scheduled_run_starting"; proposal: ProposalRow }
   | { type: "outcome_recorded"; proposalId: number }
   | { type: "lesson_saved"; domain: string }
   | { type: "cycle_idle"; nextCycleAt: string };

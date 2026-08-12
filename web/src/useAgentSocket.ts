@@ -1,6 +1,8 @@
 import { useEffect, useReducer, useRef } from 'react'
 import type { AgentEvent, FeedEntry, PersistedEvent, ProposalRow } from './types'
 import { api } from './api'
+import { notify } from './notifications'
+import { preview } from './format'
 
 const FEED_LIMIT = 400
 
@@ -15,11 +17,15 @@ interface SocketState {
   runningPhase: { phase: string; proposalId: number | null } | null
   /** Bumped only on events that mean "REST history/status is now stale" -- pages use this as a refetch trigger. */
   historyVersion: number
+  /** Set only for genuinely live socket events (never during the REST history seed) -- drives browser notifications. */
+  liveEventPulse: { id: number; event: AgentEvent } | null
 }
 
 const HISTORY_CHANGING_EVENTS = new Set<AgentEvent['type']>([
   'proposal_pending',
   'proposal_decided',
+  'proposal_scheduled',
+  'scheduled_run_starting',
   'outcome_recorded',
   'lesson_saved',
   'phase_done',
@@ -85,7 +91,10 @@ function reducer(state: SocketState, action: Action): SocketState {
   const seenIds = new Set(state.seenIds)
   seenIds.add(action.id)
   const feed: FeedEntry[] = [...state.feed, toFeedEntry(action.id, action.occurredAt, action.event)].slice(-FEED_LIMIT)
-  return applyEvent({ ...state, feed, seenIds }, action.event)
+  return applyEvent(
+    { ...state, feed, seenIds, liveEventPulse: { id: action.id, event: action.event } },
+    action.event,
+  )
 }
 
 export function useAgentSocket() {
@@ -97,8 +106,27 @@ export function useAgentSocket() {
     pendingProposals: [],
     runningPhase: null,
     historyVersion: 0,
+    liveEventPulse: null,
   })
   const retryDelay = useRef(1000)
+
+  useEffect(() => {
+    if (!state.liveEventPulse) return
+    const { event } = state.liveEventPulse
+    if (event.type === 'proposal_pending') {
+      notify(
+        `Proposal #${event.proposal.id} awaiting review`,
+        preview(event.proposal.description, 160),
+        `proposal-pending-${event.proposal.id}`,
+      )
+    } else if (event.type === 'scheduled_run_starting') {
+      notify(
+        `Scheduled action starting: #${event.proposal.id}`,
+        preview(event.proposal.description, 160),
+        `scheduled-run-${event.proposal.id}`,
+      )
+    }
+  }, [state.liveEventPulse])
 
   useEffect(() => {
     api

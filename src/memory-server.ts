@@ -115,13 +115,33 @@ export class MemoryStore {
     // Human-only verdict on an approved proposal's actual deliverable -- separate from
     // the model's self-reported outcome.success, and never settable by the model itself.
     this.ensureColumn("proposals", "review_status", "TEXT");
+
+    // Priority + scheduling, all human-set at approval time (see decideProposal /
+    // scheduleApprovedProposal) -- the model never controls when or how urgently a
+    // real action runs. next_run_at is orchestrator-maintained: the scheduler polls
+    // it, and it's what distinguishes "nothing pending" from "waiting for its turn."
+    const addedPriority = this.ensureColumn("proposals", "priority", "TEXT NOT NULL DEFAULT 'normal'");
+    this.ensureColumn("proposals", "scheduled_at", "TEXT");
+    this.ensureColumn("proposals", "recurrence_ms", "INTEGER");
+    this.ensureColumn("proposals", "next_run_at", "TEXT");
+    if (addedPriority) {
+      // One-time backfill for proposals approved before this migration existed --
+      // otherwise they'd have next_run_at = NULL forever, which now means "nothing
+      // pending" instead of "hasn't run yet." Harmless no-op against a fresh DB.
+      this.db.exec(`
+        UPDATE proposals SET next_run_at = datetime('now')
+        WHERE status = 'approved'
+          AND NOT EXISTS (SELECT 1 FROM actions WHERE actions.proposal_id = proposals.id AND actions.phase = 'act')
+      `);
+    }
   }
 
-  private ensureColumn(table: string, column: string, type: string) {
+  /** Returns true if the column didn't already exist and was just added. */
+  private ensureColumn(table: string, column: string, type: string): boolean {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
-    if (!columns.some((c) => c.name === column)) {
-      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
-    }
+    if (columns.some((c) => c.name === column)) return false;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    return true;
   }
 
   close() {
@@ -229,6 +249,42 @@ export class MemoryStore {
   /** Human-only verdict on whether an approved proposal's deliverable is MVP-done or needs more work. */
   setProposalReview(id: number, reviewStatus: "mvp_done" | "needs_refinement" | null) {
     this.db.prepare(`UPDATE proposals SET review_status = ? WHERE id = ?`).run(reviewStatus, id);
+  }
+
+  /** Called right after approval: sets the human-chosen priority/schedule and computes the first next_run_at. */
+  scheduleApprovedProposal(
+    id: number,
+    opts: { priority: Priority; scheduledAt: string | null; recurrenceMs: number | null }
+  ) {
+    const nextRunAt = opts.scheduledAt ?? now();
+    this.db
+      .prepare(
+        `UPDATE proposals SET priority = ?, scheduled_at = ?, recurrence_ms = ?, next_run_at = ? WHERE id = ?`
+      )
+      .run(opts.priority, opts.scheduledAt, opts.recurrenceMs, nextRunAt, id);
+  }
+
+  /** Approved proposals whose next_run_at has arrived, highest priority and earliest-due first. */
+  listDueProposals(nowIso: string) {
+    return this.db
+      .prepare(
+        `SELECT * FROM proposals
+         WHERE status = 'approved' AND next_run_at IS NOT NULL AND next_run_at <= ?
+         ORDER BY CASE priority WHEN 'urgent' THEN 3 WHEN 'high' THEN 2 WHEN 'normal' THEN 1 ELSE 0 END DESC,
+                  next_run_at ASC`
+      )
+      .all(nowIso) as unknown as ProposalRow[];
+  }
+
+  /** After a run completes: recurring proposals get rescheduled, one-shot proposals are cleared so they don't run again. */
+  advanceOrClearSchedule(id: number, opts: { recurring: boolean; recurrenceMs: number | null }) {
+    const nextRunAt = opts.recurring && opts.recurrenceMs ? new Date(Date.now() + opts.recurrenceMs).toISOString() : null;
+    this.db.prepare(`UPDATE proposals SET next_run_at = ? WHERE id = ?`).run(nextRunAt, id);
+  }
+
+  /** Stops a scheduled/recurring proposal from running again, without touching its approval status. */
+  cancelSchedule(id: number) {
+    this.db.prepare(`UPDATE proposals SET next_run_at = NULL, recurrence_ms = NULL WHERE id = ?`).run(id);
   }
 
   // ---- actions (written by orchestrator hooks, not by the model) --------
@@ -451,6 +507,8 @@ function omitEmbedding<T extends { embedding: string | null }>(row: T): Omit<T, 
   return rest;
 }
 
+export type Priority = "low" | "normal" | "high" | "urgent";
+
 export interface ProposalRow {
   id: number;
   domain: string;
@@ -464,6 +522,10 @@ export interface ProposalRow {
   created_at: string;
   decided_at: string | null;
   review_status: "mvp_done" | "needs_refinement" | null;
+  priority: Priority;
+  scheduled_at: string | null;
+  recurrence_ms: number | null;
+  next_run_at: string | null;
 }
 
 function safeJson(v: unknown) {

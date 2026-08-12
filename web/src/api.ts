@@ -4,11 +4,18 @@ import type {
   LessonRow,
   OutcomeRow,
   PersistedEvent,
+  Priority,
   ProposalRow,
   ResearchNoteRow,
   RunRow,
   StatusResponse,
 } from './types'
+
+export interface ScheduleOptions {
+  priority?: Priority
+  scheduledAt?: string | null
+  recurrenceMs?: number | null
+}
 
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(path)
@@ -27,11 +34,11 @@ export const api = {
   events: () => getJson<PersistedEvent[]>('/api/events'),
   actions: () => getJson<ActionWithProposal[]>('/api/actions'),
 
-  async decide(id: number, approved: boolean, notes?: string): Promise<void> {
+  async decide(id: number, approved: boolean, notes?: string, schedule?: ScheduleOptions): Promise<void> {
     const res = await fetch(`/api/proposals/${id}/decision`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ approved, notes }),
+      body: JSON.stringify({ approved, notes, ...schedule }),
     })
     if (!res.ok) {
       const body = await res.json().catch(() => ({}))
@@ -48,6 +55,14 @@ export const api = {
     if (!res.ok) {
       const body = await res.json().catch(() => ({}))
       throw new Error(body.error ?? `Review update failed: ${res.status}`)
+    }
+  },
+
+  async cancelSchedule(id: number): Promise<void> {
+    const res = await fetch(`/api/proposals/${id}/cancel-schedule`, { method: 'POST' })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error ?? `Cancel schedule failed: ${res.status}`)
     }
   },
 }

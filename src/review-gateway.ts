@@ -9,6 +9,10 @@
 export interface Decision {
   approved: boolean;
   notes?: string;
+  /** Only meaningful when approved -- human-set at decision time, never by the model. */
+  priority?: "low" | "normal" | "high" | "urgent";
+  scheduledAt?: string | null;
+  recurrenceMs?: number | null;
 }
 
 const pendingResolvers = new Map<number, (decision: Decision) => void>();

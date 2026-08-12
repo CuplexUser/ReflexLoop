@@ -14,9 +14,10 @@ import { WebSocketServer, WebSocket } from "ws";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
-import type { MemoryStore } from "./memory-server.js";
+import type { MemoryStore, Priority } from "./memory-server.js";
 import { onAgentEvent, type AgentEvent } from "./events.js";
 import { submitDecision, hasPendingDecision } from "./review-gateway.js";
+import { fireReactiveTrigger } from "./reactive-triggers.js";
 
 export function startServer(store: MemoryStore, domains: string[], port: number): Server {
   const app = express();
@@ -34,18 +35,49 @@ export function startServer(store: MemoryStore, domains: string[], port: number)
     res.json(store.listActions(Number(req.params.id)));
   });
 
+  const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
+  const MIN_RECURRENCE_MS = 5 * 60 * 1000; // 5 minutes -- blocks a fat-fingered tight loop
+
   app.post("/api/proposals/:id/decision", (req, res) => {
     const id = Number(req.params.id);
     if (!hasPendingDecision(id)) {
       res.status(409).json({ error: "No pending decision for this proposal (already decided, or not up for review)." });
       return;
     }
-    const { approved, notes } = req.body as { approved?: boolean; notes?: string };
+    const { approved, notes, priority, scheduledAt, recurrenceMs } = req.body as {
+      approved?: boolean;
+      notes?: string;
+      priority?: Priority;
+      scheduledAt?: string | null;
+      recurrenceMs?: number | null;
+    };
     if (typeof approved !== "boolean") {
       res.status(400).json({ error: "Body must include boolean `approved`." });
       return;
     }
-    submitDecision(id, { approved, notes });
+    if (priority !== undefined && !PRIORITIES.includes(priority)) {
+      res.status(400).json({ error: `\`priority\` must be one of: ${PRIORITIES.join(", ")}.` });
+      return;
+    }
+    if (scheduledAt != null && Number.isNaN(new Date(scheduledAt).getTime())) {
+      res.status(400).json({ error: "`scheduledAt` must be a valid date string." });
+      return;
+    }
+    if (recurrenceMs != null && (!Number.isFinite(recurrenceMs) || recurrenceMs < MIN_RECURRENCE_MS)) {
+      res.status(400).json({ error: `\`recurrenceMs\` must be at least ${MIN_RECURRENCE_MS}ms (5 minutes).` });
+      return;
+    }
+    submitDecision(id, { approved, notes, priority, scheduledAt, recurrenceMs });
+    res.json({ ok: true });
+  });
+
+  app.post("/api/proposals/:id/cancel-schedule", (req, res) => {
+    const id = Number(req.params.id);
+    if (!store.getProposal(id)) {
+      res.status(404).json({ error: "No such proposal." });
+      return;
+    }
+    store.cancelSchedule(id);
     res.json({ ok: true });
   });
 
@@ -61,6 +93,9 @@ export function startServer(store: MemoryStore, domains: string[], port: number)
       return;
     }
     store.setProposalReview(id, reviewStatus);
+    if (reviewStatus === "needs_refinement") {
+      fireReactiveTrigger({ proposalId: id, reason: "needs_refinement" });
+    }
     res.json({ ok: true });
   });
 

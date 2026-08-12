@@ -1,11 +1,48 @@
-import { Space, Tag, Typography } from 'antd'
+import { useEffect, useState } from 'react'
+import { Button, Space, Tag, Tooltip, Typography } from 'antd'
+import { BellFilled, BellOutlined } from '@ant-design/icons'
 import { PHASE_LABEL } from '../format'
 import { palette } from '../theme'
+import { getPermissionState, requestPermission, type NotificationPermissionState } from '../notifications'
 
 const CONNECTION_LABEL: Record<string, string> = {
   connecting: 'connecting…',
   open: 'live',
   closed: 'disconnected',
+}
+
+function NotificationBell() {
+  const [state, setState] = useState<NotificationPermissionState>('default')
+
+  useEffect(() => {
+    setState(getPermissionState())
+  }, [])
+
+  if (state === 'unsupported') return null
+
+  if (state === 'granted') {
+    return (
+      <Tooltip title="Browser notifications enabled -- you'll be notified here when a proposal needs review or a scheduled action starts">
+        <BellFilled style={{ color: palette.approved, fontSize: 16 }} />
+      </Tooltip>
+    )
+  }
+
+  if (state === 'denied') {
+    return (
+      <Tooltip title="Browser notifications are blocked -- enable them in your browser's site settings to turn this back on">
+        <BellOutlined style={{ color: palette.textFaint, fontSize: 16 }} />
+      </Tooltip>
+    )
+  }
+
+  return (
+    <Tooltip title="Get a browser notification here when a proposal needs review or a scheduled action starts">
+      <Button size="small" icon={<BellOutlined />} onClick={async () => setState(await requestPermission())}>
+        Enable notifications
+      </Button>
+    </Tooltip>
+  )
 }
 
 export function StatusBar({
@@ -48,6 +85,8 @@ export function StatusBar({
       ) : (
         <Tag>idle</Tag>
       )}
+
+      <NotificationBell />
     </Space>
   )
 }

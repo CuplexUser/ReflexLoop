@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
 import { App, Button, Descriptions, Divider, Input, Modal, Skeleton, Space, Statistic, Table, Tag, Typography } from 'antd'
-import { CheckCircleOutlined, CloseCircleOutlined } from '@ant-design/icons'
+import { CheckCircleOutlined, ClockCircleOutlined, CloseCircleOutlined } from '@ant-design/icons'
 import type { ActionRow, OutcomeRow, ProposalRow } from '../types'
-import { api } from '../api'
-import { preview } from '../format'
+import { api, type ScheduleOptions } from '../api'
+import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, preview, recurrenceLabel } from '../format'
 import { palette } from '../theme'
+import { SchedulePriorityFields } from './SchedulePriorityFields'
 
 const STATUS_COLOR: Record<ProposalRow['status'], string> = {
   pending: 'warning',
@@ -28,6 +29,9 @@ export function ProposalDialog({
   const [rejecting, setRejecting] = useState(false)
   const [notes, setNotes] = useState('')
   const [submitting, setSubmitting] = useState<'approve' | 'reject' | null>(null)
+  const [showSchedule, setShowSchedule] = useState(false)
+  const [schedule, setSchedule] = useState<ScheduleOptions>({})
+  const [cancellingSchedule, setCancellingSchedule] = useState(false)
 
   useEffect(() => {
     if (!open || !proposal) return
@@ -35,6 +39,8 @@ export function ProposalDialog({
     setRejecting(false)
     setNotes('')
     setSubmitting(null)
+    setShowSchedule(false)
+    setSchedule({})
     let cancelled = false
     api
       .proposalActions(proposal.id)
@@ -56,13 +62,27 @@ export function ProposalDialog({
     if (!proposal) return
     setSubmitting(approved ? 'approve' : 'reject')
     try {
-      await api.decide(proposal.id, approved, notes || undefined)
+      await api.decide(proposal.id, approved, notes || undefined, approved ? schedule : undefined)
       message.success(approved ? `Approved proposal #${proposal.id}` : `Rejected proposal #${proposal.id}`)
       onClose()
     } catch (err) {
       message.error(err instanceof Error ? err.message : 'Decision failed')
     } finally {
       setSubmitting(null)
+    }
+  }
+
+  async function cancelSchedule() {
+    if (!proposal) return
+    setCancellingSchedule(true)
+    try {
+      await api.cancelSchedule(proposal.id)
+      message.success('Schedule cancelled')
+      onClose()
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : 'Cancel schedule failed')
+    } finally {
+      setCancellingSchedule(false)
     }
   }
 
@@ -118,6 +138,23 @@ export function ProposalDialog({
           </div>
         </div>
 
+        {proposal.status === 'approved' && (
+          <Space align="center" size={10} wrap>
+            <Tag color={PRIORITY_TAG_COLOR[proposal.priority]}>{PRIORITY_LABEL[proposal.priority]} priority</Tag>
+            {proposal.next_run_at && (
+              <Tag icon={<ClockCircleOutlined />} color="processing">
+                next run {inWords(proposal.next_run_at)}
+                {proposal.recurrence_ms ? ` · ${recurrenceLabel(proposal.recurrence_ms)}` : ''}
+              </Tag>
+            )}
+            {(proposal.next_run_at || proposal.recurrence_ms) && (
+              <Button size="small" danger ghost loading={cancellingSchedule} onClick={cancelSchedule}>
+                Cancel schedule
+              </Button>
+            )}
+          </Space>
+        )}
+
         {outcome && (
           <Descriptions size="small" column={4} bordered>
             <Descriptions.Item label="Actual revenue">${outcome.actual_revenue.toFixed(2)}</Descriptions.Item>
@@ -168,6 +205,18 @@ export function ProposalDialog({
                 onChange={(e) => setNotes(e.target.value)}
                 autoSize={{ minRows: 2, maxRows: 4 }}
               />
+            )}
+            {!rejecting && (
+              <div>
+                <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setShowSchedule((v) => !v)}>
+                  {showSchedule ? 'Hide schedule & priority' : 'Schedule & priority…'}
+                </Button>
+                {showSchedule && (
+                  <div style={{ marginTop: 8 }}>
+                    <SchedulePriorityFields onChange={setSchedule} />
+                  </div>
+                )}
+              </div>
             )}
             <Space>
               <Button
