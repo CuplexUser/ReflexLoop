@@ -30,30 +30,43 @@ function headers(): Record<string, string> {
   return { "api-key": API_KEY!, "Content-Type": "application/json" };
 }
 
-// Collections confirmed to exist this process -- avoids a GET before every
-// write/search once a collection's presence has been established.
-const ensuredCollections = new Set<string>();
+// Collections confirmed (or in the process of being confirmed) to exist this
+// process -- avoids a GET before every write/search once a collection's
+// presence has been established, and de-dupes concurrent first-time callers
+// (e.g. syncToQdrant's Promise.all) onto a single in-flight attempt so they
+// don't race each other to create the same collection.
+const ensuredCollections = new Map<string, Promise<boolean>>();
 
-async function ensureCollection(name: string): Promise<boolean> {
-  if (ensuredCollections.has(name)) return true;
-  if (!qdrantAvailable) return false;
+function ensureCollection(name: string): Promise<boolean> {
+  if (!qdrantAvailable) return Promise.resolve(false);
+  let promise = ensuredCollections.get(name);
+  if (!promise) {
+    promise = ensureCollectionUncached(name);
+    ensuredCollections.set(name, promise);
+    // Don't cache a failed attempt -- let a later call retry from scratch.
+    promise.then((ok) => {
+      if (!ok) ensuredCollections.delete(name);
+    });
+  }
+  return promise;
+}
 
+async function ensureCollectionUncached(name: string): Promise<boolean> {
   try {
     const existing = await fetch(`${BASE_URL}/collections/${name}`, { headers: headers() });
-    if (existing.ok) {
-      ensuredCollections.add(name);
-      return true;
-    }
+    if (existing.ok) return true;
+
     const created = await fetch(`${BASE_URL}/collections/${name}`, {
       method: "PUT",
       headers: headers(),
       body: JSON.stringify({ vectors: { size: DIM, distance: DISTANCE } }),
     });
-    if (!created.ok) {
+    // 409 = another process (or a lost local race) created it first -- that's the
+    // desired end state, not a failure.
+    if (!created.ok && created.status !== 409) {
       console.error(`[qdrant] failed to create collection ${name}: ${created.status} ${await created.text()}`);
       return false;
     }
-    ensuredCollections.add(name);
     return true;
   } catch (err) {
     console.error(`[qdrant] ensureCollection(${name}) failed:`, err);
