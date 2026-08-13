@@ -1,5 +1,8 @@
 # TODO
 
+- [ ] Move large blobs/JSON out of SQLite (deferred -- see note below, not worth doing yet)
+- [x] Switch to npm workspaces
+
 ## Move large blobs/JSON out of SQLite
 
 `actions.tool_input` / `actions.tool_output` store full JSON blobs inline as TEXT --

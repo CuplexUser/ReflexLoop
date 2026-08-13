@@ -27,7 +27,8 @@ npm start             # tsx src/orchestrator.ts — runs the agent loop + web co
 There is no automated test suite beyond `smoke-test.ts` (`src/smoke-test.ts`) — it exercises
 `MemoryStore` directly against a throwaway `./data/smoke-test.db`.
 
-Frontend (`web/`), run from `web/` or via the root proxies:
+Frontend (`web/`) is an npm workspace of the root project — `npm install` at the root sets up both.
+Run its scripts from the root (below) or with `npm run <script> -w web` from anywhere:
 
 ```bash
 npm run web:dev       # Vite dev server with hot reload; proxies /api and /ws to the backend on AGENT_SERVER_PORT

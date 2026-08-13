@@ -2,13 +2,16 @@
   "name": "agent-runner",
   "version": "1.0.0",
   "description": "",
+  "workspaces": [
+    "web"
+  ],
   "scripts": {
     "start": "tsx src/orchestrator.ts",
     "typecheck": "tsc --noEmit",
     "smoke-test": "tsx src/smoke-test.ts",
-    "web:dev": "npm --prefix web run dev",
-    "web:build": "npm --prefix web run build",
-    "web:lint": "npm --prefix web run lint"
+    "web:dev": "npm run -w web dev",
+    "web:build": "npm run -w web build",
+    "web:lint": "npm run -w web lint"
   },
   "keywords": [],
   "author": "",
