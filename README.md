@@ -51,7 +51,7 @@ there.
   successful are deliberately *not* tools the model has — those stay with
   the orchestrator and with you. Research notes and lessons are embedded
   (see Semantic search below) and ranked by similarity instead of
-  exact/`LIKE` text matching, when embeddings are available.
+  exact/`LIKE` text matching, when Qdrant is configured.
   `action_history_search` lets research/plan see what's already been
   built/deployed/committed on approved proposals so it doesn't propose
   duplicate work.
@@ -81,8 +81,12 @@ there.
   is preferred over the older one-file-per-call `github_commit_file`;
   `github_merge_pr` exists so a proposal that opens a PR can also land it
   instead of leaving the default branch empty.
-- `src/embeddings.ts` — Voyage AI client for semantic search. Fails soft: with
-  no `VOYAGE_API_KEY`, everything falls back to the old `LIKE`-based search.
+- `src/qdrant.ts` — Qdrant Cloud client: vector storage/search plus
+  server-side embedding inference (Cloud Inference) in the same request, so
+  there's no separate embeddings provider to rate-limit against. Fails soft:
+  without `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
+  `QDRANT_EMBEDDING_DIM` all set, everything falls back to the old
+  `LIKE`-based search.
 - `src/events.ts` / `src/review-gateway.ts` / `src/server.ts` — the live layer
   the web UI runs on. `events.ts` is an in-process bus the orchestrator emits
   to as it works (including `proposal_scheduled` and `scheduled_run_starting`
@@ -120,8 +124,12 @@ Copy `.env.example` to `.env` and fill in what you have:
 - `GITHUB_TOKEN` / `VERCEL_TOKEN` / `NETLIFY_AUTH_TOKEN` — optional; omit any
   of them and that integration's tools simply aren't usable. No Stripe
   integration yet.
-- `VOYAGE_API_KEY` (+ `VOYAGE_API_BASE_URL`) — optional; enables semantic
-  search.
+- `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
+  `QDRANT_EMBEDDING_DIM` (+ `QDRANT_EMBEDDING_DISTANCE`) — optional, but all
+  four of the first group are required together; enables semantic search.
+  Free cluster at [cloud.qdrant.io](https://cloud.qdrant.io), no credit card
+  needed — model name and dimension are listed per-cluster in the Cloud
+  Console's Inference tab.
 - `AGENT_SCHEDULER_TICK_MS` — optional, default 15000; how often the
   scheduler checks for approved proposals whose scheduled/recurring run is
   due.
@@ -171,12 +179,13 @@ nothing is polled or written to a file.
 
 ## Semantic search
 
-`research_note_search` and `lesson_search` embed with Voyage AI (Anthropic's
-recommended embeddings provider) and rank by cosine similarity when
-`VOYAGE_API_KEY` is set, so a lesson written for "VS Code extension for
-productivity" can still surface for a proposal in "VS Code extensions" —
-wording doesn't have to match. Without a key, both fall back to the original
-`LIKE`-based search, so nothing breaks if you skip it.
+`research_note_search` and `lesson_search` embed with Qdrant Cloud Inference
+and rank by vector similarity when Qdrant is configured, so a lesson written
+for "VS Code extension for productivity" can still surface for a proposal in
+"VS Code extensions" — wording doesn't have to match. Without it configured,
+both fall back to the original `LIKE`-based search, so nothing breaks if you
+skip it. `MemoryStore.syncToQdrant()` runs once at startup to backfill any
+rows that were written before Qdrant was configured.
 
 ## Multiple domains, multiple proposals
 

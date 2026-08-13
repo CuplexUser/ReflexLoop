@@ -16,7 +16,7 @@ import { DatabaseSync } from "node:sqlite";
 import { tool, createSdkMcpServer, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { emitAgentEvent } from "./events.js";
-import { cosineSimilarity, embedDocument, embedQuery } from "./embeddings.js";
+import { qdrantAvailable, searchByText, upsertText } from "./qdrant.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS research_notes (
@@ -105,13 +105,12 @@ export class MemoryStore {
   constructor(path: string) {
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
-    // JSON-encoded embedding vectors, populated at write time when
-    // VOYAGE_API_KEY is set. NULL rows (no key, or the embedding call
-    // failed) are excluded from semantic ranking and search falls back to
-    // LIKE. Added via a runtime check rather than `ADD COLUMN IF NOT
-    // EXISTS` since that syntax isn't supported by every SQLite build.
-    this.ensureColumn("research_notes", "embedding", "TEXT");
-    this.ensureColumn("lessons", "embedding", "TEXT");
+    // Vector search moved to Qdrant Cloud (qdrant.ts) -- vectors live there now,
+    // keyed by the same row id, instead of inline as a JSON column here. Drops
+    // the old Voyage-embedding column from a pre-migration DB if present
+    // (node:sqlite's bundled SQLite supports DROP COLUMN); no-op on a fresh DB.
+    this.dropColumnIfExists("research_notes", "embedding");
+    this.dropColumnIfExists("lessons", "embedding");
     // Human-only verdict on an approved proposal's actual deliverable -- separate from
     // the model's self-reported outcome.success, and never settable by the model itself.
     this.ensureColumn("proposals", "review_status", "TEXT");
@@ -144,6 +143,12 @@ export class MemoryStore {
     return true;
   }
 
+  private dropColumnIfExists(table: string, column: string) {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    if (!columns.some((c) => c.name === column)) return;
+    this.db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+  }
+
   close() {
     this.db.close();
   }
@@ -151,22 +156,16 @@ export class MemoryStore {
   // ---- research ---------------------------------------------------------
 
   async addResearchNote(topic: string, finding: string, source?: string, confidence?: number) {
-    const embedding = await embedDocument(`${topic}: ${finding}`);
     const stmt = this.db.prepare(
-      `INSERT INTO research_notes (topic, finding, source, confidence, fetched_at, embedding) VALUES (?, ?, ?, ?, ?, ?)`
+      `INSERT INTO research_notes (topic, finding, source, confidence, fetched_at) VALUES (?, ?, ?, ?, ?)`
     );
-    const result = stmt.run(
-      topic,
-      finding,
-      source ?? null,
-      confidence ?? null,
-      now(),
-      embedding ? JSON.stringify(embedding) : null
-    );
-    return Number(result.lastInsertRowid);
+    const result = stmt.run(topic, finding, source ?? null, confidence ?? null, now());
+    const id = Number(result.lastInsertRowid);
+    await upsertText("research_notes", id, `${topic}: ${finding}`);
+    return id;
   }
 
-  /** Semantic search when embeddings are available, falling back to LIKE otherwise. */
+  /** Semantic search via Qdrant when configured, falling back to LIKE otherwise. */
   async searchResearchNotes(topic: string, limit = 10) {
     const semantic = await this.semanticSearch<ResearchNoteRow>("research_notes", topic, limit);
     if (semantic) return semantic;
@@ -174,32 +173,49 @@ export class MemoryStore {
     const stmt = this.db.prepare(
       `SELECT * FROM research_notes WHERE topic LIKE ? OR finding LIKE ? ORDER BY fetched_at DESC LIMIT ?`
     );
-    return (stmt.all(`%${topic}%`, `%${topic}%`, limit) as unknown as ResearchNoteRow[]).map(omitEmbedding);
+    return stmt.all(`%${topic}%`, `%${topic}%`, limit) as unknown as ResearchNoteRow[];
   }
 
   listAllResearchNotes(limit = 200) {
-    return (
-      this.db.prepare(`SELECT * FROM research_notes ORDER BY fetched_at DESC LIMIT ?`).all(limit) as unknown as ResearchNoteRow[]
-    ).map(omitEmbedding);
+    return this.db.prepare(`SELECT * FROM research_notes ORDER BY fetched_at DESC LIMIT ?`).all(limit) as unknown as ResearchNoteRow[];
   }
 
-  /** Cosine-similarity ranking over `table`'s embedding column; null if no query embedding could be produced. */
-  private async semanticSearch<T extends { embedding: string | null }>(
+  /**
+   * One-time backfill so rows inserted before Qdrant was configured (or under the old
+   * inline-Voyage-embedding scheme) become semantically searchable too. Upserting an id
+   * that's already present just overwrites the point, so this is safe to call on every
+   * startup rather than tracking which rows still need it.
+   */
+  async syncToQdrant() {
+    if (!qdrantAvailable) return;
+    const notes = this.db.prepare(`SELECT id, topic, finding FROM research_notes`).all() as {
+      id: number;
+      topic: string;
+      finding: string;
+    }[];
+    await Promise.all(notes.map((n) => upsertText("research_notes", n.id, `${n.topic}: ${n.finding}`)));
+
+    const lessons = this.db.prepare(`SELECT id, domain, lesson FROM lessons`).all() as {
+      id: number;
+      domain: string;
+      lesson: string;
+    }[];
+    await Promise.all(lessons.map((l) => upsertText("lessons", l.id, `${l.domain}: ${l.lesson}`)));
+  }
+
+  /** Ranks `table`'s rows by Qdrant vector similarity to `query`; null if Qdrant isn't configured or found nothing. */
+  private async semanticSearch<T extends { id: number }>(
     table: "research_notes" | "lessons",
     query: string,
     limit: number
-  ): Promise<Omit<T, "embedding">[] | null> {
-    const queryEmbedding = await embedQuery(query);
-    if (!queryEmbedding) return null;
+  ): Promise<T[] | null> {
+    const hits = await searchByText(table, query, limit);
+    if (!hits || hits.length === 0) return null;
 
-    const rows = this.db.prepare(`SELECT * FROM ${table} WHERE embedding IS NOT NULL`).all() as T[];
-    if (rows.length === 0) return null;
-
-    return rows
-      .map((row) => ({ row, score: cosineSimilarity(queryEmbedding, JSON.parse(row.embedding as string)) }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map(({ row }) => omitEmbedding(row));
+    const placeholders = hits.map(() => "?").join(",");
+    const rows = this.db.prepare(`SELECT * FROM ${table} WHERE id IN (${placeholders})`).all(...hits.map((h) => h.id)) as T[];
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    return hits.map((h) => byId.get(h.id)).filter((row): row is T => row !== undefined);
   }
 
   // ---- proposals ----------------------------------------------------------
@@ -383,45 +399,34 @@ export class MemoryStore {
   // ---- lessons --------------------------------------------------------------
 
   listAllLessons(limit = 200) {
-    return (
-      this.db.prepare(`SELECT * FROM lessons ORDER BY updated_at DESC LIMIT ?`).all(limit) as unknown as LessonRow[]
-    ).map(omitEmbedding);
+    return this.db.prepare(`SELECT * FROM lessons ORDER BY updated_at DESC LIMIT ?`).all(limit) as unknown as LessonRow[];
   }
 
   /**
-   * Semantic search over domain+lesson text when embeddings are available --
-   * this is what lets a lesson written for "VS Code extension for
-   * productivity" still surface for a proposal in "VS Code extensions",
-   * where the old exact `domain = ?` match would miss it. Falls back to
-   * exact domain equality (the original behavior) when no embedding could
-   * be produced.
+   * Semantic search over domain+lesson text when Qdrant is configured -- this is what
+   * lets a lesson written for "VS Code extension for productivity" still surface for a
+   * proposal in "VS Code extensions", where the old exact `domain = ?` match would miss
+   * it. Falls back to exact domain equality (the original behavior) when Qdrant isn't
+   * configured or the search failed.
    */
   async searchLessons(domain: string, limit = 10) {
     const semantic = await this.semanticSearch<LessonRow>("lessons", domain, limit);
     if (semantic) return semantic;
 
-    return (
-      this.db
-        .prepare(`SELECT * FROM lessons WHERE domain = ? ORDER BY confidence DESC, updated_at DESC LIMIT ?`)
-        .all(domain, limit) as unknown as LessonRow[]
-    ).map(omitEmbedding);
+    return this.db
+      .prepare(`SELECT * FROM lessons WHERE domain = ? ORDER BY confidence DESC, updated_at DESC LIMIT ?`)
+      .all(domain, limit) as unknown as LessonRow[];
   }
 
   async addLesson(domain: string, lessonText: string, derivedFromOutcomeId?: number) {
-    const embedding = await embedDocument(`${domain}: ${lessonText}`);
     const stmt = this.db.prepare(
-      `INSERT INTO lessons (domain, lesson, derived_from_outcome_id, created_at, updated_at, embedding) VALUES (?, ?, ?, ?, ?, ?)`
+      `INSERT INTO lessons (domain, lesson, derived_from_outcome_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`
     );
     const t = now();
-    const result = stmt.run(
-      domain,
-      lessonText,
-      derivedFromOutcomeId ?? null,
-      t,
-      t,
-      embedding ? JSON.stringify(embedding) : null
-    );
-    return Number(result.lastInsertRowid);
+    const result = stmt.run(domain, lessonText, derivedFromOutcomeId ?? null, t, t);
+    const id = Number(result.lastInsertRowid);
+    await upsertText("lessons", id, `${domain}: ${lessonText}`);
+    return id;
   }
 
   reinforceLesson(id: number, direction: "confirmed" | "contradicted") {
@@ -486,7 +491,6 @@ interface ResearchNoteRow {
   source: string | null;
   confidence: number | null;
   fetched_at: string;
-  embedding: string | null;
 }
 
 interface LessonRow {
@@ -499,12 +503,6 @@ interface LessonRow {
   times_contradicted: number;
   created_at: string;
   updated_at: string;
-  embedding: string | null;
-}
-
-function omitEmbedding<T extends { embedding: string | null }>(row: T): Omit<T, "embedding"> {
-  const { embedding: _embedding, ...rest } = row;
-  return rest;
 }
 
 export type Priority = "low" | "normal" | "high" | "urgent";

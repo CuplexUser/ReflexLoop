@@ -42,9 +42,9 @@ rebuilding `web/dist` on every change.
 `.env` (copy from `.env.example`): `ANTHROPIC_API_KEY` (skip if logged in via `claude setup-token`),
 `AGENT_DOMAINS`, `AGENT_DB_PATH`, `AGENT_CYCLE_INTERVAL_MS`, `AGENT_MAX_PENDING_PROPOSALS`,
 `AGENT_SERVER_PORT`, and optional integration keys `GITHUB_TOKEN` / `VERCEL_TOKEN` /
-`NETLIFY_AUTH_TOKEN` / `VOYAGE_API_KEY` (+ `VOYAGE_API_BASE_URL`, only needed for a MongoDB
-Atlas-issued Voyage key) — each integration or feature is simply unavailable, not a startup error,
-when its key is missing.
+`NETLIFY_AUTH_TOKEN` / `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
+`QDRANT_EMBEDDING_DIM` (all four required together for semantic search) — each integration or feature
+is simply unavailable, not a startup error, when its keys are missing.
 
 ## Architecture
 
@@ -88,17 +88,20 @@ API cost (`total_cost_usd` from the SDK) is recorded — spend counts against pr
   `research_note_add`, `research_note_search`, `lesson_search`, `lesson_add`, `lesson_reinforce`,
   `proposal_create`, `proposal_status`, `outcome_record`, `action_history_search`. Approving proposals,
   logging actions, and marking a run successful are deliberately *not* model-callable tools — those stay
-  with the orchestrator and the human. Notes/lessons are embedded and ranked by cosine similarity when
-  embeddings are available, falling back to `LIKE` text matching otherwise. Also owns the `events` table
-  (persisted activity feed, capped at `EVENTS_KEEP`) and `action_history_search`'s backing query, which
-  joins `actions` to `proposals` to answer "what's already been done" for research/plan — restricted to
-  `phase = 'act'` on `status = 'approved'` proposals to stay low-noise, unlike the Actions page below
-  which shows every phase.
-- `embeddings.ts` — Voyage AI (`voyage-3.5`) client for semantic search. Fails soft: no `VOYAGE_API_KEY`,
-  or any request error, and `embed()` resolves to `null` so callers fall back to `LIKE`-based search
-  instead of throwing. `VOYAGE_API_BASE_URL` (default `api.voyageai.com`) exists because a key only
-  authenticates against the endpoint it was issued for — a MongoDB Atlas-issued "Model API key" needs
-  `ai.mongodb.com` instead; same request/response schema either way.
+  with the orchestrator and the human. Notes/lessons are ranked by Qdrant vector similarity when Qdrant
+  is configured, falling back to `LIKE` text matching otherwise; `syncToQdrant()` (called once at
+  startup in `orchestrator.ts`) backfills any rows that predate Qdrant being configured. Also owns the
+  `events` table (persisted activity feed, capped at `EVENTS_KEEP`) and `action_history_search`'s
+  backing query, which joins `actions` to `proposals` to answer "what's already been done" for
+  research/plan — restricted to `phase = 'act'` on `status = 'approved'` proposals to stay low-noise,
+  unlike the Actions page below which shows every phase.
+- `qdrant.ts` — REST client for Qdrant Cloud, both vector storage/search and (via Cloud Inference)
+  server-side embedding generation in the same request — no separate embeddings provider needed. Fails
+  soft: without all of `QDRANT_URL` / `QDRANT_API_KEY` / `QDRANT_EMBEDDING_MODEL` / `QDRANT_EMBEDDING_DIM`
+  set, or on any request error, calls resolve to `null`/`false` so callers fall back to `LIKE`-based
+  search instead of throwing. Model + dimension aren't hardcoded (Qdrant Cloud's free model lineup and
+  each model's vector size are only listed per-cluster, in the Cloud Console's Inference tab), so both
+  are required env config.
 - `integrations/{github,vercel,netlify}.ts` + `integrations-server.ts` — thin API wrappers and their MCP
   tools. Read-only tools (`github_read_repo`, `vercel_list_projects`, etc.) are free for the research
   phase to call. Write tools (`github_create_repo`, `vercel_deploy`, `netlify_deploy`, etc.) only work in

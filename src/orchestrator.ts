@@ -506,6 +506,7 @@ function enqueueForReview(proposal: ProposalRow): void {
 
 async function mainLoop() {
   console.log(`Agent runner started. Domains: ${DOMAINS.join("; ")}. DB: ${DB_PATH}`);
+  await store.syncToQdrant();
   startServer(store, DOMAINS, SERVER_PORT);
   onReactiveTrigger((t) => void handleReactiveTrigger(t.proposalId));
   emitAgentEvent({ type: "run_started", domains: DOMAINS });

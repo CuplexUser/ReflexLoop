@@ -2,7 +2,7 @@
 
 - [ ] Move large blobs/JSON out of SQLite (deferred -- see note below, not worth doing yet)
 - [x] Switch to npm workspaces
-- [ ] Switch to Qdrant Cloud
+- [x] Switch to Qdrant Cloud
 
 ## Move large blobs/JSON out of SQLite
 
@@ -34,5 +34,12 @@ instead of the current `web:*` proxy scripts shelling into a separate `web/`
 install.
 
 ## Switch to Qdrant Cloud
-Current usage limits for Voyage API are low. Which makes the following error message come up frequently.
-> Voyage API error 429: {"detail":"You have not yet added your payment method in the billing page and will have reduced rate limits of 3  RPM and 10K TPM. To unlock our standard rate limits, please add a payment method in the billing page for the appropriate organization in the user dashboard (https://www.mongodb.com/docs/voyageai/management/billing/#manage-billing). Even with payment methods entered, the free tokens (200M tokens for Voyage series 3) will still apply. After adding a payment method, you should see your rate limits increase after several minutes.
+
+Voyage AI's free tier (3 RPM / 10K TPM without a payment method on file) was producing
+frequent 429s during research/reflect. Replaced `src/embeddings.ts` (Voyage) with
+`src/qdrant.ts`: Qdrant Cloud does vector storage/search *and* server-side embedding
+inference (free-tier models, no token limit) in the same request, so there's no
+separate rate-limited embeddings API in the loop anymore. Same fail-soft contract as
+before -- falls back to `LIKE` search if `QDRANT_URL` / `QDRANT_API_KEY` /
+`QDRANT_EMBEDDING_MODEL` / `QDRANT_EMBEDDING_DIM` aren't all set. See `.env.example`
+and the Semantic search section of `README.md`.
