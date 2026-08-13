@@ -5,8 +5,9 @@ import type { ProposalRow } from '../types'
 import { api, type ScheduleOptions } from '../api'
 import { palette } from '../theme'
 import { SchedulePriorityFields } from './SchedulePriorityFields'
+import { MarkdownLite } from './MarkdownLite'
 
-const { Title, Paragraph, Text } = Typography
+const { Title, Text } = Typography
 
 export function ProposalReviewCard({ proposal }: { proposal: ProposalRow }) {
   const { message } = App.useApp()
@@ -48,7 +49,7 @@ export function ProposalReviewCard({ proposal }: { proposal: ProposalRow }) {
           <Tag color="default">{proposal.domain}</Tag>
         </Space>
 
-        <Paragraph style={{ marginBottom: 0, maxWidth: 820 }}>{proposal.description}</Paragraph>
+        <MarkdownLite text={proposal.description} style={{ maxWidth: 820 }} />
 
         <Space size={40} wrap>
           <Statistic title="Expected cost" value={proposal.expected_cost} precision={2} prefix="$" />

@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { Input, Space, Table, Tag, Typography } from 'antd'
 import type { OutcomeRow, Priority, ProposalRow } from '../types'
 import { ProposalDialog } from '../components/ProposalDialog'
-import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, recurrenceLabel, timeAgo } from '../format'
+import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, markdownPreview, recurrenceLabel, timeAgo } from '../format'
 import { useResizableColumns } from '../hooks/useResizableColumns'
 
 const STATUS_COLOR: Record<ProposalRow['status'], string> = {
@@ -45,6 +45,7 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
       dataIndex: 'description',
       ellipsis: true,
       sorter: (a, b) => a.description.localeCompare(b.description),
+      render: (v: string) => markdownPreview(v),
     },
     {
       title: 'Status',

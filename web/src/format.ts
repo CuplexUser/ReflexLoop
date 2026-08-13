@@ -9,6 +9,16 @@ export function preview(value: unknown, max = 160): string {
   return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine
 }
 
+/** Same as preview(), but strips Markdown syntax first (**bold**, "- " bullets) so a
+ * truncated one-line table cell doesn't show literal asterisks/dashes. */
+export function markdownPreview(text: string, max = 160): string {
+  const stripped = text
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/^[-*]\s+/gm, '')
+    .replace(/\n+/g, ' ')
+  return preview(stripped, max)
+}
+
 export function timeAgo(iso: string): string {
   const diffMs = Date.now() - new Date(iso).getTime()
   const s = Math.round(diffMs / 1000)

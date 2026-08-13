@@ -6,6 +6,7 @@ import { api, type ScheduleOptions } from '../api'
 import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, preview, recurrenceLabel } from '../format'
 import { palette } from '../theme'
 import { SchedulePriorityFields } from './SchedulePriorityFields'
+import { MarkdownLite } from './MarkdownLite'
 
 const STATUS_COLOR: Record<ProposalRow['status'], string> = {
   pending: 'warning',
@@ -102,9 +103,7 @@ export function ProposalDialog({
       }
     >
       <Space direction="vertical" size={16} style={{ width: '100%' }}>
-        <Typography.Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>
-          {proposal.description}
-        </Typography.Paragraph>
+        <MarkdownLite text={proposal.description} />
 
         {proposal.human_notes && (
           <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>

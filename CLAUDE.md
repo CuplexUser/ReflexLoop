@@ -61,9 +61,15 @@ Each cycle: **research + plan → human review → act → outcome + reflect**.
   `waitForDecision()` (`review-gateway.ts`), resolved when a person clicks Approve/Reject in the web UI
   (`POST /api/proposals/:id/decision`). Multiple proposals can be under review concurrently, each on its
   own promise.
-- **act** (`actPhase`) — tool access is hard-limited to exactly `proposal.required_tools` plus memory
-  tools, enforced by both `allowedTools` and an independent `canUseTool` callback (belt and suspenders:
-  `allowedTools` alone only works if the model is never told about the broader tool at all).
+- **act** (`actPhase`) — side-effecting tool access is hard-limited to exactly `proposal.required_tools`,
+  plus memory tools and the same no-side-effect read-only integration tools the research phase gets
+  freely (`github_read_repo`/`github_read_file`/etc.) so the model can read back what it just
+  committed/deployed and self-check it before recording an outcome — the prompt requires this: fully
+  implement the described scope (no stub/placeholder files), proofread for syntax/import errors since
+  there's no build step available to actually run the code, then re-read the real committed/deployed
+  state before calling `outcome_record`. All of this is enforced by both `allowedTools` and an
+  independent `canUseTool` callback (belt and suspenders: `allowedTools` alone only works if the model is
+  never told about the broader tool at all).
 - **reflect** (`reflectPhase`) — calls `lesson_search` first; reinforces an existing lesson via
   `lesson_reinforce` if this outcome confirmed/contradicted it, otherwise adds one new generalized lesson.
 

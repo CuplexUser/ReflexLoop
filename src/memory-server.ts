@@ -600,7 +600,13 @@ export function buildMemoryServer(store: MemoryStore): McpSdkServerConfigWithIns
     "Save a distilled research finding for later reuse. Call this after reading a source, not raw page dumps -- write the takeaway in your own words.",
     {
       topic: z.string().describe("Short topic key, e.g. 'print-on-demand margins'"),
-      finding: z.string().describe("The distilled finding, one or two sentences"),
+      finding: z
+        .string()
+        .describe(
+          "The distilled finding. One or two plain sentences for a simple fact. For anything with multiple " +
+            "distinct parts, use Markdown instead of one dense paragraph: **bold** short labels and a '- ' " +
+            "bullet list, one point per line."
+        ),
       source: z.string().optional().describe("URL or reference"),
       confidence: z.number().min(0).max(1).optional(),
     },
@@ -660,7 +666,14 @@ export function buildMemoryServer(store: MemoryStore): McpSdkServerConfigWithIns
     "Propose a specific, boundable action for a human to approve. Every proposal needs a concrete cost/time/upside estimate and the exact list of tools it needs -- no proposal is executed without human approval, and execution is locked to exactly the tools listed here.",
     {
       domain: z.string(),
-      description: z.string().describe("What you'd do, specifically enough that a human can say yes or no"),
+      description: z
+        .string()
+        .describe(
+          "What you'd do, specifically enough that a human can say yes or no. Format as Markdown, not one long " +
+            "prose paragraph: a one-line **bold** headline (name + one-sentence pitch), a blank line, then a " +
+            "'- ' bullet list of 3-6 short points -- whichever of what/why-now/differentiation/act-phase " +
+            "scope/risks are relevant. Keep each bullet to one or two sentences."
+        ),
       expectedCost: z.number().min(0).describe("Expected cost in your currency of choice, e.g. USD"),
       expectedTimeHours: z.number().min(0),
       expectedUpside: z.number().describe("Expected revenue or value if it works"),

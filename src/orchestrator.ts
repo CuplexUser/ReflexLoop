@@ -346,33 +346,41 @@ async function humanReviewPhase(proposal: ProposalRow): Promise<ProposalRow> {
 
 // ---- phase 3: act -----------------------------------------------------------
 //
-// Tool access is hard-limited to exactly what the proposal declared, plus
-// memory tools. canUseTool is a second, independent gate on top of
-// allowedTools -- belt and suspenders, since allowedTools alone relies on
-// the model never being told about a broader tool in the first place.
+// Side-effecting tool access is hard-limited to exactly what the proposal
+// declared, plus memory tools and the read-only integration tools (same
+// no-side-effect set the research phase gets freely) so the model can read
+// back what it just committed/deployed and self-check it -- neither of
+// those additions lets it touch anything beyond what proposal.required_tools
+// named. canUseTool is a second, independent gate on top of allowedTools --
+// belt and suspenders, since allowedTools alone relies on the model never
+// being told about a broader tool in the first place.
 
 async function actPhase(proposal: ProposalRow): Promise<void> {
   const requiredTools = proposal.required_tools.split(",").map((s) => s.trim()).filter(Boolean);
+  const allowedTools = [...new Set([...MEMORY_TOOLS, ...READONLY_INTEGRATION_TOOLS, ...requiredTools])];
 
   await runPhase({
     phase: "act",
     proposalId: proposal.id,
     prompt: [
       `Execute approved proposal #${proposal.id}: ${proposal.description}`,
-      `You may only use these tools: ${requiredTools.join(", ")}, plus memory tools for logging/recall.`,
+      `You may only use these tools: ${requiredTools.join(", ")}, plus memory tools for logging/recall and the read-only tools (github_read_repo, github_read_file, github_search_repos, vercel_list_projects, vercel_get_project, netlify_list_sites, netlify_get_site) for checking real state.`,
+      `This is a real deliverable, not a stub -- fully implement the scope described above. Do not leave placeholder/TODO files, an empty repo, or a README-only scaffold standing in for the actual code.`,
+      `You have no build or compile step available -- you cannot run the code you write. Before each commit, deliberately re-read every file you're about to write: confirm every import resolves to a file actually being committed, that the syntax is valid, and that package.json's dependencies/scripts match what the code actually uses.`,
+      `After committing (and deploying, if applicable), use the read-only tools above to read back what actually landed -- confirm no file is missing, truncated, or empty, and that the deploy succeeded -- before you call outcome_record.`,
       `When finished, call outcome_record with the real numbers -- do not estimate, report what actually happened.`,
     ].join("\n"),
     options: {
       mcpServers,
-      allowedTools: [...MEMORY_TOOLS, ...requiredTools],
+      allowedTools,
       settingSources: [],
       canUseTool: async (toolName) => {
-        const allowed = MEMORY_TOOLS.includes(toolName) || requiredTools.includes(toolName);
+        const allowed = allowedTools.includes(toolName);
         return allowed
           ? { behavior: "allow" as const }
           : { behavior: "deny" as const, message: `${toolName} was not part of the approved proposal` };
       },
-      hooks: { PreToolUse: toolGateHook([...MEMORY_TOOLS, ...requiredTools], "act") },
+      hooks: { PreToolUse: toolGateHook(allowedTools, "act") },
       maxTurns: 60,
     },
   });

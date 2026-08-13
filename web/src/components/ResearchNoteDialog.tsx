@@ -1,5 +1,6 @@
 import { Modal, Progress, Space, Typography } from 'antd'
 import type { ResearchNoteRow } from '../types'
+import { MarkdownLite } from './MarkdownLite'
 
 export function ResearchNoteDialog({
   note,
@@ -15,7 +16,7 @@ export function ResearchNoteDialog({
   return (
     <Modal open={open} onCancel={onClose} footer={null} width={640} title={`Research note #${note.id} — ${note.topic}`}>
       <Space direction="vertical" size={16} style={{ width: '100%' }}>
-        <Typography.Paragraph style={{ marginBottom: 0, whiteSpace: 'pre-wrap' }}>{note.finding}</Typography.Paragraph>
+        <MarkdownLite text={note.finding} />
 
         {note.source && (
           <div>

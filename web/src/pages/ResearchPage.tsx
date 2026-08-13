@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Input, Progress, Space, Table } from 'antd'
 import type { ResearchNoteRow } from '../types'
 import { api } from '../api'
-import { timeAgo } from '../format'
+import { markdownPreview, timeAgo } from '../format'
 import { ResearchNoteDialog } from '../components/ResearchNoteDialog'
 import { useResizableColumns } from '../hooks/useResizableColumns'
 
@@ -38,6 +38,7 @@ export function ResearchPage({ historyVersion }: { historyVersion: number }) {
       dataIndex: 'finding',
       ellipsis: true,
       sorter: (a, b) => a.finding.localeCompare(b.finding),
+      render: (v: string) => markdownPreview(v),
     },
     {
       title: 'Source',
