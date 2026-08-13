@@ -143,3 +143,60 @@ export async function createPullRequest(owner: string, repo: string, title: stri
   });
   return { number: data.number, url: data.html_url, state: data.state };
 }
+
+// Batched alternative to commitFile: writes any number of files as a single
+// commit via the Git Data API (blobs -> tree -> commit -> ref update),
+// instead of one REST "update contents" call (and one commit) per file.
+export async function commitFiles(
+  owner: string,
+  repo: string,
+  files: { path: string; content: string }[],
+  message: string,
+  branch: string
+) {
+  const ref = await gh<{ object: { sha: string } }>(`/repos/${owner}/${repo}/git/ref/heads/${branch}`);
+  const baseCommitSha = ref.object.sha;
+  const baseCommit = await gh<{ tree: { sha: string } }>(`/repos/${owner}/${repo}/git/commits/${baseCommitSha}`);
+
+  const blobs = await Promise.all(
+    files.map((f) =>
+      gh<{ sha: string }>(`/repos/${owner}/${repo}/git/blobs`, {
+        method: "POST",
+        body: JSON.stringify({ content: Buffer.from(f.content, "utf8").toString("base64"), encoding: "base64" }),
+      }).then((b) => ({ path: f.path, sha: b.sha }))
+    )
+  );
+
+  const tree = await gh<{ sha: string }>(`/repos/${owner}/${repo}/git/trees`, {
+    method: "POST",
+    body: JSON.stringify({
+      base_tree: baseCommit.tree.sha,
+      tree: blobs.map((b) => ({ path: b.path, mode: "100644", type: "blob", sha: b.sha })),
+    }),
+  });
+
+  const commit = await gh<{ sha: string }>(`/repos/${owner}/${repo}/git/commits`, {
+    method: "POST",
+    body: JSON.stringify({ message, tree: tree.sha, parents: [baseCommitSha] }),
+  });
+
+  await gh(`/repos/${owner}/${repo}/git/refs/heads/${branch}`, {
+    method: "PATCH",
+    body: JSON.stringify({ sha: commit.sha }),
+  });
+
+  return { commitSha: commit.sha, filesCommitted: files.length };
+}
+
+export async function mergePullRequest(
+  owner: string,
+  repo: string,
+  pullNumber: number,
+  mergeMethod: "merge" | "squash" | "rebase" = "squash"
+) {
+  const data = await gh<{ sha: string; merged: boolean; message: string }>(
+    `/repos/${owner}/${repo}/pulls/${pullNumber}/merge`,
+    { method: "PUT", body: JSON.stringify({ merge_method: mergeMethod }) }
+  );
+  return { sha: data.sha, merged: data.merged, message: data.message };
+}

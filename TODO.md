@@ -18,3 +18,13 @@ Tradeoff to weigh then: backups/restores would span two locations instead of one
 Note: this is *not* about the artifacts the agent ships (repo code, deployed sites)
 -- those already live in a proper system of record (GitHub) and don't need a local
 git-like store of their own.
+
+## Switch to npm workspaces
+
+Root (`package.json`) and `web/package.json` are two separate, unlinked npm projects
+today -- `npm install` at the root doesn't touch `web/`, and there's no shared
+lockfile. Convert to an npm workspaces layout (root `package.json` gets
+`"workspaces": ["web"]`), so a single `npm install` at the root sets up both, and
+root-level scripts can delegate to the web workspace (`npm run -w web build`, etc.)
+instead of the current `web:*` proxy scripts shelling into a separate `web/`
+install.

@@ -96,11 +96,36 @@ export function buildIntegrationsServer(): McpSdkServerConfigWithInstance {
       toResult(() => github.commitFile(owner, repo, path, content, message, branch))
   );
 
+  const githubCommitFiles = tool(
+    "github_commit_files",
+    "Create or update any number of files on a branch as a single commit. Prefer this over repeated github_commit_file calls when scaffolding more than one file -- avoids a noisy one-commit-per-file history. Only usable when a proposal listing this tool has been approved.",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      files: z.array(z.object({ path: z.string(), content: z.string() })).min(1),
+      message: z.string(),
+      branch: z.string(),
+    },
+    ({ owner, repo, files, message, branch }) => toResult(() => github.commitFiles(owner, repo, files, message, branch))
+  );
+
   const githubCreatePr = tool(
     "github_create_pr",
-    "Open a pull request. Only usable when a proposal listing this tool has been approved.",
+    "Open a pull request. Only usable when a proposal listing this tool has been approved. If you open a PR, also call github_merge_pr afterward -- a human already reviewed and approved this work at proposal-approval time, so an unmerged PR just leaves the default branch empty/stale.",
     { owner: z.string(), repo: z.string(), title: z.string(), head: z.string(), base: z.string(), body: z.string().optional() },
     ({ owner, repo, title, head, base, body }) => toResult(() => github.createPullRequest(owner, repo, title, head, base, body))
+  );
+
+  const githubMergePr = tool(
+    "github_merge_pr",
+    "Merge an open pull request into its base branch. Only usable when a proposal listing this tool has been approved.",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      pullNumber: z.number().int().positive(),
+      mergeMethod: z.enum(["merge", "squash", "rebase"]).default("squash"),
+    },
+    ({ owner, repo, pullNumber, mergeMethod }) => toResult(() => github.mergePullRequest(owner, repo, pullNumber, mergeMethod))
   );
 
   // ---- Vercel -----------------------------------------------------------------
@@ -170,7 +195,9 @@ export function buildIntegrationsServer(): McpSdkServerConfigWithInstance {
       githubCreateRepo,
       githubCreateBranch,
       githubCommitFile,
+      githubCommitFiles,
       githubCreatePr,
+      githubMergePr,
       vercelListProjects,
       vercelGetProject,
       vercelDeploy,

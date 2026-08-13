@@ -62,7 +62,9 @@ const WRITE_INTEGRATION_TOOLS = [
   "mcp__integrations__github_create_repo",
   "mcp__integrations__github_create_branch",
   "mcp__integrations__github_commit_file",
+  "mcp__integrations__github_commit_files",
   "mcp__integrations__github_create_pr",
+  "mcp__integrations__github_merge_pr",
   "mcp__integrations__vercel_deploy",
   "mcp__integrations__netlify_create_site",
   "mcp__integrations__netlify_deploy",
@@ -72,6 +74,39 @@ function preview(value: unknown, max = 150): string {
   const s = typeof value === "string" ? value : JSON.stringify(value);
   const oneLine = (s ?? "").replace(/\s+/g, " ").trim();
   return oneLine.length > max ? oneLine.slice(0, max) + "…" : oneLine;
+}
+
+// `canUseTool` has a gap: it is not consulted for tool calls the SDK issues
+// itself as plumbing (e.g. paging back a previous tool result that was too
+// large to inline, via Read/Grep against its own persisted-output cache) --
+// confirmed live, where such a call reached a real file read despite not
+// being in the phase's allowedTools and despite canUseTool denying anything
+// not in that list. The SDK's own warning is explicit that canUseTool alone
+// does not gate every tool call and that a PreToolUse hook is what does.
+// This is the actual enforcement boundary; canUseTool and settingSources: []
+// (see RESEARCH_OPTIONS) are kept too as defense in depth, not because
+// either alone is sufficient.
+function toolGateHook(allowedTools: string[], phaseLabel: string): NonNullable<Options["hooks"]>["PreToolUse"] {
+  return [
+    {
+      hooks: [
+        async (input) => {
+          if (input.hook_event_name !== "PreToolUse" || allowedTools.includes(input.tool_name)) {
+            return { continue: true };
+          }
+          console.warn(`[${phaseLabel}] PreToolUse denied: ${input.tool_name}`);
+          return {
+            continue: true,
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse" as const,
+              permissionDecision: "deny" as const,
+              permissionDecisionReason: `${input.tool_name} is not available in the ${phaseLabel} phase`,
+            },
+          };
+        },
+      ],
+    },
+  ];
 }
 
 /** Runs a query to completion, logging every tool call and the run's Claude API cost. */
@@ -166,15 +201,28 @@ const RESEARCH_ALLOWED_TOOLS = [
   "WebFetch",
   ...READONLY_INTEGRATION_TOOLS,
 ];
+//
+// `canUseTool` alone still wasn't enough: by default the SDK also loads this
+// machine's own filesystem settings (project `.claude/settings.local.json`,
+// user `~/.claude/settings.json`) into every query(), and permissive allow
+// rules from those files can grant a tool before canUseTool is ever consulted
+// (confirmed live -- a Bash call still went through post-fix, matching a
+// broad allow-pattern accumulated in this machine's interactive CLI settings
+// from unrelated past sessions). `settingSources: []` puts every phase in
+// "SDK isolation mode" so this orchestrator's own tool grants are the only
+// policy in effect, independent of whatever this machine's own Claude Code
+// settings happen to contain.
 const RESEARCH_OPTIONS: Options = {
   mcpServers,
   allowedTools: RESEARCH_ALLOWED_TOOLS,
+  settingSources: [],
   canUseTool: async (toolName) => {
     const allowed = RESEARCH_ALLOWED_TOOLS.includes(toolName);
     return allowed
       ? { behavior: "allow" as const }
       : { behavior: "deny" as const, message: `${toolName} is not available in the research phase` };
   },
+  hooks: { PreToolUse: toolGateHook(RESEARCH_ALLOWED_TOOLS, "research") },
   maxTurns: 60,
   // No `agents` option set -> no Agent/Task tool -> this run cannot spawn subagents.
 };
@@ -192,7 +240,7 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
       `You can use the read-only tools github_read_repo, github_read_file, github_search_repos, vercel_list_projects, vercel_get_project, netlify_list_sites, netlify_get_site to check the existing landscape (competing projects, your own prior projects) before proposing.`,
       `Research for concrete, boundable opportunities to earn money. Use WebSearch/WebFetch and the read-only integration tools above. Save distilled findings with research_note_add as you go.`,
       `When you have specific ideas, call proposal_create for each one worth a human's attention -- typically 1, up to 3 per cycle if multiple domains turned up genuinely strong, distinct opportunities. Don't pad the count with weak ideas just to fill a quota.`,
-      `Each proposal needs a real cost/time/upside estimate and the exact tool names execution would need. Built-in tools are unprefixed (e.g. 'WebSearch'). MCP tools need their full qualified name -- the act-phase write tools available are: ${WRITE_INTEGRATION_TOOLS.join(", ")}.`,
+      `Each proposal needs a real cost/time/upside estimate and the exact tool names execution would need. Built-in tools are unprefixed (e.g. 'WebSearch'). MCP tools need their full qualified name -- the act-phase write tools available are: ${WRITE_INTEGRATION_TOOLS.join(", ")}. For GitHub work: prefer github_commit_files (one commit, many files) over repeated github_commit_file calls; and either commit straight to the default branch, or if you use github_create_pr, list github_merge_pr in required_tools too and merge it during the act phase -- an approved proposal has no further GitHub-side review to wait for, so an unmerged PR just leaves the default branch empty.`,
       `Then stop -- do not act on any proposal, a human reviews each one next.`,
       `If nothing concrete and boundable comes out of the research, don't force a proposal -- just stop.`,
     ].join("\n"),
@@ -317,12 +365,14 @@ async function actPhase(proposal: ProposalRow): Promise<void> {
     options: {
       mcpServers,
       allowedTools: [...MEMORY_TOOLS, ...requiredTools],
+      settingSources: [],
       canUseTool: async (toolName) => {
         const allowed = MEMORY_TOOLS.includes(toolName) || requiredTools.includes(toolName);
         return allowed
           ? { behavior: "allow" as const }
           : { behavior: "deny" as const, message: `${toolName} was not part of the approved proposal` };
       },
+      hooks: { PreToolUse: toolGateHook([...MEMORY_TOOLS, ...requiredTools], "act") },
       maxTurns: 60,
     },
   });
@@ -342,14 +392,17 @@ async function reflectPhase(proposal: ProposalRow): Promise<void> {
     options: {
       mcpServers: { memory: memoryServer },
       allowedTools: [...MEMORY_TOOLS],
-      // See the comment on RESEARCH_OPTIONS above -- bypassPermissions + allowedTools
-      // does not restrict the toolset, only canUseTool does.
+      settingSources: [],
+      // See the comment on toolGateHook above -- canUseTool alone has a gap for
+      // SDK-internal tool calls (e.g. paging a persisted large tool result), so
+      // the PreToolUse hook below is the layer that actually enforces this.
       canUseTool: async (toolName) => {
         const allowed = MEMORY_TOOLS.includes(toolName);
         return allowed
           ? { behavior: "allow" as const }
           : { behavior: "deny" as const, message: `${toolName} is not available in the reflect phase` };
       },
+      hooks: { PreToolUse: toolGateHook(MEMORY_TOOLS, "reflect") },
       maxTurns: 10,
     },
   });
