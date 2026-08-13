@@ -8,6 +8,8 @@
   "scripts": {
     "start": "tsx src/orchestrator.ts",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "smoke-test": "tsx src/smoke-test.ts",
     "web:dev": "npm run -w web dev",
     "web:build": "npm run -w web build",
@@ -29,6 +31,7 @@
     "@types/node": "^26.2.0",
     "@types/ws": "^8.18.1",
     "tsx": "^4.23.11",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   }
 }

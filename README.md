@@ -102,14 +102,17 @@ there.
   done" or "needs refinement" — a human verdict independent of the model's
   self-reported outcome, and the trigger for the reactive research pass
   above. Talks to `src/server.ts` over REST + WebSocket.
-- `src/smoke-test.ts` — exercises the memory store directly, no API key
-  needed. Run this first.
+- `src/memory-server.test.ts` — Vitest unit tests for `MemoryStore` against an
+  in-memory SQLite DB, with `qdrant.ts` mocked out. The real test suite.
+- `src/smoke-test.ts` — quick end-to-end sanity check against a throwaway DB
+  file, no API key needed. Run this first.
 
 ## Setup
 
 ```bash
 npm install
 npm run smoke-test   # sanity-checks the DB and tool wiring, no API calls
+npm test             # unit tests (Vitest)
 npm run typecheck
 ```
 

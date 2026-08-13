@@ -20,12 +20,16 @@ design assumes is there.
 ```bash
 npm install
 npm run smoke-test    # sanity-checks the DB + tool wiring directly, no API key needed — run this first
+npm test              # vitest run — unit tests over src/**/*.test.ts, no API key needed
 npm run typecheck     # tsc --noEmit over src/
 npm start             # tsx src/orchestrator.ts — runs the agent loop + web console together (one process, one SQLite connection)
 ```
 
-There is no automated test suite beyond `smoke-test.ts` (`src/smoke-test.ts`) — it exercises
-`MemoryStore` directly against a throwaway `./data/smoke-test.db`.
+`src/memory-server.test.ts` is the real test suite (Vitest): `MemoryStore` against an in-memory SQLite
+DB (`:memory:`), with `qdrant.ts` mocked out so semantic-search tests exercise the deterministic
+LIKE-fallback path regardless of ambient `QDRANT_*` env vars. `smoke-test.ts` (`src/smoke-test.ts`)
+still exists alongside it as a quick end-to-end sanity check against a throwaway `./data/smoke-test.db`
+file, useful when you want to eyeball real output rather than assertions.
 
 Frontend (`web/`) is an npm workspace of the root project — `npm install` at the root sets up both.
 Run its scripts from the root (below) or with `npm run <script> -w web` from anywhere:
