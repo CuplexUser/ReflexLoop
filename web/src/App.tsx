@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { App as AntApp, Badge, Layout, Menu, Typography } from 'antd'
 import {
   BulbOutlined,
@@ -21,10 +22,21 @@ import type { OutcomeRow, ProposalRow, StatusResponse } from './types'
 
 type PageKey = 'dashboard' | 'live' | 'proposals' | 'actions' | 'lessons' | 'research'
 
+const PAGE_PATHS: Record<PageKey, string> = {
+  dashboard: '/',
+  live: '/live',
+  proposals: '/proposals',
+  actions: '/actions',
+  lessons: '/lessons',
+  research: '/research',
+}
+
 function App() {
   const { message } = AntApp.useApp()
   const socket = useAgentSocket()
-  const [page, setPage] = useState<PageKey>('dashboard')
+  const navigate = useNavigate()
+  const location = useLocation()
+  const page = (Object.keys(PAGE_PATHS) as PageKey[]).find((key) => PAGE_PATHS[key] === location.pathname) ?? 'dashboard'
   const [status, setStatus] = useState<StatusResponse | null>(null)
   const [proposals, setProposals] = useState<ProposalRow[]>([])
   const [outcomes, setOutcomes] = useState<OutcomeRow[]>([])
@@ -67,7 +79,7 @@ function App() {
           theme="dark"
           mode="inline"
           selectedKeys={[page]}
-          onClick={(e) => setPage(e.key as PageKey)}
+          onClick={(e) => navigate(PAGE_PATHS[e.key as PageKey])}
           items={[
             { key: 'dashboard', icon: <DashboardOutlined />, label: 'Dashboard' },
             { key: 'live', icon: <CodeOutlined />, label: 'Live feed' },
@@ -97,28 +109,37 @@ function App() {
         </Layout.Header>
 
         <Layout.Content style={{ margin: 24 }}>
-          {page === 'dashboard' && (
-            <DashboardPage
-              pendingProposals={socket.pendingProposals}
-              proposals={proposals}
-              outcomes={outcomes}
-              totalCostUsd={status?.totalCostUsd ?? 0}
-              feed={socket.feed}
-              onOpenLiveFeed={() => setPage('live')}
+          <Routes>
+            <Route
+              path="/"
+              element={
+                <DashboardPage
+                  pendingProposals={socket.pendingProposals}
+                  proposals={proposals}
+                  outcomes={outcomes}
+                  totalCostUsd={status?.totalCostUsd ?? 0}
+                  feed={socket.feed}
+                  onOpenLiveFeed={() => navigate(PAGE_PATHS.live)}
+                />
+              }
             />
-          )}
-          {page === 'live' && <LiveFeedPage feed={socket.feed} />}
-          {page === 'proposals' && <ProposalsPage proposals={proposals} outcomes={outcomes} />}
-          {page === 'actions' && (
-            <ActionsPage
-              historyVersion={socket.historyVersion}
-              proposals={proposals}
-              outcomes={outcomes}
-              onSetReview={setProposalReview}
+            <Route path="/live" element={<LiveFeedPage feed={socket.feed} />} />
+            <Route path="/proposals" element={<ProposalsPage proposals={proposals} outcomes={outcomes} />} />
+            <Route
+              path="/actions"
+              element={
+                <ActionsPage
+                  historyVersion={socket.historyVersion}
+                  proposals={proposals}
+                  outcomes={outcomes}
+                  onSetReview={setProposalReview}
+                />
+              }
             />
-          )}
-          {page === 'lessons' && <LessonsPage historyVersion={socket.historyVersion} />}
-          {page === 'research' && <ResearchPage historyVersion={socket.historyVersion} />}
+            <Route path="/lessons" element={<LessonsPage historyVersion={socket.historyVersion} />} />
+            <Route path="/research" element={<ResearchPage historyVersion={socket.historyVersion} />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
         </Layout.Content>
       </Layout>
     </Layout>

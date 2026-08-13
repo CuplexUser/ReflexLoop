@@ -2,6 +2,7 @@
 
 - [ ] Move large blobs/JSON out of SQLite (deferred -- see note below, not worth doing yet)
 - [x] Switch to npm workspaces
+- [ ] Switch to Qdrant Cloud
 
 ## Move large blobs/JSON out of SQLite
 
@@ -31,3 +32,7 @@ lockfile. Convert to an npm workspaces layout (root `package.json` gets
 root-level scripts can delegate to the web workspace (`npm run -w web build`, etc.)
 instead of the current `web:*` proxy scripts shelling into a separate `web/`
 install.
+
+## Switch to Qdrant Cloud
+Current usage limits for Voyage API are low. Which makes the following error message come up frequently.
+> Voyage API error 429: {"detail":"You have not yet added your payment method in the billing page and will have reduced rate limits of 3  RPM and 10K TPM. To unlock our standard rate limits, please add a payment method in the billing page for the appropriate organization in the user dashboard (https://www.mongodb.com/docs/voyageai/management/billing/#manage-billing). Even with payment methods entered, the free tokens (200M tokens for Voyage series 3) will still apply. After adding a payment method, you should see your rate limits increase after several minutes.
