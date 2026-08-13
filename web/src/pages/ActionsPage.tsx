@@ -50,7 +50,7 @@ function ExpandedActions({
 }) {
   const sorted = useMemo(() => [...actions].sort((a, b) => b.occurred_at.localeCompare(a.occurred_at)), [actions])
 
-  const { columns, components } = useResizableColumns<ActionWithProposal>([
+  const { columns, components, scroll } = useResizableColumns<ActionWithProposal>('action-detail', [
     { title: 'Action', dataIndex: 'tool_name', width: 140, render: (v: string) => actionLabel(v) },
     { title: 'Description', ellipsis: true, render: (_, a) => actionDescription(a.tool_name, a.tool_input) },
     {
@@ -69,17 +69,16 @@ function ExpandedActions({
   ])
 
   return (
-    <div style={{ overflowX: 'auto' }}>
-      <Table
-        rowKey="id"
-        size="small"
-        pagination={false}
-        dataSource={sorted}
-        components={components}
-        columns={columns}
-        onRow={(a) => ({ onClick: () => onSelect(a), style: { cursor: 'pointer' } })}
-      />
-    </div>
+    <Table
+      rowKey="id"
+      size="small"
+      pagination={false}
+      dataSource={sorted}
+      components={components}
+      scroll={scroll}
+      columns={columns}
+      onRow={(a) => ({ onClick: () => onSelect(a), style: { cursor: 'pointer' } })}
+    />
   )
 }
 
@@ -145,7 +144,7 @@ export function ActionsPage({
     [groups],
   )
 
-  const { columns, components } = useResizableColumns<ProposalGroup>([
+  const { columns, components, scroll } = useResizableColumns<ProposalGroup>('actions', [
     {
       title: '#',
       width: 70,
@@ -276,21 +275,20 @@ export function ActionsPage({
           onChange={(e) => setSearch(e.target.value)}
         />
       </Space>
-      <div style={{ overflowX: 'auto' }}>
-        <Table
-          rowKey={(g) => g.proposal.id}
-          loading={loading}
-          dataSource={groups}
-          pagination={{ pageSize: 20 }}
-          components={components}
-          columns={columns}
-          locale={{ emptyText: 'No actions taken on approved proposals yet' }}
-          expandable={{
-            expandRowByClick: true,
-            expandedRowRender: (g) => <ExpandedActions actions={g.actions} onSelect={setSelected} />,
-          }}
-        />
-      </div>
+      <Table
+        rowKey={(g) => g.proposal.id}
+        loading={loading}
+        dataSource={groups}
+        pagination={{ pageSize: 20 }}
+        components={components}
+        scroll={scroll}
+        columns={columns}
+        locale={{ emptyText: 'No actions taken on approved proposals yet' }}
+        expandable={{
+          expandRowByClick: true,
+          expandedRowRender: (g) => <ExpandedActions actions={g.actions} onSelect={setSelected} />,
+        }}
+      />
       <ActionDialog action={selected} open={selected !== null} onClose={() => setSelected(null)} />
     </Space>
   )

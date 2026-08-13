@@ -29,7 +29,7 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
     return proposals.filter((p) => `${p.domain} ${p.description}`.toLowerCase().includes(q))
   }, [proposals, search])
 
-  const { columns, components } = useResizableColumns<ProposalRow>([
+  const { columns, components, scroll } = useResizableColumns<ProposalRow>('proposals', [
     { title: '#', dataIndex: 'id', width: 70, sorter: (a, b) => a.id - b.id },
     {
       title: 'Domain',
@@ -114,16 +114,15 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
         value={search}
         onChange={(e) => setSearch(e.target.value)}
       />
-      <div style={{ overflowX: 'auto' }}>
-        <Table
-          rowKey="id"
-          dataSource={filtered}
-          pagination={{ pageSize: 10 }}
-          components={components}
-          onRow={(p) => ({ onClick: () => setSelected(p), style: { cursor: 'pointer' } })}
-          columns={columns}
-        />
-      </div>
+      <Table
+        rowKey="id"
+        dataSource={filtered}
+        pagination={{ pageSize: 10 }}
+        components={components}
+        scroll={scroll}
+        onRow={(p) => ({ onClick: () => setSelected(p), style: { cursor: 'pointer' } })}
+        columns={columns}
+      />
       <ProposalDialog
         proposal={selected}
         outcome={selected ? outcomeByProposal.get(selected.id) : undefined}

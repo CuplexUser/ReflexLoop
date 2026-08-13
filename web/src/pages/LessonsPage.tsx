@@ -31,7 +31,7 @@ export function LessonsPage({ historyVersion }: { historyVersion: number }) {
     return lessons.filter((l) => `${l.domain} ${l.lesson}`.toLowerCase().includes(q))
   }, [lessons, search])
 
-  const { columns, components } = useResizableColumns<LessonRow>([
+  const { columns, components, scroll } = useResizableColumns<LessonRow>('lessons', [
     {
       title: 'Domain',
       dataIndex: 'domain',
@@ -90,17 +90,16 @@ export function LessonsPage({ historyVersion }: { historyVersion: number }) {
         value={search}
         onChange={(e) => setSearch(e.target.value)}
       />
-      <div style={{ overflowX: 'auto' }}>
-        <Table
-          rowKey="id"
-          loading={loading}
-          dataSource={filtered}
-          pagination={{ pageSize: 10 }}
-          components={components}
-          onRow={(l) => ({ onClick: () => setSelected(l), style: { cursor: 'pointer' } })}
-          columns={columns}
-        />
-      </div>
+      <Table
+        rowKey="id"
+        loading={loading}
+        dataSource={filtered}
+        pagination={{ pageSize: 10 }}
+        components={components}
+        scroll={scroll}
+        onRow={(l) => ({ onClick: () => setSelected(l), style: { cursor: 'pointer' } })}
+        columns={columns}
+      />
       <LessonDialog lesson={selected} open={selected !== null} onClose={() => setSelected(null)} />
     </Space>
   )

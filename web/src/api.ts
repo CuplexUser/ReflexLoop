@@ -27,6 +27,7 @@ export const api = {
   status: () => getJson<StatusResponse>('/api/status'),
   proposals: () => getJson<ProposalRow[]>('/api/proposals'),
   proposalActions: (id: number) => getJson<ActionRow[]>(`/api/proposals/${id}/actions`),
+  proposalRuns: (id: number) => getJson<RunRow[]>(`/api/proposals/${id}/runs`),
   outcomes: () => getJson<OutcomeRow[]>('/api/outcomes'),
   lessons: () => getJson<LessonRow[]>('/api/lessons'),
   researchNotes: () => getJson<ResearchNoteRow[]>('/api/research-notes'),

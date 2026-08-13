@@ -25,7 +25,7 @@ export function ResearchPage({ historyVersion }: { historyVersion: number }) {
     return notes.filter((n) => `${n.topic} ${n.finding} ${n.source ?? ''}`.toLowerCase().includes(q))
   }, [notes, search])
 
-  const { columns, components } = useResizableColumns<ResearchNoteRow>([
+  const { columns, components, scroll } = useResizableColumns<ResearchNoteRow>('research-notes', [
     {
       title: 'Topic',
       dataIndex: 'topic',
@@ -81,17 +81,16 @@ export function ResearchPage({ historyVersion }: { historyVersion: number }) {
         value={search}
         onChange={(e) => setSearch(e.target.value)}
       />
-      <div style={{ overflowX: 'auto' }}>
-        <Table
-          rowKey="id"
-          loading={loading}
-          dataSource={filtered}
-          pagination={{ pageSize: 10 }}
-          components={components}
-          onRow={(n) => ({ onClick: () => setSelected(n), style: { cursor: 'pointer' } })}
-          columns={columns}
-        />
-      </div>
+      <Table
+        rowKey="id"
+        loading={loading}
+        dataSource={filtered}
+        pagination={{ pageSize: 10 }}
+        components={components}
+        scroll={scroll}
+        onRow={(n) => ({ onClick: () => setSelected(n), style: { cursor: 'pointer' } })}
+        columns={columns}
+      />
       <ResearchNoteDialog note={selected} open={selected !== null} onClose={() => setSelected(null)} />
     </Space>
   )

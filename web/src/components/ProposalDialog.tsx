@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { App, Button, Descriptions, Divider, Input, Modal, Skeleton, Space, Statistic, Table, Tag, Typography } from 'antd'
 import { CheckCircleOutlined, ClockCircleOutlined, CloseCircleOutlined } from '@ant-design/icons'
-import type { ActionRow, OutcomeRow, ProposalRow } from '../types'
+import type { ActionRow, OutcomeRow, ProposalRow, RunRow } from '../types'
 import { api, type ScheduleOptions } from '../api'
 import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, preview, recurrenceLabel } from '../format'
 import { palette } from '../theme'
@@ -27,6 +27,7 @@ export function ProposalDialog({
 }) {
   const { message } = App.useApp()
   const [actions, setActions] = useState<ActionRow[] | null>(null)
+  const [runs, setRuns] = useState<RunRow[]>([])
   const [rejecting, setRejecting] = useState(false)
   const [notes, setNotes] = useState('')
   const [submitting, setSubmitting] = useState<'approve' | 'reject' | null>(null)
@@ -37,6 +38,7 @@ export function ProposalDialog({
   useEffect(() => {
     if (!open || !proposal) return
     setActions(null)
+    setRuns([])
     setRejecting(false)
     setNotes('')
     setSubmitting(null)
@@ -47,6 +49,10 @@ export function ProposalDialog({
       .proposalActions(proposal.id)
       .then((rows) => !cancelled && setActions(rows))
       .catch(() => !cancelled && setActions([]))
+    api
+      .proposalRuns(proposal.id)
+      .then((rows) => !cancelled && setRuns(rows))
+      .catch(() => !cancelled && setRuns([]))
     return () => {
       cancelled = true
     }
@@ -122,6 +128,15 @@ export function ProposalDialog({
             prefix="$"
             valueStyle={{ color: palette.approved }}
           />
+          {runs.length > 0 && (
+            <Statistic
+              title={`Claude API spend (${runs.length} ${runs.length === 1 ? 'phase' : 'phases'})`}
+              value={runs.reduce((sum, r) => sum + r.cost_usd, 0)}
+              precision={4}
+              prefix="$"
+              valueStyle={{ color: palette.active }}
+            />
+          )}
         </Space>
 
         <div>

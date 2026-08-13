@@ -456,7 +456,14 @@ export class MemoryStore {
   }
 
   listRuns(limit = 200) {
-    return this.db.prepare(`SELECT * FROM runs ORDER BY started_at DESC LIMIT ?`).all(limit);
+    return this.db.prepare(`SELECT * FROM runs ORDER BY started_at DESC LIMIT ?`).all(limit) as unknown as RunRow[];
+  }
+
+  /** Every phase run charged to one proposal -- what it actually cost in Claude API spend, vs its estimate. */
+  listRunsForProposal(proposalId: number) {
+    return this.db
+      .prepare(`SELECT * FROM runs WHERE proposal_id = ? ORDER BY started_at ASC`)
+      .all(proposalId) as unknown as RunRow[];
   }
 
   totalRunCost(): number {
@@ -491,6 +498,16 @@ interface ResearchNoteRow {
   source: string | null;
   confidence: number | null;
   fetched_at: string;
+}
+
+/** One phase run of the loop, with the Claude API cost it incurred -- spend counts against profit. */
+interface RunRow {
+  id: number;
+  proposal_id: number | null;
+  phase: string;
+  cost_usd: number;
+  duration_ms: number | null;
+  started_at: string;
 }
 
 interface LessonRow {

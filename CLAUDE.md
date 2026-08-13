@@ -136,6 +136,16 @@ own `ellipsis: true` (plain CSS truncation + native title tooltip) and a click-t
 full text — not AntD's `Typography.Text ellipsis={{tooltip}}`, which double-measures against the
 column's own truncation and visibly flickers on hover. Keep new long-text columns consistent with this.
 
+Every table's columns go through `useResizableColumns(storageKey, columns)` (`web/src/hooks/`), which
+adds drag-to-resize handles, persists widths to `localStorage` under `storageKey`, and returns a
+`scroll` that **must** be spread onto the `<Table>`. That `scroll.x` isn't optional polish: an
+`ellipsis` column puts rc-table into `table-layout: fixed`, where the table is pinned to its
+container's width, so widening one column steals space from its neighbours until the undeclared
+free-text column collapses to nothing. `scroll.x` lets the table grow past the container and scroll
+instead (rc-table sizes it `width: x; min-width: 100%`, so it still fills when there's room). Don't
+wrap tables in an `overflowX: auto` div — that never engages, because the table itself never
+overflows.
+
 `useAgentSocket.ts` tracks a `historyVersion` counter that bumps on state-changing WebSocket events
 (`proposal_decided`, etc.); `App.tsx`/page components refetch their REST data (`/api/proposals`,
 `/api/outcomes`, `/api/actions`, etc.) whenever it changes, so REST-fetched state stays in sync with what

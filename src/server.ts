@@ -35,6 +35,10 @@ export function startServer(store: MemoryStore, domains: string[], port: number)
     res.json(store.listActions(Number(req.params.id)));
   });
 
+  app.get("/api/proposals/:id/runs", (req, res) => {
+    res.json(store.listRunsForProposal(Number(req.params.id)));
+  });
+
   const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
   const MIN_RECURRENCE_MS = 5 * 60 * 1000; // 5 minutes -- blocks a fat-fingered tight loop
 
