@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { App as AntApp, Badge, Button, Layout, Menu, Tooltip, Typography } from 'antd'
+import { App as AntApp, Badge, Button, Layout, Menu, Spin, Tooltip, Typography } from 'antd'
 import {
   BulbOutlined,
   CodeOutlined,
@@ -18,19 +18,30 @@ import { useAgentSocket } from './useAgentSocket'
 import { UnauthorizedError, api } from './api'
 import { getToken } from './auth'
 import { StatusBar } from './components/StatusBar'
-import { CommandPalette } from './components/CommandPalette'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { TokenGate } from './components/TokenGate'
 import { DashboardPage } from './pages/DashboardPage'
-import { LiveFeedPage } from './pages/LiveFeedPage'
-import { ProposalsPage } from './pages/ProposalsPage'
-import { ActionsPage } from './pages/ActionsPage'
-import { LessonsPage } from './pages/LessonsPage'
-import { ResearchPage } from './pages/ResearchPage'
-import { EconomicsPage } from './pages/EconomicsPage'
-import { ControlPage } from './pages/ControlPage'
 import type { ThemeMode } from './theme'
 import type { OutcomeRow, ProposalRow, StatusResponse } from './types'
+
+/**
+ * Every route except the landing Dashboard is loaded on demand, so opening the console pulls
+ * down the shell plus one page instead of all eight and every dialog they own. The pages use
+ * named exports, hence the `.then` unwrap — `lazy` wants a module with a `default`.
+ *
+ * Dashboard stays eagerly imported: it is what `/` renders, and making it dynamic would only
+ * add a request round-trip in front of the first paint.
+ */
+const LiveFeedPage = lazy(() => import('./pages/LiveFeedPage').then((m) => ({ default: m.LiveFeedPage })))
+const ProposalsPage = lazy(() => import('./pages/ProposalsPage').then((m) => ({ default: m.ProposalsPage })))
+const ActionsPage = lazy(() => import('./pages/ActionsPage').then((m) => ({ default: m.ActionsPage })))
+const LessonsPage = lazy(() => import('./pages/LessonsPage').then((m) => ({ default: m.LessonsPage })))
+const ResearchPage = lazy(() => import('./pages/ResearchPage').then((m) => ({ default: m.ResearchPage })))
+const EconomicsPage = lazy(() => import('./pages/EconomicsPage').then((m) => ({ default: m.EconomicsPage })))
+const ControlPage = lazy(() => import('./pages/ControlPage').then((m) => ({ default: m.ControlPage })))
+
+// Only mounts on Cmd-K, so its modal + search plumbing has no business in the initial payload.
+const CommandPalette = lazy(() => import('./components/CommandPalette').then((m) => ({ default: m.CommandPalette })))
 
 type PageKey = 'dashboard' | 'live' | 'proposals' | 'actions' | 'economics' | 'lessons' | 'research' | 'control'
 
@@ -46,6 +57,15 @@ const PAGE_PATHS: Record<PageKey, string> = {
   control: '/control',
 }
 
+/** Shown for the moment a lazily-loaded page's chunk is in flight. */
+function PageFallback() {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'center', paddingTop: 80 }}>
+      <Spin size="large" />
+    </div>
+  )
+}
+
 function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme: () => void }) {
   const { message } = AntApp.useApp()
   const socket = useAgentSocket()
@@ -55,6 +75,9 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
   const [proposals, setProposals] = useState<ProposalRow[]>([])
   const [outcomes, setOutcomes] = useState<OutcomeRow[]>([])
   const [paletteOpen, setPaletteOpen] = useState(false)
+  // Flips on the first Cmd-K and never back, so the palette chunk is fetched once and the modal
+  // stays mounted afterwards — closing it keeps its exit animation instead of unmounting mid-fade.
+  const [paletteEverOpened, setPaletteEverOpened] = useState(false)
   const [needsToken, setNeedsToken] = useState(false)
   const [authVersion, setAuthVersion] = useState(0)
 
@@ -90,6 +113,10 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [])
+
+  useEffect(() => {
+    if (paletteOpen) setPaletteEverOpened(true)
+  }, [paletteOpen])
 
   const pendingCount = Math.max(proposals.filter((p) => p.status === 'pending').length, socket.pendingProposals.length)
 
@@ -171,61 +198,67 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
 
         <Layout.Content style={{ margin: 24 }}>
           <ErrorBoundary>
-            <Routes>
-              <Route
-                path="/"
-                element={
-                  <DashboardPage
-                    pendingProposals={socket.pendingProposals}
-                    proposals={proposals}
-                    outcomes={outcomes}
-                    totalCostUsd={status?.totalCostUsd ?? 0}
-                    feed={socket.feed}
-                    onOpenLiveFeed={() => navigate(PAGE_PATHS.live)}
-                  />
-                }
-              />
-              <Route path="/live" element={<LiveFeedPage feed={socket.feed} />} />
-              <Route path="/proposals" element={<ProposalsPage proposals={proposals} outcomes={outcomes} />} />
-              <Route path="/proposals/:id" element={<ProposalsPage proposals={proposals} outcomes={outcomes} />} />
-              <Route
-                path="/actions"
-                element={
-                  <ActionsPage
-                    historyVersion={socket.historyVersion}
-                    proposals={proposals}
-                    outcomes={outcomes}
-                    onSetReview={setProposalReview}
-                  />
-                }
-              />
-              <Route
-                path="/actions/:id"
-                element={
-                  <ActionsPage
-                    historyVersion={socket.historyVersion}
-                    proposals={proposals}
-                    outcomes={outcomes}
-                    onSetReview={setProposalReview}
-                  />
-                }
-              />
-              <Route
-                path="/economics"
-                element={<EconomicsPage historyVersion={socket.historyVersion} outcomes={outcomes} />}
-              />
-              <Route path="/lessons" element={<LessonsPage historyVersion={socket.historyVersion} />} />
-              <Route path="/lessons/:id" element={<LessonsPage historyVersion={socket.historyVersion} />} />
-              <Route path="/research" element={<ResearchPage historyVersion={socket.historyVersion} />} />
-              <Route path="/research/:id" element={<ResearchPage historyVersion={socket.historyVersion} />} />
-              <Route path="/control" element={<ControlPage historyVersion={socket.historyVersion} />} />
-              <Route path="*" element={<Navigate to="/" replace />} />
-            </Routes>
+            <Suspense fallback={<PageFallback />}>
+              <Routes>
+                <Route
+                  path="/"
+                  element={
+                    <DashboardPage
+                      pendingProposals={socket.pendingProposals}
+                      proposals={proposals}
+                      outcomes={outcomes}
+                      totalCostUsd={status?.totalCostUsd ?? 0}
+                      feed={socket.feed}
+                      onOpenLiveFeed={() => navigate(PAGE_PATHS.live)}
+                    />
+                  }
+                />
+                <Route path="/live" element={<LiveFeedPage feed={socket.feed} />} />
+                <Route path="/proposals" element={<ProposalsPage proposals={proposals} outcomes={outcomes} />} />
+                <Route path="/proposals/:id" element={<ProposalsPage proposals={proposals} outcomes={outcomes} />} />
+                <Route
+                  path="/actions"
+                  element={
+                    <ActionsPage
+                      historyVersion={socket.historyVersion}
+                      proposals={proposals}
+                      outcomes={outcomes}
+                      onSetReview={setProposalReview}
+                    />
+                  }
+                />
+                <Route
+                  path="/actions/:id"
+                  element={
+                    <ActionsPage
+                      historyVersion={socket.historyVersion}
+                      proposals={proposals}
+                      outcomes={outcomes}
+                      onSetReview={setProposalReview}
+                    />
+                  }
+                />
+                <Route
+                  path="/economics"
+                  element={<EconomicsPage historyVersion={socket.historyVersion} outcomes={outcomes} />}
+                />
+                <Route path="/lessons" element={<LessonsPage historyVersion={socket.historyVersion} />} />
+                <Route path="/lessons/:id" element={<LessonsPage historyVersion={socket.historyVersion} />} />
+                <Route path="/research" element={<ResearchPage historyVersion={socket.historyVersion} />} />
+                <Route path="/research/:id" element={<ResearchPage historyVersion={socket.historyVersion} />} />
+                  <Route path="/control" element={<ControlPage historyVersion={socket.historyVersion} />} />
+                  <Route path="*" element={<Navigate to="/" replace />} />
+              </Routes>
+            </Suspense>
           </ErrorBoundary>
         </Layout.Content>
       </Layout>
 
-      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
+      {paletteEverOpened && (
+        <Suspense fallback={null}>
+          <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
+        </Suspense>
+      )}
     </Layout>
   )
 }

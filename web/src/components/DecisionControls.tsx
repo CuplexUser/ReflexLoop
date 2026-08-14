@@ -1,11 +1,19 @@
-import { useState } from 'react'
-import { App, Button, Divider, Input, Space, Typography } from 'antd'
+import { Suspense, lazy, useState } from 'react'
+import { App, Button, Divider, Input, Space, Spin, Typography } from 'antd'
 import { CheckCircleOutlined, CloseCircleOutlined, EditOutlined } from '@ant-design/icons'
 import type { ProposalRow } from '../types'
 import { api, type ScheduleOptions, type ScopeEdits } from '../api'
 import { palette } from '../theme'
-import { SchedulePriorityFields } from './SchedulePriorityFields'
 import { ToolFence } from './ToolFence'
+
+/**
+ * DatePicker + dayjs are by far the heaviest thing on the approve surface, and they only render
+ * once the operator opens "Schedule & priority…". Loading them on demand keeps them off the
+ * dashboard's first paint, which renders this card the moment a proposal is pending.
+ */
+const SchedulePriorityFields = lazy(() =>
+  import('./SchedulePriorityFields').then((m) => ({ default: m.SchedulePriorityFields })),
+)
 
 /**
  * The approve/reject flow, shared by the dashboard review card and the proposal dialog so the
@@ -92,7 +100,11 @@ export function DecisionControls({ proposal, onDecided }: { proposal: ProposalRo
         </Space>
       )}
 
-      {showSchedule && !rejecting && <SchedulePriorityFields onChange={setSchedule} />}
+      {showSchedule && !rejecting && (
+        <Suspense fallback={<Spin size="small" />}>
+          <SchedulePriorityFields onChange={setSchedule} />
+        </Suspense>
+      )}
 
       {rejecting && (
         <Input.TextArea
