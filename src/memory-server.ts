@@ -1,7 +1,7 @@
 // src/memory-server.ts
 //
 // A single SQLite database backs both:
-//   1. an in-process MCP server (tools the Claude agent calls itself), and
+//   1. the tool set the model calls itself (buildMemoryTools, at the bottom), and
 //   2. a plain TypeScript class (MemoryStore) the orchestrator calls directly
 //      for things the agent should never control, e.g. reading pending
 //      proposals for human review, or recording the human's decision.
@@ -9,12 +9,12 @@
 // Split like that on purpose: the agent gets read/write access to research,
 // lessons, and its own proposals. It never gets a tool that approves its own
 // spending, and it never gets a tool that logs actions on its own tool calls
-// -- those are handled automatically by orchestrator.ts hooks so the audit
+// -- those are recorded by agent-loop.ts around every dispatch, so the audit
 // trail can't be skipped by the model forgetting to call a "log this" tool.
 
 import { DatabaseSync } from "node:sqlite";
-import { tool, createSdkMcpServer, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import { defineTool, namespaceTools, type ToolDefinition } from "./tools/registry.js";
 import { emitAgentEvent } from "./events.js";
 import { deletePoint, qdrantAvailable, searchByText, upsertText } from "./qdrant.js";
 
@@ -129,6 +129,12 @@ export class MemoryStore {
     // rather than looking like what the model proposed all along.
     this.ensureColumn("proposals", "original_required_tools", "TEXT");
     this.ensureColumn("proposals", "original_description", "TEXT");
+
+    // Which model produced each run. Nullable rather than backfilled: runs recorded
+    // before this project left the Claude Agent SDK genuinely have no answer, and
+    // inventing one would misattribute their spend.
+    this.ensureColumn("runs", "provider", "TEXT");
+    this.ensureColumn("runs", "model", "TEXT");
 
     // Priority + scheduling, all human-set at approval time (see decideProposal /
     // scheduleApprovedProposal) -- the model never controls when or how urgently a
@@ -348,6 +354,19 @@ export class MemoryStore {
    * originally proposed. Only ever called from the decision endpoint, before the proposal is
    * approved -- an approved proposal's fence is never edited afterwards.
    */
+  /**
+   * Whether an act phase has already run for this proposal. The dividing line for
+   * whether its scope can still be edited: once the model has committed or deployed
+   * something, narrowing required_tools can't un-do it, and widening would authorise
+   * work retroactively.
+   */
+  hasActed(id: number): boolean {
+    const row = this.db
+      .prepare(`SELECT 1 AS found FROM actions WHERE proposal_id = ? AND phase = 'act' LIMIT 1`)
+      .get(id) as { found: number } | undefined;
+    return Boolean(row);
+  }
+
   applyProposalEdits(id: number, edits: { description?: string; requiredTools?: string[] }) {
     const existing = this.getProposal(id);
     if (!existing) return false;
@@ -617,12 +636,26 @@ export class MemoryStore {
     }
   }
 
-  // ---- runs (Claude API cost per phase, so spend counts against profit) --
+  // ---- runs (model API cost per phase, so spend counts against profit) --
 
-  logRun(proposalId: number | null, phase: string, costUsd: number, durationMs: number | undefined, startedAt: string) {
+  logRun(
+    proposalId: number | null,
+    phase: string,
+    costUsd: number,
+    durationMs: number | undefined,
+    startedAt: string,
+    // Recorded per run because phases can be pointed at different models
+    // (AGENT_ACT_MODEL and friends) -- without this a cost difference between two
+    // phases is unattributable on the Economics page.
+    provider?: string,
+    model?: string
+  ) {
     this.db
-      .prepare(`INSERT INTO runs (proposal_id, phase, cost_usd, duration_ms, started_at) VALUES (?, ?, ?, ?, ?)`)
-      .run(proposalId, phase, costUsd, durationMs ?? null, startedAt);
+      .prepare(
+        `INSERT INTO runs (proposal_id, phase, cost_usd, duration_ms, started_at, provider, model)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(proposalId, phase, costUsd, durationMs ?? null, startedAt, provider ?? null, model ?? null);
   }
 
   listRuns(limit = 200) {
@@ -817,6 +850,9 @@ interface RunRow {
   cost_usd: number;
   duration_ms: number | null;
   started_at: string;
+  /** Null on runs recorded before phases could use different models. */
+  provider: string | null;
+  model: string | null;
 }
 
 interface LessonRow {
@@ -935,15 +971,18 @@ interface ActionHistoryRow {
   occurred_at: string;
 }
 
-// ---- MCP tool definitions ----------------------------------------------
+// ---- tool definitions ---------------------------------------------------
 //
 // These are the only memory operations the agent itself can call. Notice
 // what's absent: no tool to approve a proposal, no tool to mark itself
 // successful, no tool that touches real money. Those stay in the
 // orchestrator's hands.
+//
+// The `mcp__memory__` prefix is a namespace, not a live MCP server -- see the
+// note in tools/registry.ts for why the persisted names kept it.
 
-export function buildMemoryServer(store: MemoryStore): McpSdkServerConfigWithInstance {
-  const researchNoteAdd = tool(
+export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
+  const researchNoteAdd = defineTool(
     "research_note_add",
     "Save a distilled research finding for later reuse. Call this after reading a source, not raw page dumps -- write the takeaway in your own words.",
     {
@@ -960,31 +999,31 @@ export function buildMemoryServer(store: MemoryStore): McpSdkServerConfigWithIns
     },
     async ({ topic, finding, source, confidence }) => {
       const id = await store.addResearchNote(topic, finding, source, confidence);
-      return { content: [{ type: "text", text: `Saved research note #${id}` }] };
+      return `Saved research note #${id}`;
     }
   );
 
-  const researchNoteSearch = tool(
+  const researchNoteSearch = defineTool(
     "research_note_search",
     "Check what has already been researched on a topic before spending a web search cycle re-discovering it.",
     { topic: z.string(), limit: z.number().int().positive().max(50).optional() },
     async ({ topic, limit }) => {
       const rows = await store.searchResearchNotes(topic, limit ?? 10);
-      return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }] };
+      return JSON.stringify(rows, null, 2);
     }
   );
 
-  const lessonSearch = tool(
+  const lessonSearch = defineTool(
     "lesson_search",
     "Retrieve lessons learned from past attempts in a domain, ranked by confidence. Call this before proposing or planning anything.",
     { domain: z.string(), limit: z.number().int().positive().max(50).optional() },
     async ({ domain, limit }) => {
       const rows = await store.searchLessons(domain, limit ?? 10);
-      return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }] };
+      return JSON.stringify(rows, null, 2);
     }
   );
 
-  const lessonAdd = tool(
+  const lessonAdd = defineTool(
     "lesson_add",
     "Record a new, generalized lesson (not a raw log of what happened -- the reusable takeaway). Use during the reflect phase.",
     {
@@ -995,21 +1034,21 @@ export function buildMemoryServer(store: MemoryStore): McpSdkServerConfigWithIns
     async ({ domain, lesson, derivedFromOutcomeId }) => {
       const id = await store.addLesson(domain, lesson, derivedFromOutcomeId);
       emitAgentEvent({ type: "lesson_saved", domain });
-      return { content: [{ type: "text", text: `Saved lesson #${id}` }] };
+      return `Saved lesson #${id}`;
     }
   );
 
-  const lessonReinforce = tool(
+  const lessonReinforce = defineTool(
     "lesson_reinforce",
     "Adjust an existing lesson's confidence instead of creating a duplicate, when a new outcome confirms or contradicts it.",
     { id: z.number().int(), direction: z.enum(["confirmed", "contradicted"]) },
     async ({ id, direction }) => {
       store.reinforceLesson(id, direction);
-      return { content: [{ type: "text", text: `Lesson #${id} marked ${direction}` }] };
+      return `Lesson #${id} marked ${direction}`;
     }
   );
 
-  const proposalCreate = tool(
+  const proposalCreate = defineTool(
     "proposal_create",
     "Propose a specific, boundable action for a human to approve. Every proposal needs a concrete cost/time/upside estimate and the exact list of tools it needs -- no proposal is executed without human approval, and execution is locked to exactly the tools listed here.",
     {
@@ -1036,11 +1075,11 @@ export function buildMemoryServer(store: MemoryStore): McpSdkServerConfigWithIns
         expectedUpside,
         requiredTools,
       });
-      return { content: [{ type: "text", text: `Created proposal #${id}, status: pending. Stop here and wait for review -- do not act on it.` }] };
+      return `Created proposal #${id}, status: pending. Stop here and wait for review -- do not act on it.`;
     }
   );
 
-  const actionHistorySearch = tool(
+  const actionHistorySearch = defineTool(
     "action_history_search",
     "See real-world actions already taken on approved proposals (repos created, sites deployed, files committed, etc.), optionally filtered to one domain. Call this before proposing new work so you don't duplicate something already built or deployed.",
     {
@@ -1049,22 +1088,22 @@ export function buildMemoryServer(store: MemoryStore): McpSdkServerConfigWithIns
     },
     async ({ domain, limit }) => {
       const rows = store.listActionHistory(domain, limit ?? 20);
-      return { content: [{ type: "text", text: JSON.stringify(rows, null, 2) }] };
+      return JSON.stringify(rows, null, 2);
     }
   );
 
-  const proposalStatus = tool(
+  const proposalStatus = defineTool(
     "proposal_status",
     "Check whether a previously created proposal has been approved, rejected, or is still pending.",
     { id: z.number().int() },
     async ({ id }) => {
       const row = store.getProposal(id);
-      if (!row) return { content: [{ type: "text", text: "No such proposal" }] };
-      return { content: [{ type: "text", text: JSON.stringify(row, null, 2) }] };
+      if (!row) return "No such proposal";
+      return JSON.stringify(row, null, 2);
     }
   );
 
-  const outcomeRecord = tool(
+  const outcomeRecord = defineTool(
     "outcome_record",
     "Record what actually happened after executing an approved proposal -- real revenue, real cost (including time value if relevant), and whether it succeeded. Be honest here; the reflect phase depends on it.",
     {
@@ -1078,23 +1117,19 @@ export function buildMemoryServer(store: MemoryStore): McpSdkServerConfigWithIns
     async ({ proposalId, actualRevenue, actualCost, actualTimeHours, success, notes }) => {
       const id = store.recordOutcome({ proposalId, actualRevenue, actualCost, actualTimeHours, success, notes });
       emitAgentEvent({ type: "outcome_recorded", proposalId });
-      return { content: [{ type: "text", text: `Recorded outcome #${id}` }] };
+      return `Recorded outcome #${id}`;
     }
   );
 
-  return createSdkMcpServer({
-    name: "memory",
-    version: "1.0.0",
-    tools: [
-      researchNoteAdd,
-      researchNoteSearch,
-      lessonSearch,
-      lessonAdd,
-      lessonReinforce,
-      proposalCreate,
-      proposalStatus,
-      outcomeRecord,
-      actionHistorySearch,
-    ],
-  });
+  return namespaceTools("mcp__memory__", [
+    researchNoteAdd,
+    researchNoteSearch,
+    lessonSearch,
+    lessonAdd,
+    lessonReinforce,
+    proposalCreate,
+    proposalStatus,
+    outcomeRecord,
+    actionHistorySearch,
+  ]);
 }

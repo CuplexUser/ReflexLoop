@@ -43,6 +43,8 @@ export function ToolFence({
   const catalog = useToolCatalog()
   const riskOf = (name: string): ToolRisk => catalog.get(name) ?? (catalog.size === 0 ? 'read' : 'unknown')
   const writeCount = tools.filter((t) => riskOf(t) === 'write').length
+  // Only meaningful once the catalog has loaded; before that everything looks unknown.
+  const unknownTools = catalog.size === 0 ? [] : tools.filter((t) => !catalog.has(t))
 
   return (
     <div>
@@ -60,24 +62,40 @@ export function ToolFence({
       {editable ? (
         <>
           <Select
-            mode="multiple"
+            // `tags` rather than `multiple`: the catalog is the suggestion list, not the
+            // limit. A name the console doesn't know about can still be entered — the
+            // catalog may predate a tool the backend just gained, and an entry that
+            // matches nothing can't grant anything, so it's flagged rather than blocked.
+            mode="tags"
             style={{ width: '100%' }}
             value={tools}
-            onChange={(next: string[]) => onChange?.(next)}
-            placeholder="No tools — the act phase would be able to do nothing"
+            onChange={(next: string[]) => onChange?.(next.map((t) => t.trim()).filter(Boolean))}
+            placeholder="No tools — the act phase could create, commit or deploy nothing"
             options={[...catalog.entries()].map(([name, risk]) => ({
               value: name,
               label: `${name.replace(/^mcp__(memory|integrations)__/, '')}${risk === 'write' ? '  ⚠ side-effecting' : ''}`,
             }))}
             optionFilterProp="label"
+            tokenSeparators={[',']}
           />
+          {unknownTools.length > 0 && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginTop: 8 }}
+              message={`${unknownTools.length} name${unknownTools.length === 1 ? " isn't" : "s aren't"} in the tool catalog.`}
+              description={`${unknownTools.join(', ')} — the act phase matches tools by exact name, so ${
+                unknownTools.length === 1 ? 'this one grants' : 'these grant'
+              } nothing. Harmless, but check for a typo.`}
+            />
+          )}
           {writeCount > 0 && (
             <Alert
               type="warning"
               showIcon
               style={{ marginTop: 8 }}
               message={`Approving grants ${writeCount} side-effecting tool${writeCount === 1 ? '' : 's'}.`}
-              description="Removing one here narrows what the act phase can do. It cannot use anything not in this list."
+              description="Removing one here narrows what the act phase can do. It cannot create, commit or deploy anything not in this list."
             />
           )}
         </>

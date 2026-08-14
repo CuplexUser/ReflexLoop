@@ -4,22 +4,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An autonomous Claude agent (via the Agent SDK, not the chat UI) that researches money-making
-opportunities, proposes concrete plans, and — only after a human approves in a web console — acts on
-them, records the real outcome, and distills a lesson for next time. No sub-agents: `agents` is never
-set in `orchestrator.ts`, so the model has no Agent/Task tool to spawn one.
+An autonomous agent that researches money-making opportunities, proposes concrete plans, and — only
+after a human approves in a web console — acts on them, records the real outcome, and distills a lesson
+for next time. No sub-agents: the tool registry contains no tool that spawns one, and `agent-loop.ts`
+only ever dispatches tools from that registry.
+
+**It is not tied to any one model vendor.** It talks to model APIs directly over HTTP — there is no
+Claude Code, no Agent SDK, no vendor SDK of any kind. `AGENT_PROVIDER` selects OpenRouter, OpenAI,
+Anthropic, xAI (Grok) or Moonshot (Kimi); `AGENT_MODEL` names the model. Phases can use different
+models (`AGENT_ACT_MODEL` etc.). Nothing outside `src/llm/` should contain provider-specific code.
 
 **The core invariant: no proposal, no action, ever.** Every real-world side-effecting tool call
-(creating a repo, deploying, etc.) only runs inside `actPhase`, gated by a `canUseTool` fence limited to
-exactly the tools the human-approved proposal named. Don't add anything that auto-approves proposals or
-lets `actPhase` reach beyond `proposal.required_tools` — that removes the one safeguard the rest of the
-design assumes is there.
+(creating a repo, deploying, etc.) only runs inside `actPhase`, fenced to exactly the tools the
+human-approved proposal named. Don't add anything that auto-approves proposals or lets `actPhase` reach
+beyond `proposal.required_tools` — that removes the one safeguard the rest of the design assumes is
+there. The fence is now enforced structurally rather than by configuration: `agent-loop.ts` owns tool
+dispatch, so a tool outside the phase's grant is never described to the model and is refused if the
+model names it anyway. (Under the old Agent SDK this needed three overlapping mechanisms —
+`allowedTools`, `canUseTool` and a `PreToolUse` hook — because each had a documented gap the next one
+patched. Those are gone; don't reintroduce that shape.)
 
-A human *may* edit `required_tools` at approval time (see approve-with-edits below) — that's the operator
-reshaping the fence deliberately, not the agent escaping it. The edit is validated against the tool
-catalog, applied before the status flips, and the original is kept on the row. Every other lever the
-console offers (pause, abort, directives, domains) can only reduce activity or redirect research; none of
-them grants the agent anything.
+A human *may* edit `required_tools` — that's the operator reshaping the fence deliberately, not the agent
+escaping it. Two windows, and they're different endpoints on purpose:
+
+- **At approval time** (`POST /api/proposals/:id/decision`, see approve-with-edits below), the edit is
+  applied *before* the status flips, so a proposal is never approved while still carrying its pre-edit
+  fence.
+- **After approval, until the act phase starts** (`POST /api/proposals/:id/scope`). A queued or scheduled
+  proposal you can see is slightly wrong should be narrowable without cancelling it outright. The window
+  closes at `store.hasActed(id)` (or while it's the running proposal): after that, narrowing can't
+  un-commit anything and widening would authorise work retroactively.
+
+Either way the original is preserved on the row (`original_required_tools` / `original_description`).
+A name that isn't in the tool catalog is **allowed but flagged**, not rejected — `agent-loop.ts` matches
+tools by exact name, so an unrecognized entry grants nothing, and rejecting it blocked legitimate cases
+(a console whose catalog predates a newly added tool). The console badges it; the server logs it.
+
+Every other lever the console offers (pause, abort, directives, domains) can only reduce activity or
+redirect research; none of them grants the agent anything.
 
 ## Commands
 
@@ -31,11 +53,16 @@ npm run typecheck     # tsc --noEmit over src/
 npm start             # tsx src/orchestrator.ts — runs the agent loop + web console together (one process, one SQLite connection)
 ```
 
-`src/memory-server.test.ts` is the real test suite (Vitest): `MemoryStore` against an in-memory SQLite
-DB (`:memory:`), with `qdrant.ts` mocked out so semantic-search tests exercise the deterministic
-LIKE-fallback path regardless of ambient `QDRANT_*` env vars. `smoke-test.ts` (`src/smoke-test.ts`)
-still exists alongside it as a quick end-to-end sanity check against a throwaway `./data/smoke-test.db`
-file, useful when you want to eyeball real output rather than assertions.
+Vitest covers the parts that can be tested without an API key: `src/memory-server.test.ts`
+(`MemoryStore` against an in-memory SQLite DB, with `qdrant.ts` mocked so semantic-search tests exercise
+the deterministic LIKE-fallback path regardless of ambient `QDRANT_*` env vars), `src/tools/registry.test.ts`
+(schema conversion and in-band error handling), `src/tools/web.test.ts` (HTML-to-text, and that WebFetch
+refuses loopback/private addresses), and `src/llm/pricing.test.ts` (the cost table, the OpenRouter
+reported-cost path, and the deliberate $0-for-unknown-model behaviour). The adapters and the loop itself
+aren't unit-tested — they're thin over HTTP, and a mock of a provider's wire format mostly tests the mock.
+`smoke-test.ts` runs end-to-end against a throwaway `./data/smoke-test.db`, and also builds the real tool
+registry and serializes every schema — which is the cheap way to catch a zod shape that can't be converted,
+since otherwise it surfaces as a provider 400 on the first live cycle.
 
 Frontend (`web/`) is an npm workspace of the root project — `npm install` at the root sets up both.
 Run its scripts from the root (below) or with `npm run <script> -w web` from anywhere:
@@ -49,12 +76,19 @@ npm run web:lint      # oxlint over web/
 For frontend work, run `npm start` (backend) and `npm run web:dev` (frontend) side by side rather than
 rebuilding `web/dist` on every change.
 
-`.env` (copy from `.env.example`): `ANTHROPIC_API_KEY` (skip if logged in via `claude setup-token`),
-`AGENT_DOMAINS`, `AGENT_DB_PATH`, `AGENT_CYCLE_INTERVAL_MS`, `AGENT_MAX_PENDING_PROPOSALS`,
-`AGENT_SERVER_PORT`, `AGENT_API_TOKEN`, `AGENT_BIND_HOST`, and optional integration keys `GITHUB_TOKEN` / `VERCEL_TOKEN` /
-`NETLIFY_AUTH_TOKEN` / `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
+`.env` (copy from `.env.example`). The three that must be right for `npm start` to work at all:
+`AGENT_PROVIDER` (default `openrouter`), `AGENT_MODEL` (**required, no default** — see below), and that
+provider's key (`OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `XAI_API_KEY` /
+`MOONSHOT_API_KEY`). Then `AGENT_DOMAINS`, `AGENT_DB_PATH`, `AGENT_CYCLE_INTERVAL_MS`,
+`AGENT_MAX_PENDING_PROPOSALS`, `AGENT_SERVER_PORT`, `AGENT_API_TOKEN`, `AGENT_BIND_HOST`; optional
+search keys `TAVILY_API_KEY` / `BRAVE_API_KEY` (see below); optional integration keys `GITHUB_TOKEN` /
+`VERCEL_TOKEN` / `NETLIFY_AUTH_TOKEN` / `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
 `QDRANT_EMBEDDING_DIM` (all four required together for semantic search) — each integration or feature
 is simply unavailable, not a startup error, when its keys are missing.
+
+**`AGENT_MODEL` has no default on purpose.** Providers rename and retire models constantly; a model id
+baked into the code fails at the first API call with an opaque 404 instead of at startup with a message
+naming the provider and its model list. Don't add one.
 
 ## Architecture
 
@@ -62,8 +96,8 @@ is simply unavailable, not a startup error, when its keys are missing.
 
 Each cycle: **research + plan → human review → act → outcome + reflect**.
 
-- **research + plan** (`researchAndPlanPhase`) — runs with `permissionMode: "bypassPermissions"` since
-  every tool available to it is read-only or writes only to the agent's own memory DB. Can span multiple
+- **research + plan** (`researchAndPlanPhase`) — gets its whole tool grant up front with no human in the
+  loop, since every tool available to it is read-only or writes only to the agent's own memory DB. Can span multiple
   `AGENT_DOMAINS` per cycle and create 0-3 proposals; not forced to cover domains evenly. Calls
   `lesson_search`/`research_note_search` first so it doesn't re-research what's already known, and
   `action_history_search` to see what's already been built/deployed so it doesn't propose duplicate work.
@@ -76,15 +110,16 @@ Each cycle: **research + plan → human review → act → outcome + reflect**.
   `original_description` preserve what the model asked for. A **rejection** now runs
   `reflectOnRejectionPhase` (memory-only tools, same grant as reflect) with the human's stated reason,
   so being told no produces a lesson instead of teaching the agent nothing.
-- **act** (`actPhase`) — side-effecting tool access is hard-limited to exactly `proposal.required_tools`,
-  plus memory tools and the same no-side-effect read-only integration tools the research phase gets
-  freely (`github_read_repo`/`github_read_file`/etc.) so the model can read back what it just
-  committed/deployed and self-check it before recording an outcome — the prompt requires this: fully
-  implement the described scope (no stub/placeholder files), proofread for syntax/import errors since
-  there's no build step available to actually run the code, then re-read the real committed/deployed
-  state before calling `outcome_record`. All of this is enforced by both `allowedTools` and an
-  independent `canUseTool` callback (belt and suspenders: `allowedTools` alone only works if the model is
-  never told about the broader tool at all).
+- **act** (`actPhase`) — side-effecting tool access is hard-limited to exactly `proposal.required_tools`.
+  On top of that it always gets the same no-side-effect set research gets freely: memory tools, the
+  read-only integration tools (`github_read_repo`/`github_read_file`/etc.) so the model can read back what
+  it just committed/deployed and self-check it, and `WebSearch`/`WebFetch` so it can check a library's
+  current API mid-build rather than committing what it half-remembers with no build step to catch it.
+  None of those can change anything outside the process, so they widen what act can *learn*, never what
+  it can *do*. The prompt requires it to fully implement the described scope (no stub/placeholder files),
+  proofread for syntax/import errors since there's no build step available to actually run the code, and
+  re-read the real committed/deployed state before calling `outcome_record`. The whole grant is passed to
+  `runAgent` as `allowedTools`, which is now the entire fence — see the note at the top of this file.
 - **reflect** (`reflectPhase`) — calls `lesson_search` first; reinforces an existing lesson via
   `lesson_reinforce` if this outcome confirmed/contradicted it, otherwise adds one new generalized lesson.
 
@@ -94,10 +129,14 @@ proposal's act+reflect is pushed onto a single serialized chain (`scheduleActAnd
 so side-effecting tool calls from different proposals never run concurrently, even if several are
 approved back to back.
 
-Every tool call in every phase is logged via a `PostToolUse` hook in `runPhase`, and every phase's Claude
-API cost (`total_cost_usd` from the SDK) is recorded — spend counts against profit. That accounting lives
-in a `finally`, so an aborted or crashed phase still lands in `runs`: spend already incurred is real
-whether or not the phase finished, and a phase missing from the ledger would understate what the loop cost.
+Every tool call in every phase is logged by `runPhase`'s `onToolCall` callback, and every phase's model
+API cost is recorded — spend counts against profit. Cost is no longer handed over the way the SDK's
+`total_cost_usd` was: it's computed from token usage against `llm/pricing.ts`, or taken from the provider
+when it reports a real per-call charge (OpenRouter does). It accumulates via `onTurnCost` per model call
+rather than being read off the result, and the ledger write lives in a `finally`, so an aborted or crashed
+phase still lands in `runs` with the spend it actually incurred — a phase missing from the ledger, or
+present with a zero, would understate what the loop cost. `runs` also records the `provider`/`model` that
+produced each row, since phases can be pointed at different models.
 
 **Runtime control** (`agent-control.ts`) holds state the operator drives from the console: paused,
 domains, cycle interval, a one-shot research directive, and a live view of what's executing. `mainLoop`
@@ -108,12 +147,47 @@ on). A directive is consumed — injected into one research prompt, then cleared
 
 ### Backend modules (`src/`)
 
-- `memory-server.ts` — SQLite-backed memory (`data/agent.db`) plus the MCP tools the model can call:
+- `llm/` — everything provider-specific, and the only place it should live. `types.ts` is the neutral
+  vocabulary (messages, tool calls, usage) every phase speaks. Two adapters implement it:
+  `openai-compatible.ts` covers OpenRouter, OpenAI, xAI and Moonshot (they share the `/chat/completions`
+  wire format and differ only in how you cap output tokens, how you turn on server-side search, and
+  whether the provider bills the call back to you), and `anthropic.ts` covers Claude's Messages API
+  natively — worth its own file rather than going through Anthropic's OpenAI-compat shim, which lags on
+  tool use. `providers.ts` is the registry of base URLs / key env vars / model-list links; `http.ts` is
+  one retrying JSON POST (429 and 5xx only — a 400 from a bad model id is returned immediately);
+  `pricing.ts` turns tokens into dollars; `index.ts` resolves one client per phase from the env.
+  Adapters must normalize `Usage.inputTokens` to *total* prompt tokens including cached ones — Anthropic
+  reports the uncached remainder, so its adapter adds the cache fields back or pricing under-counts.
+- `agent-loop.ts` — the replacement for the SDK's `query()`: ask the model, run the tools it asked for,
+  feed results back, repeat to `maxTurns`. Provider-agnostic (it only touches an `LlmClient`), and the
+  place the tool fence is enforced.
+- `tools/registry.ts` — what replaced the MCP servers. A tool is a name, description, zod schema and
+  handler; the registry converts schemas to JSON Schema (`z.toJSONSchema`, `io: "input"`) and dispatches.
+  Every failure — unknown tool, invalid args, throwing handler — comes back as `isError` tool text rather
+  than an exception, so one bad call costs a turn instead of the phase. **Tool names keep their
+  `mcp__memory__` / `mcp__integrations__` prefixes** even though no MCP server exists any more: those
+  strings are persisted in `actions.tool_name` and in approved proposals' `required_tools`, and the
+  console strips them for display. Treat them as opaque namespaces; renaming would invalidate the fence
+  on already-approved proposals for no behavioural gain.
+- `tools/web.ts` — `WebSearch` and `WebFetch`, which were Claude Code built-ins and had to be rebuilt.
+  `WebFetch` is always registered (fetch + a regex HTML-to-text pass, with private/loopback addresses
+  refused). `WebSearch` is registered only in `tavily`/`brave` search mode.
+- `search/` — the seam behind `WebSearch`: `tavily.ts` and `brave.ts` implement one small interface, and
+  `index.ts` resolves the mode from `AGENT_SEARCH_PROVIDER` (`auto` | `tavily` | `brave` | `native` |
+  `none`). In `native` mode no local tool is registered at all and `agent-loop.ts` instead sets
+  `ChatRequest.nativeSearch`, which each adapter translates to its provider's own knob (OpenRouter
+  `plugins`, xAI `search_parameters`, OpenAI `web_search_options`, Moonshot's `$web_search` builtin,
+  Anthropic's `web_search_*` server tool). **The point of the seam: "WebSearch" means the same thing to
+  the operator in all modes** — one grantable tool name, one badge in the console, one entry in
+  `required_tools`. Keep it that way.
+- `memory-server.ts` — SQLite-backed memory (`data/agent.db`) plus the tools the model can call:
   `research_note_add`, `research_note_search`, `lesson_search`, `lesson_add`, `lesson_reinforce`,
   `proposal_create`, `proposal_status`, `outcome_record`, `action_history_search`. Approving proposals,
   logging actions, marking a run successful, and **curating memory** (editing, muting, or deleting a
   lesson; deleting or merging research notes) are deliberately *not* model-callable tools — those stay
-  with the orchestrator and the human. Muting matters most: `searchLessons` is the single chokepoint
+  with the orchestrator and the human. `buildMemoryTools(store)` returns them; `MemoryStore` itself is a
+  plain class the orchestrator and `server.ts` call directly for everything the model must not control.
+  Muting matters most: `searchLessons` is the single chokepoint
   every `lesson_search` goes through, so muting there removes a wrong lesson from the agent's reasoning
   everywhere at once while keeping the record of what was believed and when. `searchLessonsByText` is a
   deliberate sibling of `searchLessons` for the console's operator — the agent looks lessons up *by
@@ -132,8 +206,8 @@ on). A directive is consumed — injected into one research prompt, then cleared
   search instead of throwing. Model + dimension aren't hardcoded (Qdrant Cloud's free model lineup and
   each model's vector size are only listed per-cluster, in the Cloud Console's Inference tab), so both
   are required env config.
-- `integrations/{github,vercel,netlify}.ts` + `integrations-server.ts` — thin API wrappers and their MCP
-  tools. Read-only tools (`github_read_repo`, `vercel_list_projects`, etc.) are free for the research
+- `integrations/{github,vercel,netlify}.ts` + `integrations-server.ts` — thin API wrappers and the tools
+  that expose them (`buildIntegrationsTools()`). Read-only tools (`github_read_repo`, `vercel_list_projects`, etc.) are free for the research
   phase to call. Write tools (`github_create_repo`, `vercel_deploy`, `netlify_deploy`, etc.) only work in
   `actPhase`, and only when named in the approved proposal's `required_tools`. Each write tool that
   creates/deploys something returns a plain `url` field on success — `memory-server.ts`'s
@@ -142,7 +216,8 @@ on). A directive is consumed — injected into one research prompt, then cleared
 - `tool-catalog.ts` — the one place that knows which tools exist and which touch the real world
   (`toolRisk` → write/read/memory). Three consumers used to each carry their own copy of that answer:
   `orchestrator.ts` (listing act-phase write tools in the research prompt), `server.ts` (validating
-  operator edits to `required_tools` against `ALL_GRANTABLE_TOOLS`), and the console (badging risk at
+  operator edits to `required_tools` against `ALL_GRANTABLE_TOOLS` — now to warn on an uncatalogued name,
+  not to reject it), and the console (badging risk at
   decision time, via `GET /api/tools`). Read-only integration tools stay defined in
   `integrations-server.ts` next to their handlers and are re-exported here.
 - `agent-control.ts` — runtime knobs (pause, run-now, abort, domains, interval, directive) plus the

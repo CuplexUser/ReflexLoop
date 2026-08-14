@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { App, Button, Descriptions, Modal, Skeleton, Space, Statistic, Table, Tag, Tooltip, Typography } from 'antd'
-import { ClockCircleOutlined } from '@ant-design/icons'
+import { ClockCircleOutlined, EditOutlined } from '@ant-design/icons'
 import type { ActionRow, OutcomeRow, ProposalRow, RunRow } from '../types'
 import { api } from '../api'
 import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, preview, recurrenceLabel, timeAgo } from '../format'
@@ -30,11 +30,15 @@ export function ProposalDialog({
   const [actions, setActions] = useState<ActionRow[] | null>(null)
   const [runs, setRuns] = useState<RunRow[]>([])
   const [cancellingSchedule, setCancellingSchedule] = useState(false)
+  const [editingScope, setEditingScope] = useState(false)
+  const [scopeTools, setScopeTools] = useState<string[]>([])
+  const [savingScope, setSavingScope] = useState(false)
 
   useEffect(() => {
     if (!open || !proposal) return
     setActions(null)
     setRuns([])
+    setEditingScope(false)
     let cancelled = false
     api
       .proposalActions(proposal.id)
@@ -59,6 +63,26 @@ export function ProposalDialog({
     ?.split(',')
     .map((t) => t.trim())
     .filter(Boolean)
+
+  // The server enforces the same rule and 409s if we get it wrong; this just keeps the
+  // button from appearing when it would obviously fail. `actions === null` means the fetch
+  // hasn't landed yet, so hold off rather than offering an edit we may have to reject.
+  const hasActed = (actions ?? []).some((a) => a.phase === 'act')
+  const scopeEditable = proposal.status === 'approved' && actions !== null && !hasActed
+
+  async function saveScope() {
+    if (!proposal) return
+    setSavingScope(true)
+    try {
+      await api.editScope(proposal.id, { requiredTools: scopeTools })
+      message.success(`Fence updated on proposal #${proposal.id}`)
+      setEditingScope(false)
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : 'Editing the fence failed')
+    } finally {
+      setSavingScope(false)
+    }
+  }
 
   async function cancelSchedule() {
     if (!proposal) return
@@ -123,7 +147,7 @@ export function ProposalDialog({
           />
           {runs.length > 0 && (
             <Statistic
-              title={`Claude API spend (${runs.length} ${runs.length === 1 ? 'phase' : 'phases'})`}
+              title={`Model API spend (${runs.length} ${runs.length === 1 ? 'phase' : 'phases'})`}
               value={runs.reduce((sum, r) => sum + r.cost_usd, 0)}
               precision={4}
               prefix="$"
@@ -132,13 +156,52 @@ export function ProposalDialog({
           )}
         </Space>
 
-        {/* Pending proposals get the editable fence inside DecisionControls; decided ones are read-only. */}
+        {/*
+          Pending proposals get the editable fence inside DecisionControls. An approved one
+          stays editable here until its act phase starts — a queued or scheduled proposal you
+          can see is slightly wrong should be narrowable without cancelling it outright.
+          Once it has acted the fence is history, so it's read-only.
+        */}
         {proposal.status !== 'pending' && (
           <div>
-            <ToolFence tools={tools} />
+            <Space align="center" size={8} style={{ marginBottom: editingScope ? 4 : 0 }}>
+              {scopeEditable && !editingScope && (
+                <Button
+                  size="small"
+                  icon={<EditOutlined />}
+                  onClick={() => {
+                    setScopeTools(tools)
+                    setEditingScope(true)
+                  }}
+                >
+                  Edit fence
+                </Button>
+              )}
+              {editingScope && (
+                <>
+                  <Button size="small" type="primary" loading={savingScope} onClick={saveScope}>
+                    Save fence
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      setEditingScope(false)
+                      setScopeTools(tools)
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                </>
+              )}
+            </Space>
+            <ToolFence
+              tools={editingScope ? scopeTools : tools}
+              editable={editingScope}
+              onChange={setScopeTools}
+            />
             {originalTools && (
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                Fence edited at approval — the model asked for: {originalTools.join(', ')}
+                Fence edited — the model asked for: {originalTools.join(', ')}
               </Typography.Text>
             )}
           </div>

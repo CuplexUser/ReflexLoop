@@ -89,6 +89,13 @@ export const api = {
     send(`/api/proposals/${id}/review`, 'POST', { reviewStatus }),
 
   cancelSchedule: (id: number) => send(`/api/proposals/${id}/cancel-schedule`, 'POST'),
+  /**
+   * Narrow or widen an already-approved proposal's scope, up until its act phase starts.
+   * Pending proposals use `decide` instead, which applies edits before the status flips.
+   * 409s once the proposal is running or has acted.
+   */
+  editScope: (id: number, edits: { description?: string; requiredTools?: string[] }) =>
+    send<{ ok: true; proposal: ProposalRow }>(`/api/proposals/${id}/scope`, 'POST', edits),
 
   // ---- memory curation ----
   editLesson: (id: number, fields: { domain?: string; lesson?: string }) => send(`/api/lessons/${id}`, 'PATCH', fields),

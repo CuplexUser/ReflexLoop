@@ -23,7 +23,7 @@ import { timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 import type { MemoryStore, Priority } from "./memory-server.js";
-import { onAgentEvent, type AgentEvent } from "./events.js";
+import { emitAgentEvent, onAgentEvent, type AgentEvent } from "./events.js";
 import { submitDecision, hasPendingDecision } from "./review-gateway.js";
 import { fireReactiveTrigger } from "./reactive-triggers.js";
 import { ALL_GRANTABLE_TOOLS, toolRisk } from "./tool-catalog.js";
@@ -131,14 +131,22 @@ export function startServer(store: MemoryStore, port: number): Server {
       return `\`recurrenceMs\` must be at least ${MIN_RECURRENCE_MS}ms (5 minutes).`;
     }
     if (body.editedRequiredTools !== undefined) {
-      if (!Array.isArray(body.editedRequiredTools) || body.editedRequiredTools.some((t) => typeof t !== "string")) {
-        return "`editedRequiredTools` must be an array of tool names.";
+      if (
+        !Array.isArray(body.editedRequiredTools) ||
+        body.editedRequiredTools.some((t) => typeof t !== "string" || !t.trim())
+      ) {
+        return "`editedRequiredTools` must be an array of non-blank tool names.";
       }
-      // An operator may narrow the fence freely, and may widen it -- but only to tools
-      // this system actually has. An unknown name would otherwise sit in required_tools
-      // looking authorized while silently never matching anything.
-      const unknown = body.editedRequiredTools.filter((t) => !ALL_GRANTABLE_TOOLS.includes(t));
-      if (unknown.length > 0) return `Unknown tool(s): ${unknown.join(", ")}.`;
+      // A name outside the catalog is allowed through rather than rejected. It cannot
+      // grant anything -- agent-loop.ts dispatches by exact name, so an unrecognized
+      // entry simply never matches a tool -- and refusing it blocked legitimate cases
+      // (a catalog fetched before a tool was added, an operator who knows the name).
+      // The console badges it as unknown; this logs it so the same surprise is visible
+      // to anyone tailing stdout rather than watching the UI.
+      const unknown = body.editedRequiredTools.filter((t) => !ALL_GRANTABLE_TOOLS.includes(t.trim()));
+      if (unknown.length > 0) {
+        console.warn(`[server] approved required_tools include names not in the catalog: ${unknown.join(", ")}`);
+      }
     }
     if (body.editedDescription !== undefined && typeof body.editedDescription !== "string") {
       return "`editedDescription` must be a string.";
@@ -186,6 +194,78 @@ export function startServer(store: MemoryStore, port: number): Server {
       decided.push(id);
     }
     res.json({ ok: true, decided, skipped });
+  });
+
+  /**
+   * Edit an approved proposal's scope before it runs.
+   *
+   * Approving used to be the only moment scope was editable, which made a scheduled or
+   * queued proposal un-narrowable: the operator could see it was about to do something
+   * slightly wrong and their only lever was cancelling the schedule. This reopens that
+   * window for exactly as long as it's meaningful -- until an act phase has actually
+   * started. After that, narrowing can't un-commit anything and widening would authorise
+   * work retroactively, so it stays closed.
+   *
+   * Pending proposals don't come through here: their scope travels with the approval
+   * decision (POST /decision), which applies edits before the status flips so a proposal
+   * is never approved while still carrying its pre-edit fence.
+   */
+  app.post("/api/proposals/:id/scope", (req, res) => {
+    const id = Number(req.params.id);
+    const proposal = store.getProposal(id);
+    if (!proposal) {
+      res.status(404).json({ error: "No such proposal." });
+      return;
+    }
+    if (proposal.status !== "approved") {
+      res.status(409).json({
+        error:
+          proposal.status === "pending"
+            ? "Edit a pending proposal's scope as part of approving it, not here."
+            : `Cannot edit scope on a ${proposal.status} proposal.`,
+      });
+      return;
+    }
+    if (getControlState().runningProposalId === id) {
+      res.status(409).json({ error: "This proposal's act phase is running; abort it first." });
+      return;
+    }
+    if (store.hasActed(id)) {
+      res.status(409).json({ error: "This proposal has already acted; its scope can no longer be changed." });
+      return;
+    }
+
+    const { description, requiredTools } = req.body as { description?: string; requiredTools?: string[] };
+    if (description === undefined && requiredTools === undefined) {
+      res.status(400).json({ error: "Body must include `description` and/or `requiredTools`." });
+      return;
+    }
+    if (description !== undefined && (typeof description !== "string" || !description.trim())) {
+      res.status(400).json({ error: "`description` must be a non-blank string." });
+      return;
+    }
+    if (
+      requiredTools !== undefined &&
+      (!Array.isArray(requiredTools) || requiredTools.some((t) => typeof t !== "string" || !t.trim()))
+    ) {
+      res.status(400).json({ error: "`requiredTools` must be an array of non-blank tool names." });
+      return;
+    }
+    if (requiredTools) {
+      // Same rule as at approval time: an uncatalogued name is allowed but noted, since
+      // it can't grant anything the loop will actually dispatch.
+      const unknown = requiredTools.filter((t) => !ALL_GRANTABLE_TOOLS.includes(t.trim()));
+      if (unknown.length > 0) {
+        console.warn(`[server] proposal #${id} scope edited to include uncatalogued tools: ${unknown.join(", ")}`);
+      }
+    }
+
+    store.applyProposalEdits(id, { description, requiredTools });
+    const updated = store.getProposal(id)!;
+    // Same event the approval path emits, so the console's tables and any open dialog
+    // refresh through the existing historyVersion path rather than needing a new one.
+    emitAgentEvent({ type: "proposal_decided", proposal: updated });
+    res.json({ ok: true, proposal: updated });
   });
 
   app.post("/api/proposals/:id/cancel-schedule", (req, res) => {

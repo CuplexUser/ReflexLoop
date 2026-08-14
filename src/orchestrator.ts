@@ -1,8 +1,11 @@
 // src/orchestrator.ts
 //
 // Drives agents through: RESEARCH+PLAN -> HUMAN REVIEW -> ACT -> OUTCOME+REFLECT.
-// No subagents anywhere -- the 'agents' option is simply never set, so the
-// model has no Agent/Task tool available to spawn one.
+// No subagents anywhere -- the tool registry has no tool that spawns one, and the
+// loop in agent-loop.ts only ever dispatches tools from that registry.
+//
+// The model behind this is whatever AGENT_PROVIDER/AGENT_MODEL name (OpenRouter,
+// OpenAI, Anthropic, xAI or Moonshot); nothing in this file is provider-specific.
 //
 // Concurrency model: research runs one cycle at a time (on CYCLE_INTERVAL_MS),
 // and can produce more than one proposal per cycle across AGENT_DOMAINS.
@@ -16,10 +19,19 @@
 // Run with: npx tsx src/orchestrator.ts
 
 import "dotenv/config";
-import { query, type Options, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { MemoryStore, buildMemoryServer, type Priority, type ProposalRow } from "./memory-server.js";
-import { buildIntegrationsServer } from "./integrations-server.js";
-import { MEMORY_TOOLS, READONLY_INTEGRATION_TOOLS, WRITE_INTEGRATION_TOOLS } from "./tool-catalog.js";
+import { runAgent } from "./agent-loop.js";
+import { describeClients, resolveLlmClients } from "./llm/index.js";
+import { getSearchConfig } from "./search/index.js";
+import { ToolRegistry } from "./tools/registry.js";
+import { buildWebTools } from "./tools/web.js";
+import { MemoryStore, buildMemoryTools, type Priority, type ProposalRow } from "./memory-server.js";
+import { buildIntegrationsTools } from "./integrations-server.js";
+import {
+  MEMORY_TOOLS,
+  READONLY_BUILTIN_TOOLS,
+  READONLY_INTEGRATION_TOOLS,
+  WRITE_INTEGRATION_TOOLS,
+} from "./tool-catalog.js";
 import { emitAgentEvent } from "./events.js";
 import { waitForDecision } from "./review-gateway.js";
 import { onReactiveTrigger } from "./reactive-triggers.js";
@@ -47,14 +59,53 @@ const MAX_PENDING_PROPOSALS = Number(process.env.AGENT_MAX_PENDING_PROPOSALS ?? 
 const SCHEDULER_TICK_MS = Number(process.env.AGENT_SCHEDULER_TICK_MS ?? 15_000);
 
 const store = new MemoryStore(DB_PATH);
-const memoryServer = buildMemoryServer(store);
-const integrationsServer = buildIntegrationsServer();
-const mcpServers = { memory: memoryServer, integrations: integrationsServer };
+
+/**
+ * Config problems (no AGENT_MODEL, an unknown provider, a search mode whose key is
+ * missing) are all a person's .env being wrong, not a bug -- so they get a readable
+ * line and a clean exit rather than a stack trace from module-load depth.
+ */
+function loadConfigOrExit<T>(load: () => T): T {
+  try {
+    return load();
+  } catch (err) {
+    console.error(`\nConfiguration error: ${err instanceof Error ? err.message : String(err)}`);
+    console.error("Copy .env.example to .env and fill it in, then try again.\n");
+    process.exit(1);
+  }
+}
+
+// One client per phase. They're usually the same model, but they don't have to be:
+// research is wide and cheap to get wrong, act writes real code into real repos with
+// no build step to catch mistakes, and reflect is two short memory calls. See the
+// AGENT_*_PROVIDER / AGENT_*_MODEL overrides in llm/index.ts.
+const llmByPhase = loadConfigOrExit(resolveLlmClients);
+
+// One registry for the whole process; each phase gets a subset by name, never a
+// different registry. buildWebTools() contributes WebFetch always and WebSearch only
+// when an HTTP search provider is configured -- in native mode the provider searches
+// server-side instead, and agent-loop.ts handles that from the same "WebSearch" grant.
+const registry = loadConfigOrExit(
+  () => new ToolRegistry([...buildMemoryTools(store), ...buildIntegrationsTools(), ...buildWebTools()])
+);
 
 // MEMORY_TOOLS (always available, every phase) and WRITE_INTEGRATION_TOOLS
 // (act-phase-only, and only when an approved proposal names them) both live in
 // tool-catalog.ts now -- server.ts validates operator edits to a proposal's
 // required_tools against the same lists, and they can't be allowed to drift.
+
+/**
+ * Shared framing for every phase. The Agent SDK supplied a system prompt of its own
+ * (a coding-agent persona with filesystem tools); this loop has no such default, so
+ * the operating rules that used to be implicit are stated here once instead of being
+ * repeated in each phase prompt.
+ */
+const BASE_SYSTEM = [
+  "You are an autonomous agent that researches money-making opportunities, proposes concrete plans, and -- only after a human approves -- executes them and records what actually happened.",
+  "You work entirely through the tools you are given. You have no filesystem, no shell, and no ability to run code: if a tool doesn't exist for something, you cannot do it, and you should say so rather than pretending otherwise.",
+  "Only the tools listed for the current phase are available. Do not invent tool names or describe a tool call in prose instead of calling it.",
+  "Be concrete and honest. Estimates are estimates and must be labelled as such; recorded outcomes must be what actually happened, including failures.",
+].join("\n");
 
 function preview(value: unknown, max = 150): string {
   const s = typeof value === "string" ? value : JSON.stringify(value);
@@ -62,45 +113,21 @@ function preview(value: unknown, max = 150): string {
   return oneLine.length > max ? oneLine.slice(0, max) + "…" : oneLine;
 }
 
-// `canUseTool` has a gap: it is not consulted for tool calls the SDK issues
-// itself as plumbing (e.g. paging back a previous tool result that was too
-// large to inline, via Read/Grep against its own persisted-output cache) --
-// confirmed live, where such a call reached a real file read despite not
-// being in the phase's allowedTools and despite canUseTool denying anything
-// not in that list. The SDK's own warning is explicit that canUseTool alone
-// does not gate every tool call and that a PreToolUse hook is what does.
-// This is the actual enforcement boundary; canUseTool and settingSources: []
-// (see RESEARCH_OPTIONS) are kept too as defense in depth, not because
-// either alone is sufficient.
-function toolGateHook(allowedTools: string[], phaseLabel: string): NonNullable<Options["hooks"]>["PreToolUse"] {
-  return [
-    {
-      hooks: [
-        async (input) => {
-          if (input.hook_event_name !== "PreToolUse" || allowedTools.includes(input.tool_name)) {
-            return { continue: true };
-          }
-          console.warn(`[${phaseLabel}] PreToolUse denied: ${input.tool_name}`);
-          return {
-            continue: true,
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse" as const,
-              permissionDecision: "deny" as const,
-              permissionDecisionReason: `${input.tool_name} is not available in the ${phaseLabel} phase`,
-            },
-          };
-        },
-      ],
-    },
-  ];
-}
-
-/** Runs a query to completion, logging every tool call and the run's Claude API cost. */
+/**
+ * Runs one phase to completion, logging every tool call and the phase's API spend.
+ *
+ * Spend is no longer handed to us the way the SDK's `total_cost_usd` was -- it's
+ * computed from token usage, or taken from the provider when it reports a real
+ * per-call charge (OpenRouter does). See llm/pricing.ts.
+ */
 async function runPhase(opts: {
   phase: "research_plan" | "act" | "reflect";
   prompt: string;
-  options: Options;
+  system: string;
+  allowedTools: string[];
+  maxTurns: number;
   proposalId: number | null;
+  signal?: AbortSignal;
 }): Promise<{ finalText: string; costUsd: number }> {
   // An aborted run still gets its cost and duration logged below -- spend already
   // incurred counts against profit whether or not the phase finished.
@@ -111,57 +138,41 @@ async function runPhase(opts: {
 
   emitAgentEvent({ type: "phase_start", phase: opts.phase, proposalId: opts.proposalId });
 
-  const hooks: Options["hooks"] = {
-    PostToolUse: [
-      {
-        hooks: [
-          async (input) => {
-            if (input.hook_event_name === "PostToolUse") {
-              store.logAction(opts.proposalId, opts.phase, input.tool_name, input.tool_input, input.tool_response);
-              console.log(`[${opts.phase}] tool: ${input.tool_name} ${preview(input.tool_input)}`);
-              emitAgentEvent({
-                type: "tool_call",
-                phase: opts.phase,
-                proposalId: opts.proposalId,
-                toolName: input.tool_name,
-                input: input.tool_input,
-              });
-            }
-            return { continue: true };
-          },
-        ],
-      },
-    ],
-  };
-
-  const result = query({
-    prompt: opts.prompt,
-    options: {
-      ...opts.options,
-      hooks: { ...(opts.options.hooks ?? {}), ...hooks },
-    },
-  });
-
   try {
-    for await (const message of result as AsyncGenerator<SDKMessage>) {
-      if (message.type === "assistant") {
-        for (const block of message.message.content) {
-          if (block.type === "text" && block.text.trim()) {
-            console.log(`[${opts.phase}] model: ${preview(block.text, 300)}`);
-            emitAgentEvent({ type: "model_text", phase: opts.phase, proposalId: opts.proposalId, text: block.text });
-          }
-        }
-      } else if (message.type === "result") {
-        costUsd = message.total_cost_usd;
-        if (message.subtype === "success") finalText = message.result;
-      }
+    const result = await runAgent({
+      client: llmByPhase[opts.phase],
+      registry,
+      system: opts.system,
+      prompt: opts.prompt,
+      allowedTools: opts.allowedTools,
+      maxTurns: opts.maxTurns,
+      signal: opts.signal,
+      // Accumulated per turn rather than read off the result, so an abort or a crash
+      // mid-phase still records what was already spent.
+      onTurnCost: (usd) => {
+        costUsd += usd;
+      },
+      onAssistantText: (text) => {
+        console.log(`[${opts.phase}] model: ${preview(text, 300)}`);
+        emitAgentEvent({ type: "model_text", phase: opts.phase, proposalId: opts.proposalId, text });
+      },
+      onToolCall: (toolName, input, output) => {
+        store.logAction(opts.proposalId, opts.phase, toolName, input, output);
+        console.log(`[${opts.phase}] tool: ${toolName} ${preview(input)}`);
+        emitAgentEvent({ type: "tool_call", phase: opts.phase, proposalId: opts.proposalId, toolName, input });
+      },
+    });
+    finalText = result.finalText;
+    if (result.stopReason === "max_turns") {
+      console.warn(`[${opts.phase}] hit the ${opts.maxTurns}-turn limit; stopping with whatever it had done so far.`);
     }
   } finally {
     // In the finally so an aborted or failed phase is still accounted for: the spend
     // and the tool calls that already happened are real either way, and a phase that
     // vanished from the ledger because it crashed would understate what the loop cost.
     console.log(`[${opts.phase}] done in ${((Date.now() - t0) / 1000).toFixed(1)}s, cost $${costUsd.toFixed(4)}`);
-    store.logRun(opts.proposalId, opts.phase, costUsd, Date.now() - t0, startedAt);
+    const client = llmByPhase[opts.phase];
+    store.logRun(opts.proposalId, opts.phase, costUsd, Date.now() - t0, startedAt, client.provider, client.model);
     emitAgentEvent({
       type: "phase_done",
       phase: opts.phase,
@@ -185,47 +196,26 @@ async function runPhase(opts: {
 // pass below -- same read-only/memory tool grant either way, only the prompt
 // differs. Reused as-is so the two can't drift apart on what's allowed.
 //
-// IMPORTANT: `allowedTools` alone only skips the permission *prompt* for the
-// tools named in it -- per the SDK's own docs, restricting which tools are
-// actually available requires `canUseTool` (or the `tools` option). Without
-// this callback the model had the full default toolset (Bash, Read, Write,
-// Edit, ...) available here, permission-bypassed, despite the tool list
-// below suggesting otherwise -- confirmed live via a Bash call during a
-// research_plan run. Mirrors actPhase's canUseTool pattern instead of
-// `permissionMode: "bypassPermissions"`, which is what actually restricts
-// this phase to exactly the tools in RESEARCH_ALLOWED_TOOLS.
+// Everything here is read-only or writes only to the agent's own memory DB, which
+// is why this phase can be granted its whole list up front with no human in the
+// loop. WebSearch is listed whether or not a local WebSearch tool exists -- in
+// native mode agent-loop.ts reads this grant and turns on the provider's own
+// server-side search instead. Nothing outside this list is described to the model
+// or dispatchable by it; see the fence note in agent-loop.ts.
 const RESEARCH_ALLOWED_TOOLS = [
   ...MEMORY_TOOLS,
   "mcp__memory__proposal_create",
-  "WebSearch",
-  "WebFetch",
+  ...READONLY_BUILTIN_TOOLS,
   ...READONLY_INTEGRATION_TOOLS,
 ];
-//
-// `canUseTool` alone still wasn't enough: by default the SDK also loads this
-// machine's own filesystem settings (project `.claude/settings.local.json`,
-// user `~/.claude/settings.json`) into every query(), and permissive allow
-// rules from those files can grant a tool before canUseTool is ever consulted
-// (confirmed live -- a Bash call still went through post-fix, matching a
-// broad allow-pattern accumulated in this machine's interactive CLI settings
-// from unrelated past sessions). `settingSources: []` puts every phase in
-// "SDK isolation mode" so this orchestrator's own tool grants are the only
-// policy in effect, independent of whatever this machine's own Claude Code
-// settings happen to contain.
-const RESEARCH_OPTIONS: Options = {
-  mcpServers,
-  allowedTools: RESEARCH_ALLOWED_TOOLS,
-  settingSources: [],
-  canUseTool: async (toolName) => {
-    const allowed = RESEARCH_ALLOWED_TOOLS.includes(toolName);
-    return allowed
-      ? { behavior: "allow" as const }
-      : { behavior: "deny" as const, message: `${toolName} is not available in the research phase` };
-  },
-  hooks: { PreToolUse: toolGateHook(RESEARCH_ALLOWED_TOOLS, "research") },
-  maxTurns: 60,
-  // No `agents` option set -> no Agent/Task tool -> this run cannot spawn subagents.
-};
+
+const RESEARCH_SYSTEM = [
+  BASE_SYSTEM,
+  "You are in the RESEARCH+PLAN phase. Nothing you do here touches the real world: you can read the web, read existing repos and deployments, and write to your own memory. That is all.",
+  "Your only output that matters is proposals. You cannot execute anything in this phase, and a proposal you create will sit until a human approves it.",
+].join("\n");
+
+const RESEARCH_MAX_TURNS = 60;
 
 async function researchAndPlanPhase(): Promise<ProposalRow[]> {
   const beforeIds = new Set(store.listPendingProposals().map((p) => p.id));
@@ -250,7 +240,9 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
       `Then stop -- do not act on any proposal, a human reviews each one next.`,
       `If nothing concrete and boundable comes out of the research, don't force a proposal -- just stop.`,
     ].join("\n"),
-    options: RESEARCH_OPTIONS,
+    system: RESEARCH_SYSTEM,
+    allowedTools: RESEARCH_ALLOWED_TOOLS,
+    maxTurns: RESEARCH_MAX_TURNS,
   });
 
   return store.listPendingProposals().filter((p) => !beforeIds.has(p.id));
@@ -289,7 +281,9 @@ async function handleReactiveTrigger(proposalId: number): Promise<void> {
         `If you find something concrete and boundable, call proposal_create for a tightly-scoped follow-up fix addressing the refinement need.`,
         `If there isn't enough signal yet to propose something concrete, save a research_note explaining what's unclear and stop -- don't force a proposal.`,
       ].join("\n"),
-      options: RESEARCH_OPTIONS,
+      system: RESEARCH_SYSTEM,
+      allowedTools: RESEARCH_ALLOWED_TOOLS,
+      maxTurns: RESEARCH_MAX_TURNS,
     });
 
     const created = store.listPendingProposals().filter((p) => !beforeIds.has(p.id));
@@ -310,6 +304,14 @@ async function handleReactiveTrigger(proposalId: number): Promise<void> {
 // stdout headlessly. Safe to run for several proposals at once -- each
 // waits on its own decision promise independently.
 
+const REFLECT_SYSTEM = [
+  BASE_SYSTEM,
+  "You are in the REFLECT phase. You can only read and write your own memory -- no web access, no integrations, nothing that touches the outside world.",
+  "Write lessons that will still be useful to a future cycle looking at a different opportunity in the same domain. A retelling of this one event is not a lesson.",
+].join("\n");
+
+const REFLECT_MAX_TURNS = 10;
+
 /**
  * A rejection is a signal too -- without this the agent learns nothing from being told no,
  * and the next cycle is free to re-propose the same idea. Runs the same memory-only reflect
@@ -326,19 +328,9 @@ async function reflectOnRejectionPhase(proposal: ProposalRow): Promise<void> {
       `Otherwise call lesson_add exactly once with a generalized takeaway about what makes a proposal in this domain not worth approving -- something that would stop you re-proposing this same idea next cycle. Don't record the rejection as a play-by-play.`,
       `If no reason was given, infer nothing beyond the obvious and keep the lesson conservative -- a low-confidence, narrowly-worded note is better than a confident guess about why.`,
     ].join("\n"),
-    options: {
-      mcpServers: { memory: memoryServer },
-      allowedTools: [...MEMORY_TOOLS],
-      settingSources: [],
-      canUseTool: async (toolName) => {
-        const allowed = MEMORY_TOOLS.includes(toolName);
-        return allowed
-          ? { behavior: "allow" as const }
-          : { behavior: "deny" as const, message: `${toolName} is not available in the reflect phase` };
-      },
-      hooks: { PreToolUse: toolGateHook(MEMORY_TOOLS, "reflect") },
-      maxTurns: 10,
-    },
+    system: REFLECT_SYSTEM,
+    allowedTools: [...MEMORY_TOOLS],
+    maxTurns: REFLECT_MAX_TURNS,
   });
 }
 
@@ -395,13 +387,33 @@ async function humanReviewPhase(proposal: ProposalRow): Promise<ProposalRow> {
 // ---- phase 3: act -----------------------------------------------------------
 //
 // Side-effecting tool access is hard-limited to exactly what the proposal
-// declared, plus memory tools and the read-only integration tools (same
-// no-side-effect set the research phase gets freely) so the model can read
-// back what it just committed/deployed and self-check it -- neither of
-// those additions lets it touch anything beyond what proposal.required_tools
-// named. canUseTool is a second, independent gate on top of allowedTools --
-// belt and suspenders, since allowedTools alone relies on the model never
-// being told about a broader tool in the first place.
+// declared. On top of that it always gets the same no-side-effect set the
+// research phase gets freely: memory tools, the read-only integration tools
+// (so it can read back what it just committed/deployed and self-check it),
+// and WebSearch/WebFetch.
+//
+// The web tools are auto-granted rather than requiring the proposal to have
+// named them: act is where the model actually writes code, and it routinely
+// needs to check an API's current shape or a package's real export names
+// mid-build. Making that depend on the model having predicted the need at
+// proposal time meant it usually couldn't, and a proposal that forgot to ask
+// had to be rejected and re-proposed. None of these can change anything
+// outside this process, so granting them widens what the act phase can
+// *learn*, never what it can *do* -- the fence that matters, on tools that
+// create/commit/deploy, is still exactly proposal.required_tools.
+//
+// `allowedTools` is now the whole fence rather than one layer of three: this
+// process owns tool dispatch outright, so a tool missing from the list is never
+// described to the model and is refused if it names one anyway. See agent-loop.ts.
+
+const ACT_SYSTEM = [
+  BASE_SYSTEM,
+  "You are in the ACT phase, executing a proposal a human has approved. This is the only phase where your tool calls change anything real -- repos, deployments, live sites.",
+  "You are fenced to exactly the tools the approved proposal named, plus memory and read-only tools. That fence is the whole reason you are trusted to run unattended: do the approved work and nothing beyond it.",
+  "You cannot run, build or test the code you write. Compensate by re-reading it before you commit and by reading back what actually landed afterwards.",
+].join("\n");
+
+const ACT_MAX_TURNS = 60;
 
 /**
  * Set while an act phase is executing, so the operator's abort button has something to
@@ -413,7 +425,14 @@ let actAbortController: AbortController | null = null;
 
 async function actPhase(proposal: ProposalRow): Promise<void> {
   const requiredTools = proposal.required_tools.split(",").map((s) => s.trim()).filter(Boolean);
-  const allowedTools = [...new Set([...MEMORY_TOOLS, ...READONLY_INTEGRATION_TOOLS, ...requiredTools])];
+  const allowedTools = [
+    ...new Set([
+      ...MEMORY_TOOLS,
+      ...READONLY_INTEGRATION_TOOLS,
+      ...READONLY_BUILTIN_TOOLS,
+      ...requiredTools,
+    ]),
+  ];
   const abortController = new AbortController();
   actAbortController = abortController;
 
@@ -422,26 +441,17 @@ async function actPhase(proposal: ProposalRow): Promise<void> {
     proposalId: proposal.id,
     prompt: [
       `Execute approved proposal #${proposal.id}: ${proposal.description}`,
-      `You may only use these tools: ${requiredTools.join(", ")}, plus memory tools for logging/recall and the read-only tools (github_read_repo, github_read_file, github_search_repos, vercel_list_projects, vercel_get_project, netlify_list_sites, netlify_get_site) for checking real state.`,
+      `The only tools that can change anything real are the ones this proposal was approved for: ${requiredTools.join(", ")}. On top of those you always have memory tools for logging/recall, the read-only integration tools (github_read_repo, github_read_file, github_search_repos, vercel_list_projects, vercel_get_project, netlify_list_sites, netlify_get_site) for checking real state, and WebSearch/WebFetch.`,
+      `Use WebSearch/WebFetch while you build, not just before: check a library's current API, a package's real export names, or a config format rather than writing what you half-remember. You have no build step to catch a wrong import.`,
       `This is a real deliverable, not a stub -- fully implement the scope described above. Do not leave placeholder/TODO files, an empty repo, or a README-only scaffold standing in for the actual code.`,
       `You have no build or compile step available -- you cannot run the code you write. Before each commit, deliberately re-read every file you're about to write: confirm every import resolves to a file actually being committed, that the syntax is valid, and that package.json's dependencies/scripts match what the code actually uses.`,
       `After committing (and deploying, if applicable), use the read-only tools above to read back what actually landed -- confirm no file is missing, truncated, or empty, and that the deploy succeeded -- before you call outcome_record.`,
       `When finished, call outcome_record with the real numbers -- do not estimate, report what actually happened.`,
     ].join("\n"),
-    options: {
-      mcpServers,
-      allowedTools,
-      settingSources: [],
-      abortController,
-      canUseTool: async (toolName) => {
-        const allowed = allowedTools.includes(toolName);
-        return allowed
-          ? { behavior: "allow" as const }
-          : { behavior: "deny" as const, message: `${toolName} was not part of the approved proposal` };
-      },
-      hooks: { PreToolUse: toolGateHook(allowedTools, "act") },
-      maxTurns: 60,
-    },
+    system: ACT_SYSTEM,
+    allowedTools,
+    maxTurns: ACT_MAX_TURNS,
+    signal: abortController.signal,
   }).finally(() => {
     // Only clear if this run still owns the slot -- a later act phase may have claimed it.
     if (actAbortController === abortController) actAbortController = null;
@@ -459,22 +469,9 @@ async function reflectPhase(proposal: ProposalRow): Promise<void> {
       `Call lesson_search for this domain first. If an existing lesson was confirmed or contradicted by this outcome, call lesson_reinforce on it instead of duplicating it.`,
       `Otherwise, call lesson_add exactly once with a generalized, reusable takeaway -- not a play-by-play retelling of what happened this one time.`,
     ].join("\n"),
-    options: {
-      mcpServers: { memory: memoryServer },
-      allowedTools: [...MEMORY_TOOLS],
-      settingSources: [],
-      // See the comment on toolGateHook above -- canUseTool alone has a gap for
-      // SDK-internal tool calls (e.g. paging a persisted large tool result), so
-      // the PreToolUse hook below is the layer that actually enforces this.
-      canUseTool: async (toolName) => {
-        const allowed = MEMORY_TOOLS.includes(toolName);
-        return allowed
-          ? { behavior: "allow" as const }
-          : { behavior: "deny" as const, message: `${toolName} is not available in the reflect phase` };
-      },
-      hooks: { PreToolUse: toolGateHook(MEMORY_TOOLS, "reflect") },
-      maxTurns: 10,
-    },
+    system: REFLECT_SYSTEM,
+    allowedTools: [...MEMORY_TOOLS],
+    maxTurns: REFLECT_MAX_TURNS,
   });
 }
 
@@ -577,7 +574,15 @@ function enqueueForReview(proposal: ProposalRow): void {
 // ---- main loop --------------------------------------------------------------
 
 async function mainLoop() {
+  const search = getSearchConfig();
   console.log(`Agent runner started. Domains: ${DOMAINS.join("; ")}. DB: ${DB_PATH}`);
+  console.log(`Models: ${describeClients(llmByPhase).join(", ")}. Web search: ${search.mode}.`);
+  if (search.mode === "none") {
+    console.warn(
+      "[search] No web search is configured -- research will run on WebFetch and the read-only " +
+        "integrations alone. Set TAVILY_API_KEY or BRAVE_API_KEY, or AGENT_SEARCH_PROVIDER=native."
+    );
+  }
   await store.syncToQdrant();
   // Env values are the starting point; from here the operator's console owns them, so
   // every later read goes through getControlState() rather than the module constants.

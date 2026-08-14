@@ -1,10 +1,15 @@
 # agent-runner
 
-A Claude Code agent with persistent memory, run outside any chat UI via the
-Agent SDK, with a web console (React + Ant Design) to watch it work, approve
-or reject what it wants to do, and set priority/scheduling on approved work.
-No sub-agents: the `agents` option is never set anywhere in
-`orchestrator.ts`, so the model has no Agent/Task tool to spawn one.
+An autonomous agent with persistent memory, run outside any chat UI, with a web
+console (React + Ant Design) to watch it work, approve or reject what it wants
+to do, and set priority/scheduling on approved work. No sub-agents: nothing in
+the tool registry can spawn one.
+
+**Bring your own model.** It calls model APIs directly over HTTP — no Claude
+Code, no Agent SDK, no vendor SDK. Set `AGENT_PROVIDER` to `openrouter`,
+`openai`, `anthropic`, `xai` (Grok) or `moonshot` (Kimi), set that provider's
+key, and name a model in `AGENT_MODEL`. Different phases can use different
+models: cheap and wide for research, your best model for writing the code.
 
 ## How it works
 
@@ -44,7 +49,7 @@ there.
 ## Files
 
 - `src/memory-server.ts` — SQLite-backed memory (`data/agent.db`) plus the
-  MCP tools the agent can call: `research_note_add`, `research_note_search`,
+  memory tools the agent can call: `research_note_add`, `research_note_search`,
   `lesson_search`, `lesson_add`, `lesson_reinforce`, `proposal_create`,
   `proposal_status`, `outcome_record`, `action_history_search`. Approving
   proposals, setting priority/schedule, logging actions, and marking a run
@@ -57,26 +62,36 @@ there.
   duplicate work.
 - `src/orchestrator.ts` — the main loop, its four phases, and a priority
   queue + scheduler tick that decides which approved proposal's act+reflect
-  runs next. Every tool call is logged via a `PostToolUse` hook, and every
-  phase's Claude API cost is recorded so spend counts against profit. Tool
-  access in every phase is enforced in three independent layers, not one:
-  `settingSources: []` (ignore this machine's own Claude Code settings, so a
-  developer's local allow-rules can't leak permissions into the agent),
-  `canUseTool` (denies anything outside the phase's declared allowlist), and
-  a `PreToolUse` hook (the layer that actually catches *everything*,
-  including SDK-internal tool calls that bypass `canUseTool` — see "Before
-  running unattended" below for why all three are needed).
+  runs next. Every tool call is logged, and every phase's model API cost is
+  recorded so spend counts against profit — computed from token usage, or
+  taken from the provider when it reports a real per-call charge.
+- `src/agent-loop.ts` — the agentic loop itself: ask the model, run the tools
+  it asked for, feed the results back, repeat. This is also where each phase's
+  tool fence is enforced — a tool outside the phase's grant is never described
+  to the model, and is refused if the model names it anyway.
+- `src/llm/` — the only provider-specific code in the project. One adapter
+  covers every provider that speaks OpenAI's `/chat/completions` (OpenRouter,
+  OpenAI, xAI, Moonshot); a second covers Anthropic's Messages API natively.
+  Also holds the pricing table that turns tokens into the dollar figures on
+  the Economics page.
+- `src/tools/` — the tool registry (name + description + zod schema + handler,
+  converted to JSON Schema for the wire) and `web.ts`, which implements
+  `WebSearch` and `WebFetch`.
+- `src/search/` — pluggable search behind `WebSearch`: Tavily, Brave, or the
+  model provider's own server-side search, chosen with
+  `AGENT_SEARCH_PROVIDER`. Whichever you pick, `WebSearch` stays one tool name
+  in a proposal and one badge in the console.
 - `src/reactive-triggers.ts` — a small fire-and-forget bridge: marking a
   proposal "needs refinement" in the UI wakes a targeted research+plan pass
   for that one proposal, independent of the hourly cycle.
 - `src/integrations/{github,vercel,netlify}.ts` + `src/integrations-server.ts`
-  — thin API wrappers and the MCP tools built on them. Read-only tools
+  — thin API wrappers and the tools built on them. Read-only tools
   (`github_read_repo`, `vercel_list_projects`, etc.) are free for research to
   call, same as `WebSearch`. Write tools (`github_create_repo`,
   `github_commit_files`, `github_merge_pr`, `vercel_deploy`,
   `netlify_deploy`, etc.) only work when an approved proposal's
-  `required_tools` names them — enforced by the same layered fence as above,
-  not just by convention. `github_commit_files` writes any number of files
+  `required_tools` names them — enforced by the fence in `agent-loop.ts`,
+  not by convention. `github_commit_files` writes any number of files
   as a single commit (Git Data API: blob → tree → commit → ref update) and
   is preferred over the older one-file-per-call `github_commit_file`;
   `github_merge_pr` exists so a proposal that opens a PR can also land it
@@ -118,8 +133,20 @@ npm run typecheck
 
 Copy `.env.example` to `.env` and fill in what you have:
 
-- `ANTHROPIC_API_KEY` — needed for `npm start` to actually run the agent
-  (skip if you're logged in via `claude setup-token`).
+- `AGENT_PROVIDER` + `AGENT_MODEL` + that provider's key — needed for
+  `npm start` to run the agent at all. `AGENT_PROVIDER` defaults to
+  `openrouter` (one key reaches Claude, GPT, Grok and Kimi, and it reports
+  real per-call cost, so the Economics page stays accurate without a pricing
+  table). `AGENT_MODEL` is **required and has no default** — model ids change
+  too often for a baked-in one to be anything but a future 404; the startup
+  error names your provider's model list. Optional per-phase overrides:
+  `AGENT_RESEARCH_MODEL`, `AGENT_ACT_MODEL`, `AGENT_REFLECT_MODEL` (and
+  `_PROVIDER` variants).
+- `TAVILY_API_KEY` or `BRAVE_API_KEY` — optional but recommended. `WebSearch`
+  was a Claude Code built-in and is now backed by whichever of these you set
+  (both have free tiers). With neither, `AGENT_SEARCH_PROVIDER` falls back to
+  `native` — the model provider's own server-side search, which varies in
+  quality by provider. `WebFetch` needs no key.
 - `AGENT_DOMAINS` — comma-separated lanes research considers each cycle
   (default covers small-business/consumer web tools, a general-audience
   Chrome extension, and a free web calculator/tool — not developer-only).
@@ -206,30 +233,40 @@ signal in any one of them.
 
 ## Before running unattended
 
-- **Tool access is enforced in three layers, and all three matter.**
-  Earlier versions of this app relied on `canUseTool` alone in the
-  research/reflect phases, plus this machine's default filesystem settings —
-  that turned out to be insufficient in practice: a developer's own
-  accumulated Claude Code allow-rules (`~/.claude/settings.json`,
-  `.claude/settings.local.json`) can grant a tool before `canUseTool` is
-  ever consulted, and some SDK-internal tool calls (e.g. paging back a tool
-  result too large to inline) bypass `canUseTool` entirely regardless of
-  settings. `settingSources: []` + `canUseTool` + a `PreToolUse` hook
-  together are what actually hold research and reflect to their declared
-  tool lists — confirmed live by observing `Bash`/`Read`/`Grep`/`Agent`
-  attempts get denied. `actPhase`'s fence uses the same three layers, scoped
-  to exactly `proposal.required_tools`.
+- **Tool access is enforced by this process, not by a permission setting.**
+  Earlier versions of this app ran on the Claude Agent SDK and needed three
+  overlapping mechanisms to hold a phase to its tool list — `settingSources: []`
+  (so a developer's own accumulated Claude Code allow-rules in
+  `~/.claude/settings.json` couldn't leak permissions into the agent),
+  `canUseTool`, and a `PreToolUse` hook — because each had a gap the next one
+  patched, and `Bash`/`Read` calls were observed slipping through the first two.
+  Off the SDK, that whole class of problem is gone: `agent-loop.ts` dispatches
+  every tool call itself, so a tool outside the phase's grant is never described
+  to the model and there is no other path from this process to a tool handler.
+  `actPhase`'s grant is exactly `proposal.required_tools` plus memory and
+  read-only tools (the read-only GitHub/Vercel/Netlify calls, `WebSearch` and
+  `WebFetch`) — those are always granted because none of them can change
+  anything outside the process, so they widen what the act phase can *learn*,
+  never what it can *do*.
+- **You can still narrow the fence after approving.** Up until an approved
+  proposal's act phase actually starts, "Edit fence" in the proposal dialog
+  reworks its `required_tools` — so a queued or scheduled proposal you notice
+  is slightly wrong doesn't have to be cancelled and re-proposed. The window
+  closes the moment it acts.
 - **That fence is a hard boundary, not the whole safety story.** It stops
   the agent from touching tools outside what you approved; it doesn't stop
-  it from using an approved tool badly. `required_tools` on a proposal is
-  free text (nothing server-side restricts it to known tool names), so
-  actually check what's listed before approving — don't approve a proposal
-  requesting a tool you don't recognize. Keep `expectedCost` realistic and
-  don't approve proposals whose downside you wouldn't accept.
-- **The web console has no authentication.** `src/server.ts` binds on all
-  interfaces with nothing gating `/api/proposals/:id/decision` — anyone who
-  can reach the port can approve spending. Fine on localhost; if you expose
-  it beyond that (a tunnel, a VPS), put auth in front of it first.
+  it from using an approved tool badly. The `required_tools` the *model*
+  writes on a proposal is free text — a name that isn't a real tool simply
+  never fires — so actually read what's listed before approving, and don't
+  approve a proposal requesting a tool you don't recognize. (Tool names you
+  add yourself at approval time *are* validated against the catalog.) Keep
+  `expectedCost` realistic and don't approve proposals whose downside you
+  wouldn't accept.
+- **Set `AGENT_API_TOKEN` before exposing the console.** With it unset the
+  API is open and nothing gates `/api/proposals/:id/decision` — anyone who
+  can reach the port can approve spending. That's why `AGENT_BIND_HOST`
+  defaults to loopback and startup warns. Set the token before changing the
+  bind host; it's one shared secret for the whole console, not per-user auth.
 - **No proposal, no action, ever.** Still true, still the point.
 
 ## Roadmap

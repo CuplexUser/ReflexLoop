@@ -1,12 +1,33 @@
 import "dotenv/config";
-import { MemoryStore, buildMemoryServer } from "./memory-server.js";
+import { MemoryStore, buildMemoryTools } from "./memory-server.js";
+import { buildIntegrationsTools } from "./integrations-server.js";
+import { buildWebTools } from "./tools/web.js";
+import { ToolRegistry } from "./tools/registry.js";
+import { ALL_GRANTABLE_TOOLS } from "./tool-catalog.js";
 import { unlinkSync, existsSync } from "node:fs";
 
 const dbPath = "./data/smoke-test.db";
 if (existsSync(dbPath)) unlinkSync(dbPath);
 
 const store = new MemoryStore(dbPath);
-buildMemoryServer(store); // just confirm this doesn't throw
+
+// Builds the same registry orchestrator.ts does, then converts every schema to the
+// JSON Schema the wire needs. This is the cheap way to catch a zod shape that can't be
+// serialized -- otherwise the failure would surface as a provider 400 on the first
+// real cycle, which needs an API key and an hour of waiting to reach.
+const registry = new ToolRegistry([...buildMemoryTools(store), ...buildIntegrationsTools(), ...buildWebTools()]);
+const schemas = registry.schemas(registry.names());
+console.log(`registry: ${schemas.length} tools, all schemas serialized`);
+
+// The catalog is what server.ts validates an operator's required_tools edits against and
+// what the console badges. A name in the catalog with no tool behind it would look
+// grantable and then silently never fire. WebSearch is the deliberate exception: in
+// native/none search mode there is no local tool, and agent-loop.ts reads the grant.
+const missing = ALL_GRANTABLE_TOOLS.filter((name) => !registry.has(name) && name !== "WebSearch");
+if (missing.length > 0) {
+  throw new Error(`tool-catalog lists tools the registry doesn't provide: ${missing.join(", ")}`);
+}
+console.log("tool catalog matches the registry");
 
 const noteId = await store.addResearchNote(
   "pod-margins",
