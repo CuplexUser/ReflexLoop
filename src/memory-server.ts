@@ -16,7 +16,7 @@ import { DatabaseSync } from "node:sqlite";
 import { tool, createSdkMcpServer, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { emitAgentEvent } from "./events.js";
-import { qdrantAvailable, searchByText, upsertText } from "./qdrant.js";
+import { deletePoint, qdrantAvailable, searchByText, upsertText } from "./qdrant.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS research_notes (
@@ -115,6 +115,21 @@ export class MemoryStore {
     // the model's self-reported outcome.success, and never settable by the model itself.
     this.ensureColumn("proposals", "review_status", "TEXT");
 
+    // Human curation of the agent's own memory. A lesson the model got wrong would
+    // otherwise be lesson_search-ed into every future cycle forever, with no way to
+    // take it back -- muting excludes it from search without destroying the record of
+    // what was believed and when. Never settable by the model: there is no MCP tool
+    // for any of this, same reasoning as proposal approval.
+    this.ensureColumn("lessons", "muted", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("lessons", "edited_at", "TEXT");
+
+    // Set only when a human narrowed or widened a proposal's scope at approval time.
+    // required_tools stays the single thing actPhase is fenced to; these columns preserve
+    // what the model originally asked for, so an edited fence is auditable after the fact
+    // rather than looking like what the model proposed all along.
+    this.ensureColumn("proposals", "original_required_tools", "TEXT");
+    this.ensureColumn("proposals", "original_description", "TEXT");
+
     // Priority + scheduling, all human-set at approval time (see decideProposal /
     // scheduleApprovedProposal) -- the model never controls when or how urgently a
     // real action runs. next_run_at is orchestrator-maintained: the scheduler polls
@@ -178,6 +193,72 @@ export class MemoryStore {
 
   listAllResearchNotes(limit = 200) {
     return this.db.prepare(`SELECT * FROM research_notes ORDER BY fetched_at DESC LIMIT ?`).all(limit) as unknown as ResearchNoteRow[];
+  }
+
+  async deleteResearchNote(id: number) {
+    this.db.prepare(`DELETE FROM research_notes WHERE id = ?`).run(id);
+    await deletePoint("research_notes", id);
+  }
+
+  /**
+   * Folds duplicate notes into `keepId`: any source URL the duplicates had that the keeper
+   * lacked is appended to the keeper's finding (so merging never silently drops a citation),
+   * then the duplicates are deleted.
+   */
+  async mergeResearchNotes(keepId: number, mergeIds: number[]) {
+    const keeper = this.db.prepare(`SELECT * FROM research_notes WHERE id = ?`).get(keepId) as
+      | ResearchNoteRow
+      | undefined;
+    if (!keeper) return false;
+
+    const ids = mergeIds.filter((id) => id !== keepId);
+    if (ids.length === 0) return true;
+
+    const placeholders = ids.map(() => "?").join(",");
+    const others = this.db
+      .prepare(`SELECT * FROM research_notes WHERE id IN (${placeholders})`)
+      .all(...ids) as unknown as ResearchNoteRow[];
+
+    const extraSources = [
+      ...new Set(others.map((o) => o.source).filter((s): s is string => Boolean(s) && s !== keeper.source)),
+    ];
+    const finding = extraSources.length > 0 ? `${keeper.finding}\n\nAlso sourced from: ${extraSources.join(", ")}` : keeper.finding;
+    // Keep the highest confidence any of the merged notes claimed rather than the keeper's alone.
+    const confidence = [keeper, ...others].reduce<number | null>(
+      (max, n) => (n.confidence != null && (max == null || n.confidence > max) ? n.confidence : max),
+      null
+    );
+
+    this.db
+      .prepare(`UPDATE research_notes SET finding = ?, confidence = ? WHERE id = ?`)
+      .run(finding, confidence, keepId);
+    this.db.prepare(`DELETE FROM research_notes WHERE id IN (${placeholders})`).run(...ids);
+
+    await upsertText("research_notes", keepId, `${keeper.topic}: ${finding}`);
+    await Promise.all(others.map((o) => deletePoint("research_notes", o.id)));
+    return true;
+  }
+
+  /**
+   * Near-duplicate note pairs, by word-overlap (Jaccard) on topic+finding. Deliberately not a
+   * Qdrant query: that would be one round trip per note to compare all pairs, where this is a
+   * local scan over a few hundred rows and returns the same shape of answer deterministically
+   * whether or not Qdrant is configured.
+   */
+  findDuplicateResearchNotes(threshold = 0.6, limit = 50) {
+    const notes = this.listAllResearchNotes(500);
+    const tokenized = notes.map((n) => ({ note: n, tokens: tokenSet(`${n.topic} ${n.finding}`) }));
+
+    const pairs: { a: ResearchNoteRow; b: ResearchNoteRow; similarity: number }[] = [];
+    for (let i = 0; i < tokenized.length; i++) {
+      for (let j = i + 1; j < tokenized.length; j++) {
+        const similarity = jaccard(tokenized[i].tokens, tokenized[j].tokens);
+        if (similarity >= threshold) {
+          pairs.push({ a: tokenized[i].note, b: tokenized[j].note, similarity });
+        }
+      }
+    }
+    return pairs.sort((x, y) => y.similarity - x.similarity).slice(0, limit);
   }
 
   /**
@@ -260,6 +341,37 @@ export class MemoryStore {
     this.db
       .prepare(`UPDATE proposals SET status = ?, human_notes = ?, decided_at = ? WHERE id = ?`)
       .run(status, humanNotes ?? null, now(), id);
+  }
+
+  /**
+   * Applies a human's edits to a proposal's scope at approval time, preserving what the model
+   * originally proposed. Only ever called from the decision endpoint, before the proposal is
+   * approved -- an approved proposal's fence is never edited afterwards.
+   */
+  applyProposalEdits(id: number, edits: { description?: string; requiredTools?: string[] }) {
+    const existing = this.getProposal(id);
+    if (!existing) return false;
+
+    if (edits.description !== undefined && edits.description !== existing.description) {
+      this.db
+        .prepare(
+          `UPDATE proposals SET description = ?,
+             original_description = COALESCE(original_description, ?) WHERE id = ?`
+        )
+        .run(edits.description, existing.description, id);
+    }
+    if (edits.requiredTools !== undefined) {
+      const next = edits.requiredTools.join(",");
+      if (next !== existing.required_tools) {
+        this.db
+          .prepare(
+            `UPDATE proposals SET required_tools = ?,
+               original_required_tools = COALESCE(original_required_tools, ?) WHERE id = ?`
+          )
+          .run(next, existing.required_tools, id);
+      }
+    }
+    return true;
   }
 
   /** Human-only verdict on whether an approved proposal's deliverable is MVP-done or needs more work. */
@@ -410,12 +522,37 @@ export class MemoryStore {
    * configured or the search failed.
    */
   async searchLessons(domain: string, limit = 10) {
-    const semantic = await this.semanticSearch<LessonRow>("lessons", domain, limit);
-    if (semantic) return semantic;
+    // Muted lessons are filtered out of both paths -- this is the single chokepoint every
+    // lesson_search call goes through, so muting one here takes it out of the agent's
+    // reasoning everywhere at once.
+    // Over-fetch so muting a few of the top hits doesn't quietly shrink the result set.
+    const semantic = await this.semanticSearch<LessonRow>("lessons", domain, limit * 2);
+    if (semantic) return semantic.filter((l) => !l.muted).slice(0, limit);
 
     return this.db
-      .prepare(`SELECT * FROM lessons WHERE domain = ? ORDER BY confidence DESC, updated_at DESC LIMIT ?`)
+      .prepare(
+        `SELECT * FROM lessons WHERE domain = ? AND muted = 0 ORDER BY confidence DESC, updated_at DESC LIMIT ?`
+      )
       .all(domain, limit) as unknown as LessonRow[];
+  }
+
+  /**
+   * Free-text lesson search for the console's operator, as distinct from searchLessons above:
+   * that one's LIKE fallback matches `domain` exactly, which is right for the agent (it looks
+   * lessons up by the domain it's working in) but useless for a human typing a phrase from the
+   * lesson body. Same semantic path, same muted filter -- only the fallback differs.
+   */
+  async searchLessonsByText(query: string, limit = 10) {
+    const semantic = await this.semanticSearch<LessonRow>("lessons", query, limit * 2);
+    if (semantic) return semantic.filter((l) => !l.muted).slice(0, limit);
+
+    const like = `%${query}%`;
+    return this.db
+      .prepare(
+        `SELECT * FROM lessons WHERE muted = 0 AND (domain LIKE ? OR lesson LIKE ?)
+         ORDER BY confidence DESC, updated_at DESC LIMIT ?`
+      )
+      .all(like, like, limit) as unknown as LessonRow[];
   }
 
   async addLesson(domain: string, lessonText: string, derivedFromOutcomeId?: number) {
@@ -427,6 +564,39 @@ export class MemoryStore {
     const id = Number(result.lastInsertRowid);
     await upsertText("lessons", id, `${domain}: ${lessonText}`);
     return id;
+  }
+
+  // ---- lesson curation (human-only -- no MCP tool exposes any of this) ----
+
+  getLesson(id: number) {
+    return this.db.prepare(`SELECT * FROM lessons WHERE id = ?`).get(id) as LessonRow | undefined;
+  }
+
+  /** Rewrite a lesson the model got wrong or phrased badly, keeping its id and track record. */
+  async editLesson(id: number, fields: { domain?: string; lesson?: string }) {
+    const existing = this.getLesson(id);
+    if (!existing) return false;
+    const domain = fields.domain ?? existing.domain;
+    const lessonText = fields.lesson ?? existing.lesson;
+    this.db
+      .prepare(`UPDATE lessons SET domain = ?, lesson = ?, updated_at = ?, edited_at = ? WHERE id = ?`)
+      .run(domain, lessonText, now(), now(), id);
+    // Keep the vector in step with the text, or semantic search would keep matching the old wording.
+    await upsertText("lessons", id, `${domain}: ${lessonText}`);
+    return true;
+  }
+
+  /**
+   * Excludes a lesson from lesson_search without deleting it -- the row stays as a record of
+   * what was believed and when, but it stops steering future cycles.
+   */
+  setLessonMuted(id: number, muted: boolean) {
+    this.db.prepare(`UPDATE lessons SET muted = ?, updated_at = ? WHERE id = ?`).run(muted ? 1 : 0, now(), id);
+  }
+
+  async deleteLesson(id: number) {
+    this.db.prepare(`DELETE FROM lessons WHERE id = ?`).run(id);
+    await deletePoint("lessons", id);
   }
 
   reinforceLesson(id: number, direction: "confirmed" | "contradicted") {
@@ -471,6 +641,122 @@ export class MemoryStore {
     return row.total;
   }
 
+  // ---- economics ----------------------------------------------------------
+  //
+  // The loop's whole premise is that spend counts against profit, so these join
+  // Claude API spend (runs) to self-reported outcomes rather than reporting either
+  // in isolation. `net` is the only number that answers "is this thing paying for
+  // itself": revenue minus the agent's own reported cost minus what it cost in API
+  // spend to produce.
+
+  spendByPhase() {
+    return this.db
+      .prepare(
+        `SELECT phase, COUNT(*) AS runs, COALESCE(SUM(cost_usd), 0) AS cost_usd,
+                COALESCE(SUM(duration_ms), 0) AS duration_ms
+         FROM runs GROUP BY phase ORDER BY cost_usd DESC`
+      )
+      .all() as unknown as { phase: string; runs: number; cost_usd: number; duration_ms: number }[];
+  }
+
+  /** Daily Claude API spend, oldest first -- the series behind the spend-over-time chart. */
+  spendOverTime(days = 30) {
+    return this.db
+      .prepare(
+        `SELECT substr(started_at, 1, 10) AS day, COALESCE(SUM(cost_usd), 0) AS cost_usd, COUNT(*) AS runs
+         FROM runs GROUP BY day ORDER BY day DESC LIMIT ?`
+      )
+      .all(days)
+      .reverse() as unknown as { day: string; cost_usd: number; runs: number }[];
+  }
+
+  /**
+   * Per-domain scoreboard: how often work in a domain succeeded, what it really cost, and how
+   * far the model's own upside estimate landed from reported revenue (forecast accuracy --
+   * both numbers were already stored, just never compared).
+   */
+  domainScoreboard() {
+    return this.db
+      .prepare(
+        `SELECT p.domain,
+                COUNT(DISTINCT p.id) AS proposals,
+                COUNT(DISTINCT CASE WHEN p.status = 'approved' THEN p.id END) AS approved,
+                COUNT(DISTINCT o.id) AS outcomes,
+                COALESCE(SUM(CASE WHEN o.success = 1 THEN 1 ELSE 0 END), 0) AS successes,
+                COALESCE(SUM(o.actual_revenue), 0) AS revenue,
+                COALESCE(SUM(o.actual_cost), 0) AS reported_cost,
+                COALESCE(SUM(CASE WHEN o.id IS NOT NULL THEN p.expected_upside ELSE 0 END), 0) AS forecast_upside,
+                (SELECT COALESCE(SUM(r.cost_usd), 0) FROM runs r
+                  JOIN proposals rp ON rp.id = r.proposal_id WHERE rp.domain = p.domain) AS api_spend
+         FROM proposals p
+         LEFT JOIN outcomes o ON o.proposal_id = p.id
+         GROUP BY p.domain
+         ORDER BY revenue DESC`
+      )
+      .all() as unknown as DomainScoreRow[];
+  }
+
+  // ---- unified search (backs the console's global search) ------------------
+
+  /**
+   * One query across everything the console can navigate to. Lessons and research notes go
+   * through the same Qdrant-or-LIKE path the agent's own tools use, so the operator searches
+   * the memory the way the agent reads it -- semantically when Qdrant is configured, by
+   * substring when it isn't. Proposals and actions have no vectors, so they stay LIKE-matched.
+   */
+  async searchEverything(query: string, perTypeLimit = 5): Promise<SearchHit[]> {
+    const like = `%${query}%`;
+    const hits: SearchHit[] = [];
+
+    const proposals = this.db
+      .prepare(
+        `SELECT id, domain, description, status FROM proposals
+         WHERE domain LIKE ? OR description LIKE ? ORDER BY created_at DESC LIMIT ?`
+      )
+      .all(like, like, perTypeLimit) as unknown as {
+      id: number;
+      domain: string;
+      description: string;
+      status: string;
+    }[];
+    for (const p of proposals) {
+      hits.push({ type: "proposal", id: p.id, title: `#${p.id} · ${p.domain}`, snippet: p.description, badge: p.status });
+    }
+
+    for (const lesson of await this.searchLessonsByText(query, perTypeLimit)) {
+      hits.push({ type: "lesson", id: lesson.id, title: lesson.domain, snippet: lesson.lesson });
+    }
+
+    for (const note of await this.searchResearchNotes(query, perTypeLimit)) {
+      hits.push({ type: "research_note", id: note.id, title: note.topic, snippet: note.finding });
+    }
+
+    const actions = this.db
+      .prepare(
+        `SELECT a.id, a.proposal_id, a.tool_name, a.tool_input FROM actions a
+         JOIN proposals p ON p.id = a.proposal_id
+         WHERE p.status = 'approved' AND (a.tool_name LIKE ? OR a.tool_input LIKE ?)
+         ORDER BY a.occurred_at DESC LIMIT ?`
+      )
+      .all(like, like, perTypeLimit) as unknown as {
+      id: number;
+      proposal_id: number;
+      tool_name: string;
+      tool_input: string | null;
+    }[];
+    for (const a of actions) {
+      hits.push({
+        type: "action",
+        id: a.id,
+        proposalId: a.proposal_id,
+        title: a.tool_name.replace(/^mcp__(memory|integrations)__/, ""),
+        snippet: (a.tool_input ?? "").slice(0, 200),
+      });
+    }
+
+    return hits;
+  }
+
   // ---- events (persisted activity feed, so a page reload doesn't lose it) --
 
   logEvent(type: string, payload: unknown): { id: number; occurredAt: string } {
@@ -500,6 +786,29 @@ interface ResearchNoteRow {
   fetched_at: string;
 }
 
+export interface SearchHit {
+  type: "proposal" | "lesson" | "research_note" | "action";
+  id: number;
+  title: string;
+  snippet: string;
+  badge?: string;
+  /** Set on action hits -- the Actions page navigates by proposal, not by action id. */
+  proposalId?: number;
+}
+
+export interface DomainScoreRow {
+  domain: string;
+  proposals: number;
+  approved: number;
+  outcomes: number;
+  successes: number;
+  revenue: number;
+  reported_cost: number;
+  /** Sum of expected_upside across proposals that actually produced an outcome -- compare to `revenue`. */
+  forecast_upside: number;
+  api_spend: number;
+}
+
 /** One phase run of the loop, with the Claude API cost it incurred -- spend counts against profit. */
 interface RunRow {
   id: number;
@@ -520,6 +829,10 @@ interface LessonRow {
   times_contradicted: number;
   created_at: string;
   updated_at: string;
+  /** 1 = excluded from lesson_search. Human-set only; the model can't mute or unmute itself. */
+  muted: number;
+  /** Set when a human rewrote the text, so an edited lesson is distinguishable from a model-written one. */
+  edited_at: string | null;
 }
 
 export type Priority = "low" | "normal" | "high" | "urgent";
@@ -541,6 +854,9 @@ export interface ProposalRow {
   scheduled_at: string | null;
   recurrence_ms: number | null;
   next_run_at: string | null;
+  /** Set only when a human edited the scope at approval time -- what the model originally asked for. */
+  original_required_tools: string | null;
+  original_description: string | null;
 }
 
 function safeJson(v: unknown) {
@@ -549,6 +865,23 @@ function safeJson(v: unknown) {
   } catch {
     return String(v);
   }
+}
+
+/** Lowercased word set, minus very short filler tokens -- the unit of comparison for near-duplicate notes. */
+function tokenSet(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((w) => w.length > 2)
+  );
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let shared = 0;
+  for (const token of a) if (b.has(token)) shared++;
+  return shared / (a.size + b.size - shared);
 }
 
 function safeParseJson(raw: string | null): unknown {

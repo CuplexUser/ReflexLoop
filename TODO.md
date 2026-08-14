@@ -1,19 +1,24 @@
 # TODO
 
-## Tier 0 -- bugs & correctness (in progress)
+## Tier 0 -- bugs & correctness
 
 - [x] Fix table column resize collapsing neighbouring columns
 - [x] Re-register pending review decisions on restart -- not a bug, already handled
 - [x] Surface run cost in the UI (was dead code)
 
+## Console overhaul
+
+- [x] Tier 1 -- table & navigation usability
+- [x] Tier 2 -- approval workflow
+- [x] Tier 3 -- economics & observability
+- [x] Tier 4 -- agent control & memory curation
+- [x] Tier 5 -- hardening & polish
+
 ## Backlog
 
-- [ ] Tier 1 -- table & navigation usability
-- [ ] Tier 2 -- approval workflow
-- [ ] Tier 3 -- economics & observability
-- [ ] Tier 4 -- agent control & memory curation
-- [ ] Tier 5 -- hardening & polish
 - [ ] Move large blobs/JSON out of SQLite (deferred -- see note below, not worth doing yet)
+- [ ] Code-split the frontend bundle (1.3MB / 415KB gzipped, one chunk -- Vite warns on every
+      build). Not urgent for a localhost console, but it's the only build warning left.
 - [x] Switch to npm workspaces
 - [x] Switch to Qdrant Cloud
 
@@ -58,62 +63,98 @@ Done: added `MemoryStore.listRunsForProposal()`, `GET /api/proposals/:id/runs`, 
 proposal (with its phase count) right next to the model's own cost estimate -- so the
 estimate can be read against what the proposal actually cost to produce.
 
-Still open: the list endpoint `/api/runs` / `api.runs()` remains unused. It's the
-right backing query for the Tier 3 Runs/Spend page (cost per phase / proposal /
-domain over time), so it stays until that lands.
+`/api/runs` (the whole-history list) now backs the Economics page's phase breakdown.
 
 ## Tier 1 -- table & navigation usability
 
-- Deep-linkable rows (`/proposals/:id` etc.) -- dialogs currently don't touch the URL,
-  so nothing is bookmarkable and the back button doesn't close them.
-- Column show/hide, density toggle, sticky header, page-size changer (hardcoded 10/20).
-- Global search (`Cmd-K`) across proposals, actions, lessons, notes -- today each page
-  has its own isolated client-side substring filter.
-- Server-side semantic search: Qdrant is fully wired in the backend but the UI only
-  does client-side `.includes()`. Expose `/api/search` over the existing vector search.
-- Keyboard nav: `j`/`k` move, `Enter` opens, `Esc` closes, `a`/`r` decide.
-- CSV/JSON export per table.
+- Deep-linkable rows: `/proposals/:id`, `/actions/:id`, `/lessons/:id`, `/research/:id`.
+  Dialogs are driven by the URL, so rows are bookmarkable and Back closes them. The nav
+  highlight keys off the first path segment so `/proposals/12` still selects Proposals.
+- `useTableView` (`web/src/hooks/`) wraps `useResizableColumns` and adds column show/hide,
+  density, and page size, all persisted per table. Column keys are assigned from the
+  *unfiltered* list so hiding one can't shift another's identity and steal its stored width.
+  `TableToolbar` is the shared chrome; `sticky` headers come from the same hook.
+- Global search: `Cmd-K` opens `CommandPalette`, which queries `GET /api/search` --
+  server-side, so it reaches the whole history rather than the loaded page.
+- Semantic search reaches the UI through that endpoint. Note `searchLessonsByText` exists
+  separately from `searchLessons`: the agent looks lessons up *by domain* (its LIKE fallback
+  matches domain equality), which is useless for a human typing a phrase from a lesson body.
+  Same semantic path and same muted filter, different fallback.
+- Keyboard nav via `useTableKeyboardNav`: `j`/`k` or arrows move, `Enter` opens, `Esc`
+  clears. Scoped to the rows passed in, so the highlight can't land on a filtered-out row.
+- CSV/JSON export per table (`web/src/export.ts`), exporting the rows currently on screen.
 
 ## Tier 2 -- approval workflow
 
-- **Approve with edits**: let the operator trim `required_tools` or tighten the
-  description before approving. Today it's take-it-or-leave-it plus a notes field --
-  and `required_tools` *is* the security fence, so editing it down is the single
-  highest-value control the console could offer.
-- Risk surfacing in the review card: badge which requested tools are side-effecting
-  (`github_create_repo`, `vercel_deploy`, ...) vs read-only, so the fence is visible
-  at decision time.
-- Bulk approve/reject, plus a "pending for 4h" age indicator.
-- Feed rejection reasons back into `reflectPhase` -- a rejected proposal currently
-  teaches the agent nothing, so it can re-propose the same thing next cycle.
+- **Approve with edits**: `DecisionControls` (shared by the dashboard card and the proposal
+  dialog) lets the operator rewrite the description and narrow or widen `required_tools`
+  before approving. Edits ride along with the decision and are applied by
+  `applyProposalEdits` *before* the status flips, so there's never a window where a proposal
+  is approved while still carrying its pre-edit fence. The original is preserved in
+  `original_required_tools` / `original_description` and shown in the dialog afterwards.
+  The server validates edited tools against `ALL_GRANTABLE_TOOLS` -- an operator can reshape
+  the fence, but only to tools that actually exist, never an arbitrary string.
+- Risk surfacing: `src/tool-catalog.ts` is now the one place that knows which tools exist
+  and which touch the world; `GET /api/tools` serves it, and `ToolFence` badges each
+  requested tool write/read/memory at decision time.
+- Bulk approve/reject on the Proposals page (`POST /api/proposals/bulk-decision`), plus a
+  pending-age indicator on the review card and in the status column. Scope edits are
+  deliberately not accepted in bulk -- they're per-proposal by nature.
+- Rejections now teach: `reflectOnRejectionPhase` runs a memory-only reflect pass with the
+  human's stated reason, so the next cycle has a lesson about why that kind of proposal
+  isn't worth approving instead of being free to re-propose it.
 
 ## Tier 3 -- economics & observability
 
-- Runs/Spend page off `/api/runs`: cost per phase, per proposal, per domain, over time.
-- Real P&L on the dashboard. The tiles show Claude spend and self-reported revenue
-  side by side but never net them; spend counts against profit by design, so show
-  `revenue - reported cost - API spend` as one number.
-- Per-domain scoreboard: success rate, avg cost-to-outcome, and forecast accuracy
-  (`expected_upside` vs `actual_revenue` -- both stored, never compared).
+- Economics page: daily spend, spend by phase, and a per-domain scoreboard, off a new
+  `GET /api/economics` (`spendByPhase` / `spendOverTime` / `domainScoreboard`).
+- Real P&L: the dashboard's headline tile is now `revenue - reported cost - API spend`
+  as one number, rather than showing the parts and leaving the subtraction to the reader.
+- Forecast accuracy compares `expected_upside` against `actual_revenue` per domain --
+  both were already stored and never compared.
+- Aborted and failed phases are still logged to `runs` (the logging moved into a `finally`),
+  because spend already incurred is real whether or not the phase finished.
 
 ## Tier 4 -- agent control & memory curation
 
-- Runtime control: pause/resume the loop, "run a cycle now", abort an in-flight act
-  phase, edit domains and cycle interval without an env change + restart.
-- Steering: a free-text directive the operator can inject into the next research phase.
-- **Lesson curation**: the human can't edit, delete, or mute a lesson today. A wrong
-  lesson gets `lesson_search`-ed into every future cycle forever. For a system whose
-  premise is learning from outcomes, this is the biggest missing capability outside
-  the approval fence itself.
-- Dedupe/merge view for near-identical research notes.
+- `src/agent-control.ts` holds runtime state the Agent control page drives: pause/resume,
+  "run a cycle now" (`sleepUntilNextCycle` resolves early), abort an in-flight act phase
+  (via the SDK's `abortController`), and edit domains/interval without a restart. The loop
+  re-reads control state each pass rather than closing over the env constants.
+- Directives: free text injected into the next research prompt and then cleared, so a steer
+  nudges one cycle instead of quietly reshaping every future one.
+- Nothing in the control surface can widen what the agent may do -- it only reduces activity
+  or redirects research, and research output is still a proposal needing approval.
+- **Lesson curation**: edit, mute, and delete, all human-only (no MCP tool exposes any of
+  it). Muting is the important one -- `searchLessons` is the single chokepoint every
+  `lesson_search` goes through, so muting there removes a wrong lesson from the agent's
+  reasoning everywhere at once while keeping the record of what was believed and when.
+  Editing re-upserts the Qdrant vector so semantic search stops matching the old wording.
+- Research-note dedupe: `findDuplicateResearchNotes` scores pairs by word-overlap (Jaccard)
+  locally rather than one Qdrant round trip per note, so it answers the same way whether or
+  not Qdrant is configured. Merging keeps the chosen note, appends any source the other had,
+  and takes the higher confidence.
 
 ## Tier 5 -- hardening & polish
 
-- Auth. `server.ts` binds all interfaces with nothing gating
-  `POST /api/proposals/:id/decision` -- anyone on the LAN can approve a side-effecting
-  proposal. Shared-token gate, and default the bind to `127.0.0.1`.
-- Error boundary, WS reconnect backoff with a visible reconnecting state, light-theme
-  toggle, mobile-usable table fallback.
+- Auth: `AGENT_API_TOKEN` gates `/api` and the WebSocket upgrade, compared with
+  `timingSafeEqual`. The browser WebSocket API can't set headers, so the socket passes the
+  same secret as a query param and the server checks it at the upgrade rather than letting
+  an unauthenticated socket see the event stream. `AGENT_BIND_HOST` now defaults to
+  `127.0.0.1`; with no token set the server logs a warning at startup. `TokenGate` prompts
+  once and stores the token. One shared secret for the console, not per-user auth.
+- Theme toggle: the palette moved to `--rl-*` CSS custom properties, so `palette.approved`
+  is now `var(--rl-approved)` and every component follows the theme with no code change.
+  Ant Design still needs real hex (it derives hover/active shades with color math), so
+  `HEX_PALETTES` in `theme.ts` and the variables in `index.css` are two representations of
+  one palette and have to stay in step.
+- `ErrorBoundary` around the routes, so a render error in one page doesn't blank the console
+  and take the pending-review queue with it.
+- WS reconnect backoff with a visible state already existed in `useAgentSocket` -- 1s
+  growing 1.5x to a 15s cap, with `StatusBar` showing connecting/open/closed. Nothing to do.
+- Mobile: the sider already collapses under `lg`, and the Tier 0 `scroll.x` fix means tables
+  scroll horizontally instead of crushing columns. That's the practical fallback; a genuine
+  card-per-row mobile layout is still not there and is the one Tier 5 item left undone.
 
 ## Move large blobs/JSON out of SQLite
 

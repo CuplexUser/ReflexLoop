@@ -15,6 +15,12 @@ exactly the tools the human-approved proposal named. Don't add anything that aut
 lets `actPhase` reach beyond `proposal.required_tools` — that removes the one safeguard the rest of the
 design assumes is there.
 
+A human *may* edit `required_tools` at approval time (see approve-with-edits below) — that's the operator
+reshaping the fence deliberately, not the agent escaping it. The edit is validated against the tool
+catalog, applied before the status flips, and the original is kept on the row. Every other lever the
+console offers (pause, abort, directives, domains) can only reduce activity or redirect research; none of
+them grants the agent anything.
+
 ## Commands
 
 ```bash
@@ -45,7 +51,7 @@ rebuilding `web/dist` on every change.
 
 `.env` (copy from `.env.example`): `ANTHROPIC_API_KEY` (skip if logged in via `claude setup-token`),
 `AGENT_DOMAINS`, `AGENT_DB_PATH`, `AGENT_CYCLE_INTERVAL_MS`, `AGENT_MAX_PENDING_PROPOSALS`,
-`AGENT_SERVER_PORT`, and optional integration keys `GITHUB_TOKEN` / `VERCEL_TOKEN` /
+`AGENT_SERVER_PORT`, `AGENT_API_TOKEN`, `AGENT_BIND_HOST`, and optional integration keys `GITHUB_TOKEN` / `VERCEL_TOKEN` /
 `NETLIFY_AUTH_TOKEN` / `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
 `QDRANT_EMBEDDING_DIM` (all four required together for semantic search) — each integration or feature
 is simply unavailable, not a startup error, when its keys are missing.
@@ -64,7 +70,12 @@ Each cycle: **research + plan → human review → act → outcome + reflect**.
 - **human review** (`humanReviewPhase`) — emits a `proposal_pending` event and blocks on
   `waitForDecision()` (`review-gateway.ts`), resolved when a person clicks Approve/Reject in the web UI
   (`POST /api/proposals/:id/decision`). Multiple proposals can be under review concurrently, each on its
-  own promise.
+  own promise. The decision can carry **scope edits** (`editedDescription`, `editedRequiredTools`);
+  those are applied via `store.applyProposalEdits` *before* `decideProposal` flips the status, so a
+  proposal is never approved while still carrying its pre-edit fence. `original_required_tools` /
+  `original_description` preserve what the model asked for. A **rejection** now runs
+  `reflectOnRejectionPhase` (memory-only tools, same grant as reflect) with the human's stated reason,
+  so being told no produces a lesson instead of teaching the agent nothing.
 - **act** (`actPhase`) — side-effecting tool access is hard-limited to exactly `proposal.required_tools`,
   plus memory tools and the same no-side-effect read-only integration tools the research phase gets
   freely (`github_read_repo`/`github_read_file`/etc.) so the model can read back what it just
@@ -84,15 +95,30 @@ so side-effecting tool calls from different proposals never run concurrently, ev
 approved back to back.
 
 Every tool call in every phase is logged via a `PostToolUse` hook in `runPhase`, and every phase's Claude
-API cost (`total_cost_usd` from the SDK) is recorded — spend counts against profit.
+API cost (`total_cost_usd` from the SDK) is recorded — spend counts against profit. That accounting lives
+in a `finally`, so an aborted or crashed phase still lands in `runs`: spend already incurred is real
+whether or not the phase finished, and a phase missing from the ledger would understate what the loop cost.
+
+**Runtime control** (`agent-control.ts`) holds state the operator drives from the console: paused,
+domains, cycle interval, a one-shot research directive, and a live view of what's executing. `mainLoop`
+re-reads it each pass instead of closing over the env constants, so changes take effect without a
+restart. "Run a cycle now" resolves `sleepUntilNextCycle` early; aborting an act phase fires the
+`AbortController` passed to that run's `query()` (skipping reflect, since there's no outcome to reflect
+on). A directive is consumed — injected into one research prompt, then cleared.
 
 ### Backend modules (`src/`)
 
 - `memory-server.ts` — SQLite-backed memory (`data/agent.db`) plus the MCP tools the model can call:
   `research_note_add`, `research_note_search`, `lesson_search`, `lesson_add`, `lesson_reinforce`,
   `proposal_create`, `proposal_status`, `outcome_record`, `action_history_search`. Approving proposals,
-  logging actions, and marking a run successful are deliberately *not* model-callable tools — those stay
-  with the orchestrator and the human. Notes/lessons are ranked by Qdrant vector similarity when Qdrant
+  logging actions, marking a run successful, and **curating memory** (editing, muting, or deleting a
+  lesson; deleting or merging research notes) are deliberately *not* model-callable tools — those stay
+  with the orchestrator and the human. Muting matters most: `searchLessons` is the single chokepoint
+  every `lesson_search` goes through, so muting there removes a wrong lesson from the agent's reasoning
+  everywhere at once while keeping the record of what was believed and when. `searchLessonsByText` is a
+  deliberate sibling of `searchLessons` for the console's operator — the agent looks lessons up *by
+  domain* (its LIKE fallback matches domain equality), which finds nothing for a human typing a phrase
+  from a lesson body. Same semantic path, same muted filter, different fallback. Notes/lessons are ranked by Qdrant vector similarity when Qdrant
   is configured, falling back to `LIKE` text matching otherwise; `syncToQdrant()` (called once at
   startup in `orchestrator.ts`) backfills any rows that predate Qdrant being configured. Also owns the
   `events` table (persisted activity feed, capped at `EVENTS_KEEP`) and `action_history_search`'s
@@ -113,6 +139,15 @@ API cost (`total_cost_usd` from the SDK) is recorded — spend counts against pr
   creates/deploys something returns a plain `url` field on success — `memory-server.ts`'s
   `extractResultUrl` pulls that out generically (by field name, not per-tool switching) to back the
   Actions page's browsable result links.
+- `tool-catalog.ts` — the one place that knows which tools exist and which touch the real world
+  (`toolRisk` → write/read/memory). Three consumers used to each carry their own copy of that answer:
+  `orchestrator.ts` (listing act-phase write tools in the research prompt), `server.ts` (validating
+  operator edits to `required_tools` against `ALL_GRANTABLE_TOOLS`), and the console (badging risk at
+  decision time, via `GET /api/tools`). Read-only integration tools stay defined in
+  `integrations-server.ts` next to their handlers and are re-exported here.
+- `agent-control.ts` — runtime knobs (pause, run-now, abort, domains, interval, directive) plus the
+  execution snapshot the console reads. Same in-process bus shape as `review-gateway.ts` and
+  `reactive-triggers.ts`.
 - `events.ts` / `review-gateway.ts` / `server.ts` — the live layer under the web UI. `events.ts` is an
   in-process bus the orchestrator emits to; `server.ts` persists each event via `store.logEvent()` *then*
   rebroadcasts it over WebSocket with the same `{id, occurredAt}` the DB assigned, and serves the REST API
@@ -122,14 +157,31 @@ API cost (`total_cost_usd` from the SDK) is recorded — spend counts against pr
 
 ### Frontend (`web/`)
 
-React + TypeScript + Ant Design (dark theme, see `web/src/theme.ts` for the palette), linted with
-oxlint, talking to `src/server.ts` over REST (`web/src/api.ts`) and WebSocket
-(`web/src/useAgentSocket.ts`). Pages live in `web/src/pages/`: Dashboard (pending proposals + stat tiles
-+ recent activity), Live feed (full filterable activity stream), Proposals (full history; click a row to
-open `ProposalDialog` with full description/stats/tool calls and Approve/Reject for pending ones),
-Actions (every tool call on an *approved* proposal — action type, an input-derived description, and a
-browsable result URL when the tool returned one; phase-filterable, click a row for full input/output
-JSON via `ActionDialog`), Lessons, Research notes.
+React + TypeScript + Ant Design, linted with oxlint, talking to `src/server.ts` over REST
+(`web/src/api.ts`) and WebSocket (`web/src/useAgentSocket.ts`). Pages live in `web/src/pages/`: Dashboard
+(pending proposals + stat tiles + recent activity), Live feed (full filterable activity stream),
+Proposals (full history, bulk approve/reject, click a row for `ProposalDialog`), Actions (every tool call
+on an *approved* proposal — action type, an input-derived description, and a browsable result URL when
+the tool returned one; phase-filterable, click a row for full input/output JSON via `ActionDialog`),
+Economics (spend over time, spend by phase, per-domain scoreboard with forecast accuracy), Lessons,
+Research notes, Agent control.
+
+**Theming.** Components import `palette` from `web/src/theme.ts` and get **CSS variables**
+(`var(--rl-approved)`, etc.), so a theme switch repaints without re-rendering. Ant Design can't use
+those — it derives hover/active shades with color math — so `HEX_PALETTES` holds real hex for
+`ConfigProvider`. The `--rl-*` definitions in `index.css` and `HEX_PALETTES` are two representations of
+one palette: **change both together**. `main.tsx` owns the mode and sets `data-theme` on `<html>`.
+
+**Deep links.** Every detail dialog is driven by the URL — `/proposals/:id`, `/actions/:id`,
+`/lessons/:id`, `/research/:id` — so rows are bookmarkable and Back closes the dialog. The nav highlight
+keys off the first path segment, so `/proposals/12` still selects Proposals. New detail views should
+follow this rather than holding the selected row in local state.
+
+**Table plumbing.** Pages call `useTableView(storageKey, columns)`, which wraps `useResizableColumns`
+and adds column show/hide, density, and page size (all persisted per table), returning `tableProps` to
+spread and a `view` object for `TableToolbar`. It assigns column keys from the *unfiltered* list so
+hiding one column can't shift another's identity and steal its stored width. `useTableKeyboardNav` adds
+j/k navigation scoped to the rows passed in, so the highlight can never land on a filtered-out row.
 
 Table cells that need to show long free text (a proposal description, a lesson, etc.) use the column's
 own `ellipsis: true` (plain CSS truncation + native title tooltip) and a click-to-open dialog for the
@@ -154,5 +206,9 @@ mount and merged with live WebSocket events by server-assigned id (de-duped, ord
 doesn't lose history — replaying that same event log is also what reconstructs `pendingProposals` and
 `runningPhase` on load, not just the visible feed.
 
-The web console has **no authentication** — `server.ts` binds on all interfaces with nothing gating
-`/api/proposals/:id/decision`. Fine on localhost; don't expose it beyond that without adding auth first.
+The web console is gated by a **single shared token**: set `AGENT_API_TOKEN` and `server.ts` requires it
+on `/api` (Bearer header) and on the WebSocket upgrade (query param — the browser WebSocket API can't set
+headers), compared with `timingSafeEqual`. `TokenGate` prompts for it once and stores it. Leave the token
+unset and the API is open, which is why `AGENT_BIND_HOST` defaults to `127.0.0.1` and startup logs a
+warning. This is one secret for the whole console, not per-user auth — set a token before changing the
+bind host, since nothing else stands between the network and the approve endpoint.

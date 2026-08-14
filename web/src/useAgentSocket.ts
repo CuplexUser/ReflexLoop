@@ -1,6 +1,7 @@
 import { useEffect, useReducer, useRef } from 'react'
 import type { AgentEvent, FeedEntry, PersistedEvent, ProposalRow } from './types'
 import { api } from './api'
+import { withTokenParam } from './auth'
 import { notify } from './notifications'
 import { preview } from './format'
 
@@ -143,7 +144,9 @@ export function useAgentSocket() {
     let retryTimer: ReturnType<typeof setTimeout>
 
     function connect() {
-      const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
+      // The browser WebSocket API can't set an Authorization header, so the shared token
+      // rides along as a query param and the server checks it at the upgrade.
+      const url = withTokenParam(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`)
       socket = new WebSocket(url)
       dispatch({ type: 'connection', connection: 'connecting' })
 

@@ -18,10 +18,19 @@
 import "dotenv/config";
 import { query, type Options, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { MemoryStore, buildMemoryServer, type Priority, type ProposalRow } from "./memory-server.js";
-import { buildIntegrationsServer, READONLY_INTEGRATION_TOOLS } from "./integrations-server.js";
+import { buildIntegrationsServer } from "./integrations-server.js";
+import { MEMORY_TOOLS, READONLY_INTEGRATION_TOOLS, WRITE_INTEGRATION_TOOLS } from "./tool-catalog.js";
 import { emitAgentEvent } from "./events.js";
 import { waitForDecision } from "./review-gateway.js";
 import { onReactiveTrigger } from "./reactive-triggers.js";
+import {
+  consumeDirective,
+  getControlState,
+  initControl,
+  onAbort,
+  onRunNow,
+  reportExecutionState,
+} from "./agent-control.js";
 import { startServer } from "./server.js";
 
 const DOMAINS = (process.env.AGENT_DOMAINS ?? "micro-SaaS tool for developers (self-built and self-hosted),Chrome extension for developers,VS Code extension for developers")
@@ -42,33 +51,10 @@ const memoryServer = buildMemoryServer(store);
 const integrationsServer = buildIntegrationsServer();
 const mcpServers = { memory: memoryServer, integrations: integrationsServer };
 
-// Tools always available to the model, in every phase, regardless of what
-// the phase is trying to accomplish.
-const MEMORY_TOOLS = [
-  "mcp__memory__research_note_add",
-  "mcp__memory__research_note_search",
-  "mcp__memory__lesson_search",
-  "mcp__memory__lesson_add",
-  "mcp__memory__lesson_reinforce",
-  "mcp__memory__proposal_status",
-  "mcp__memory__outcome_record",
-  "mcp__memory__action_history_search",
-];
-
-// Act-phase-only integration tools a proposal can request by exact
-// (fully-qualified) name -- listed in the research prompt so the model
-// doesn't have to guess the mcp__integrations__ prefix.
-const WRITE_INTEGRATION_TOOLS = [
-  "mcp__integrations__github_create_repo",
-  "mcp__integrations__github_create_branch",
-  "mcp__integrations__github_commit_file",
-  "mcp__integrations__github_commit_files",
-  "mcp__integrations__github_create_pr",
-  "mcp__integrations__github_merge_pr",
-  "mcp__integrations__vercel_deploy",
-  "mcp__integrations__netlify_create_site",
-  "mcp__integrations__netlify_deploy",
-];
+// MEMORY_TOOLS (always available, every phase) and WRITE_INTEGRATION_TOOLS
+// (act-phase-only, and only when an approved proposal names them) both live in
+// tool-catalog.ts now -- server.ts validates operator edits to a proposal's
+// required_tools against the same lists, and they can't be allowed to drift.
 
 function preview(value: unknown, max = 150): string {
   const s = typeof value === "string" ? value : JSON.stringify(value);
@@ -116,6 +102,8 @@ async function runPhase(opts: {
   options: Options;
   proposalId: number | null;
 }): Promise<{ finalText: string; costUsd: number }> {
+  // An aborted run still gets its cost and duration logged below -- spend already
+  // incurred counts against profit whether or not the phase finished.
   const startedAt = new Date().toISOString();
   const t0 = Date.now();
   let finalText = "";
@@ -154,23 +142,35 @@ async function runPhase(opts: {
     },
   });
 
-  for await (const message of result as AsyncGenerator<SDKMessage>) {
-    if (message.type === "assistant") {
-      for (const block of message.message.content) {
-        if (block.type === "text" && block.text.trim()) {
-          console.log(`[${opts.phase}] model: ${preview(block.text, 300)}`);
-          emitAgentEvent({ type: "model_text", phase: opts.phase, proposalId: opts.proposalId, text: block.text });
+  try {
+    for await (const message of result as AsyncGenerator<SDKMessage>) {
+      if (message.type === "assistant") {
+        for (const block of message.message.content) {
+          if (block.type === "text" && block.text.trim()) {
+            console.log(`[${opts.phase}] model: ${preview(block.text, 300)}`);
+            emitAgentEvent({ type: "model_text", phase: opts.phase, proposalId: opts.proposalId, text: block.text });
+          }
         }
+      } else if (message.type === "result") {
+        costUsd = message.total_cost_usd;
+        if (message.subtype === "success") finalText = message.result;
       }
-    } else if (message.type === "result") {
-      costUsd = message.total_cost_usd;
-      if (message.subtype === "success") finalText = message.result;
     }
+  } finally {
+    // In the finally so an aborted or failed phase is still accounted for: the spend
+    // and the tool calls that already happened are real either way, and a phase that
+    // vanished from the ledger because it crashed would understate what the loop cost.
+    console.log(`[${opts.phase}] done in ${((Date.now() - t0) / 1000).toFixed(1)}s, cost $${costUsd.toFixed(4)}`);
+    store.logRun(opts.proposalId, opts.phase, costUsd, Date.now() - t0, startedAt);
+    emitAgentEvent({
+      type: "phase_done",
+      phase: opts.phase,
+      proposalId: opts.proposalId,
+      costUsd,
+      durationMs: Date.now() - t0,
+    });
   }
 
-  console.log(`[${opts.phase}] done in ${((Date.now() - t0) / 1000).toFixed(1)}s, cost $${costUsd.toFixed(4)}`);
-  store.logRun(opts.proposalId, opts.phase, costUsd, Date.now() - t0, startedAt);
-  emitAgentEvent({ type: "phase_done", phase: opts.phase, proposalId: opts.proposalId, costUsd, durationMs: Date.now() - t0 });
   return { finalText, costUsd };
 }
 
@@ -229,12 +229,18 @@ const RESEARCH_OPTIONS: Options = {
 
 async function researchAndPlanPhase(): Promise<ProposalRow[]> {
   const beforeIds = new Set(store.listPendingProposals().map((p) => p.id));
+  const domains = getControlState().domains;
+  // A directive steers exactly one cycle, then clears itself -- it's a nudge for this
+  // run, not a standing instruction that quietly reshapes every future cycle. It can
+  // only redirect what gets researched; the output is still a proposal needing approval.
+  const directive = consumeDirective();
 
   await runPhase({
     phase: "research_plan",
     proposalId: null,
     prompt: [
-      `Domains to research this cycle (pick whichever look most promising -- you don't need to cover all of them evenly): ${DOMAINS.join("; ")}.`,
+      `Domains to research this cycle (pick whichever look most promising -- you don't need to cover all of them evenly): ${domains.join("; ")}.`,
+      ...(directive ? [`The operator left a directive for this cycle -- weight it heavily: ${directive}`] : []),
       `Before anything else, call lesson_search and research_note_search for each domain/topic you're about to look into -- don't re-research what's already known. lesson_search does semantic matching now, so it can surface relevant lessons even when your domain's wording doesn't exactly match a past one.`,
       `Also call action_history_search for each domain -- it shows what's actually been built/deployed/committed on approved proposals so far, so you don't propose duplicate work (e.g. a second repo for something already shipped). Prefer proposing the next step on existing work over starting over.`,
       `You can use the read-only tools github_read_repo, github_read_file, github_search_repos, vercel_list_projects, vercel_get_project, netlify_list_sites, netlify_get_site to check the existing landscape (competing projects, your own prior projects) before proposing.`,
@@ -304,6 +310,38 @@ async function handleReactiveTrigger(proposalId: number): Promise<void> {
 // stdout headlessly. Safe to run for several proposals at once -- each
 // waits on its own decision promise independently.
 
+/**
+ * A rejection is a signal too -- without this the agent learns nothing from being told no,
+ * and the next cycle is free to re-propose the same idea. Runs the same memory-only reflect
+ * grant as a post-outcome reflection; there is no outcome row here, just the human's reason.
+ */
+async function reflectOnRejectionPhase(proposal: ProposalRow): Promise<void> {
+  await runPhase({
+    phase: "reflect",
+    proposalId: proposal.id,
+    prompt: [
+      `Proposal #${proposal.id} in domain "${proposal.domain}" was REJECTED by the human reviewer: ${proposal.description}`,
+      `Their stated reason: ${proposal.human_notes?.trim() || "(none given)"}`,
+      `Call lesson_search for this domain first. If an existing lesson already covers why this kind of proposal gets rejected, call lesson_reinforce on it rather than duplicating it.`,
+      `Otherwise call lesson_add exactly once with a generalized takeaway about what makes a proposal in this domain not worth approving -- something that would stop you re-proposing this same idea next cycle. Don't record the rejection as a play-by-play.`,
+      `If no reason was given, infer nothing beyond the obvious and keep the lesson conservative -- a low-confidence, narrowly-worded note is better than a confident guess about why.`,
+    ].join("\n"),
+    options: {
+      mcpServers: { memory: memoryServer },
+      allowedTools: [...MEMORY_TOOLS],
+      settingSources: [],
+      canUseTool: async (toolName) => {
+        const allowed = MEMORY_TOOLS.includes(toolName);
+        return allowed
+          ? { behavior: "allow" as const }
+          : { behavior: "deny" as const, message: `${toolName} is not available in the reflect phase` };
+      },
+      hooks: { PreToolUse: toolGateHook(MEMORY_TOOLS, "reflect") },
+      maxTurns: 10,
+    },
+  });
+}
+
 async function humanReviewPhase(proposal: ProposalRow): Promise<ProposalRow> {
   console.log("\n=== Proposal awaiting review ===");
   console.log(`#${proposal.id} [${proposal.domain}]`);
@@ -315,6 +353,16 @@ async function humanReviewPhase(proposal: ProposalRow): Promise<ProposalRow> {
 
   emitAgentEvent({ type: "proposal_pending", proposal });
   const decision = await waitForDecision(proposal.id);
+
+  // Scope edits land before the status flips, so what gets approved is exactly what
+  // actPhase will later be fenced to -- there is never a window where the proposal is
+  // approved but still carries the pre-edit tool list.
+  if (decision.approved && (decision.editedDescription !== undefined || decision.editedRequiredTools !== undefined)) {
+    store.applyProposalEdits(proposal.id, {
+      description: decision.editedDescription,
+      requiredTools: decision.editedRequiredTools,
+    });
+  }
 
   store.decideProposal(proposal.id, decision.approved ? "approved" : "rejected", decision.notes);
 
@@ -355,9 +403,19 @@ async function humanReviewPhase(proposal: ProposalRow): Promise<ProposalRow> {
 // belt and suspenders, since allowedTools alone relies on the model never
 // being told about a broader tool in the first place.
 
+/**
+ * Set while an act phase is executing, so the operator's abort button has something to
+ * cancel. Aborting stops the model mid-run: whatever side effects already landed stay
+ * landed (there is no rollback), but nothing further is attempted, and reflect is skipped
+ * because the run didn't reach an outcome.
+ */
+let actAbortController: AbortController | null = null;
+
 async function actPhase(proposal: ProposalRow): Promise<void> {
   const requiredTools = proposal.required_tools.split(",").map((s) => s.trim()).filter(Boolean);
   const allowedTools = [...new Set([...MEMORY_TOOLS, ...READONLY_INTEGRATION_TOOLS, ...requiredTools])];
+  const abortController = new AbortController();
+  actAbortController = abortController;
 
   await runPhase({
     phase: "act",
@@ -374,6 +432,7 @@ async function actPhase(proposal: ProposalRow): Promise<void> {
       mcpServers,
       allowedTools,
       settingSources: [],
+      abortController,
       canUseTool: async (toolName) => {
         const allowed = allowedTools.includes(toolName);
         return allowed
@@ -383,6 +442,9 @@ async function actPhase(proposal: ProposalRow): Promise<void> {
       hooks: { PreToolUse: toolGateHook(allowedTools, "act") },
       maxTurns: 60,
     },
+  }).finally(() => {
+    // Only clear if this run still owns the slot -- a later act phase may have claimed it.
+    if (actAbortController === abortController) actAbortController = null;
   });
 }
 
@@ -466,11 +528,14 @@ async function drainQueue(): Promise<void> {
 
   workerBusy = true;
   runningProposalId = next.proposal.id;
+  reportExecutionState(runningProposalId, runQueue.map((r) => r.proposal.id));
   try {
     if (next.wasScheduled) {
       emitAgentEvent({ type: "scheduled_run_starting", proposal: next.proposal });
     }
     await actPhase(next.proposal);
+    // Reflect only after an act phase that actually ran to completion -- an aborted or
+    // failed act throws past this, so there's no outcome for it to draw a lesson from.
     await reflectPhase(next.proposal);
   } catch (err) {
     console.error(`[act] proposal #${next.proposal.id} failed:`, err);
@@ -481,6 +546,7 @@ async function drainQueue(): Promise<void> {
     });
     workerBusy = false;
     runningProposalId = null;
+    reportExecutionState(null, runQueue.map((r) => r.proposal.id));
   }
   void drainQueue();
 }
@@ -495,9 +561,15 @@ function schedulerTick(): void {
 /** Fire-and-forget: waits for this proposal's review independently of any others in flight. */
 function enqueueForReview(proposal: ProposalRow): void {
   void (async () => {
-    const decided = await humanReviewPhase(proposal);
-    if (decided.status !== "approved") {
-      console.log(`Proposal #${decided.id} rejected. Reason: ${decided.human_notes ?? "(none given)"}`);
+    try {
+      const decided = await humanReviewPhase(proposal);
+      if (decided.status !== "approved") {
+        console.log(`Proposal #${decided.id} rejected. Reason: ${decided.human_notes ?? "(none given)"}`);
+        // Memory-only, no side effects, so this doesn't need the act queue's serialization.
+        await reflectOnRejectionPhase(decided);
+      }
+    } catch (err) {
+      console.error(`[review] proposal #${proposal.id} failed:`, err);
     }
   })();
 }
@@ -507,8 +579,18 @@ function enqueueForReview(proposal: ProposalRow): void {
 async function mainLoop() {
   console.log(`Agent runner started. Domains: ${DOMAINS.join("; ")}. DB: ${DB_PATH}`);
   await store.syncToQdrant();
-  startServer(store, DOMAINS, SERVER_PORT);
+  // Env values are the starting point; from here the operator's console owns them, so
+  // every later read goes through getControlState() rather than the module constants.
+  initControl({ domains: DOMAINS, cycleIntervalMs: CYCLE_INTERVAL_MS });
+  startServer(store, SERVER_PORT);
   onReactiveTrigger((t) => void handleReactiveTrigger(t.proposalId));
+  onRunNow(() => wakeCycle());
+  onAbort((proposalId) => {
+    if (actAbortController && runningProposalId === proposalId) {
+      console.log(`[control] aborting act phase for proposal #${proposalId}`);
+      actAbortController.abort();
+    }
+  });
   emitAgentEvent({ type: "run_started", domains: DOMAINS });
 
   // Pick up any proposals left pending from a previous run -- all queued for
@@ -523,8 +605,12 @@ async function mainLoop() {
   setInterval(schedulerTick, SCHEDULER_TICK_MS);
 
   while (true) {
+    const control = getControlState();
     const pendingCount = store.listPendingProposals().length;
-    if (pendingCount >= MAX_PENDING_PROPOSALS) {
+
+    if (control.paused) {
+      console.log("Loop is paused by the operator; skipping research this cycle.");
+    } else if (pendingCount >= MAX_PENDING_PROPOSALS) {
       console.log(`${pendingCount} proposals already pending review (max ${MAX_PENDING_PROPOSALS}); skipping research this cycle.`);
     } else {
       const proposals = await researchAndPlanPhase();
@@ -534,14 +620,29 @@ async function mainLoop() {
         console.log("No proposal this cycle.");
       }
     }
-    const nextCycleAt = new Date(Date.now() + CYCLE_INTERVAL_MS).toISOString();
+
+    // Re-read the interval each pass so an operator's change takes effect on the next
+    // wait rather than only after a restart.
+    const intervalMs = getControlState().cycleIntervalMs;
+    const nextCycleAt = new Date(Date.now() + intervalMs).toISOString();
     emitAgentEvent({ type: "cycle_idle", nextCycleAt });
-    await sleep(CYCLE_INTERVAL_MS);
+    await sleepUntilNextCycle(intervalMs);
   }
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Resolves when the interval elapses, or early if the operator hits "run a cycle now". */
+let wakeCycle: () => void = () => {};
+
+function sleepUntilNextCycle(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(finish, ms);
+    function finish() {
+      clearTimeout(timer);
+      wakeCycle = () => {};
+      resolve();
+    }
+    wakeCycle = finish;
+  });
 }
 
 mainLoop().catch((err) => {

@@ -1,4 +1,4 @@
-import { Card, Col, Row, Statistic, Tag } from 'antd'
+import { Card, Col, Row, Statistic, Tag, Tooltip } from 'antd'
 import type { OutcomeRow, ProposalRow } from '../types'
 import { palette } from '../theme'
 
@@ -12,23 +12,27 @@ export function StatTiles({
   totalCostUsd: number
 }) {
   const revenue = outcomes.reduce((sum, o) => sum + o.actual_revenue, 0)
-  const cost = outcomes.reduce((sum, o) => sum + o.actual_cost, 0)
-  const net = revenue - cost
+  const reportedCost = outcomes.reduce((sum, o) => sum + o.actual_cost, 0)
+  // Claude spend counts against profit by design, so the headline number nets it out rather
+  // than showing revenue and spend side by side and leaving the subtraction to the reader.
+  const net = revenue - reportedCost - totalCostUsd
 
   const counts = { pending: 0, approved: 0, rejected: 0 }
   for (const p of proposals) counts[p.status]++
 
   return (
-    <Row gutter={16}>
-      <Col xs={24} sm={12} lg={5}>
+    <Row gutter={[16, 16]}>
+      <Col xs={24} sm={12} lg={6}>
         <Card size="small">
-          <Statistic
-            title="Claude API spend"
-            value={totalCostUsd}
-            precision={4}
-            prefix="$"
-            valueStyle={{ color: palette.active, fontSize: 22 }}
-          />
+          <Tooltip title="Revenue reported by the agent, minus its reported cost, minus Claude API spend.">
+            <Statistic
+              title="Net"
+              value={net}
+              precision={2}
+              prefix="$"
+              valueStyle={{ color: net >= 0 ? palette.approved : palette.rejected, fontSize: 22 }}
+            />
+          </Tooltip>
         </Card>
       </Col>
       <Col xs={24} sm={12} lg={5}>
@@ -38,17 +42,17 @@ export function StatTiles({
       </Col>
       <Col xs={24} sm={12} lg={5}>
         <Card size="small">
-          <Statistic title="Reported cost" value={cost} precision={2} prefix="$" valueStyle={{ fontSize: 22 }} />
+          <Statistic title="Reported cost" value={reportedCost} precision={2} prefix="$" valueStyle={{ fontSize: 22 }} />
         </Card>
       </Col>
-      <Col xs={24} sm={12} lg={5}>
+      <Col xs={24} sm={12} lg={4}>
         <Card size="small">
           <Statistic
-            title="Net (reported)"
-            value={net}
-            precision={2}
+            title="Claude API spend"
+            value={totalCostUsd}
+            precision={4}
             prefix="$"
-            valueStyle={{ color: net >= 0 ? palette.approved : palette.rejected, fontSize: 22 }}
+            valueStyle={{ color: palette.active, fontSize: 22 }}
           />
         </Card>
       </Col>

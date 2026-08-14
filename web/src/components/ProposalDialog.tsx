@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react'
-import { App, Button, Descriptions, Divider, Input, Modal, Skeleton, Space, Statistic, Table, Tag, Typography } from 'antd'
-import { CheckCircleOutlined, ClockCircleOutlined, CloseCircleOutlined } from '@ant-design/icons'
+import { App, Button, Descriptions, Modal, Skeleton, Space, Statistic, Table, Tag, Tooltip, Typography } from 'antd'
+import { ClockCircleOutlined } from '@ant-design/icons'
 import type { ActionRow, OutcomeRow, ProposalRow, RunRow } from '../types'
-import { api, type ScheduleOptions } from '../api'
-import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, preview, recurrenceLabel } from '../format'
+import { api } from '../api'
+import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, preview, recurrenceLabel, timeAgo } from '../format'
 import { palette } from '../theme'
-import { SchedulePriorityFields } from './SchedulePriorityFields'
 import { MarkdownLite } from './MarkdownLite'
+import { DecisionControls } from './DecisionControls'
+import { ToolFence } from './ToolFence'
 
 const STATUS_COLOR: Record<ProposalRow['status'], string> = {
   pending: 'warning',
@@ -28,22 +29,12 @@ export function ProposalDialog({
   const { message } = App.useApp()
   const [actions, setActions] = useState<ActionRow[] | null>(null)
   const [runs, setRuns] = useState<RunRow[]>([])
-  const [rejecting, setRejecting] = useState(false)
-  const [notes, setNotes] = useState('')
-  const [submitting, setSubmitting] = useState<'approve' | 'reject' | null>(null)
-  const [showSchedule, setShowSchedule] = useState(false)
-  const [schedule, setSchedule] = useState<ScheduleOptions>({})
   const [cancellingSchedule, setCancellingSchedule] = useState(false)
 
   useEffect(() => {
     if (!open || !proposal) return
     setActions(null)
     setRuns([])
-    setRejecting(false)
-    setNotes('')
-    setSubmitting(null)
-    setShowSchedule(false)
-    setSchedule({})
     let cancelled = false
     api
       .proposalActions(proposal.id)
@@ -64,20 +55,10 @@ export function ProposalDialog({
     .split(',')
     .map((t) => t.trim())
     .filter(Boolean)
-
-  async function decide(approved: boolean) {
-    if (!proposal) return
-    setSubmitting(approved ? 'approve' : 'reject')
-    try {
-      await api.decide(proposal.id, approved, notes || undefined, approved ? schedule : undefined)
-      message.success(approved ? `Approved proposal #${proposal.id}` : `Rejected proposal #${proposal.id}`)
-      onClose()
-    } catch (err) {
-      message.error(err instanceof Error ? err.message : 'Decision failed')
-    } finally {
-      setSubmitting(null)
-    }
-  }
+  const originalTools = proposal.original_required_tools
+    ?.split(',')
+    .map((t) => t.trim())
+    .filter(Boolean)
 
   async function cancelSchedule() {
     if (!proposal) return
@@ -101,15 +82,27 @@ export function ProposalDialog({
       width={720}
       destroyOnClose
       title={
-        <Space align="center" size={10}>
+        <Space align="center" size={10} wrap>
           <span>Proposal #{proposal.id}</span>
           <Tag color={STATUS_COLOR[proposal.status]}>{proposal.status}</Tag>
           <Tag color="default">{proposal.domain}</Tag>
+          {proposal.status === 'pending' && (
+            <Typography.Text type="secondary" style={{ fontSize: 12, fontWeight: 400 }}>
+              pending {timeAgo(proposal.created_at)}
+            </Typography.Text>
+          )}
         </Space>
       }
     >
       <Space direction="vertical" size={16} style={{ width: '100%' }}>
         <MarkdownLite text={proposal.description} />
+
+        {proposal.original_description && (
+          <Typography.Paragraph type="secondary" style={{ marginBottom: 0, fontSize: 12 }}>
+            <Typography.Text strong>Edited by a human before approval.</Typography.Text> The model originally
+            wrote: {preview(proposal.original_description, 240)}
+          </Typography.Paragraph>
+        )}
 
         {proposal.human_notes && (
           <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
@@ -139,18 +132,17 @@ export function ProposalDialog({
           )}
         </Space>
 
-        <div>
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            TOOLS REQUIRED
-          </Typography.Text>
-          <div style={{ marginTop: 4 }}>
-            {tools.map((t) => (
-              <Tag key={t} className="mono">
-                {t}
-              </Tag>
-            ))}
+        {/* Pending proposals get the editable fence inside DecisionControls; decided ones are read-only. */}
+        {proposal.status !== 'pending' && (
+          <div>
+            <ToolFence tools={tools} />
+            {originalTools && (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                Fence edited at approval — the model asked for: {originalTools.join(', ')}
+              </Typography.Text>
+            )}
           </div>
-        </div>
+        )}
 
         {proposal.status === 'approved' && (
           <Space align="center" size={10} wrap>
@@ -198,75 +190,28 @@ export function ProposalDialog({
               pagination={false}
               rowKey="id"
               dataSource={actions}
+              scroll={{ x: 620 }}
               locale={{ emptyText: 'No tool calls logged' }}
               columns={[
                 { title: 'Phase', dataIndex: 'phase', width: 110 },
                 { title: 'Tool', dataIndex: 'tool_name', width: 200, render: (v) => <span className="mono">{v}</span> },
                 { title: 'Input', dataIndex: 'tool_input', render: (v) => <span className="mono">{preview(v, 100)}</span> },
-                { title: 'When', dataIndex: 'occurred_at', width: 160, render: (v) => new Date(v).toLocaleString() },
+                {
+                  title: 'When',
+                  dataIndex: 'occurred_at',
+                  width: 160,
+                  render: (v: string) => (
+                    <Tooltip title={new Date(v).toLocaleString()}>
+                      <span>{timeAgo(v)}</span>
+                    </Tooltip>
+                  ),
+                },
               ]}
             />
           )}
         </div>
 
-        {proposal.status === 'pending' && (
-          <>
-            <Divider style={{ margin: '4px 0' }} />
-            {rejecting && (
-              <Input.TextArea
-                placeholder="Reason (optional) — saved with the rejection for future reference"
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                autoSize={{ minRows: 2, maxRows: 4 }}
-              />
-            )}
-            {!rejecting && (
-              <div>
-                <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setShowSchedule((v) => !v)}>
-                  {showSchedule ? 'Hide schedule & priority' : 'Schedule & priority…'}
-                </Button>
-                {showSchedule && (
-                  <div style={{ marginTop: 8 }}>
-                    <SchedulePriorityFields onChange={setSchedule} />
-                  </div>
-                )}
-              </div>
-            )}
-            <Space>
-              <Button
-                type="primary"
-                icon={<CheckCircleOutlined />}
-                loading={submitting === 'approve'}
-                disabled={submitting !== null}
-                style={{ background: palette.approved, borderColor: palette.approved }}
-                onClick={() => decide(true)}
-              >
-                Approve
-              </Button>
-              {rejecting ? (
-                <Button
-                  danger
-                  icon={<CloseCircleOutlined />}
-                  loading={submitting === 'reject'}
-                  disabled={submitting !== null}
-                  onClick={() => decide(false)}
-                >
-                  Confirm reject
-                </Button>
-              ) : (
-                <Button
-                  danger
-                  ghost
-                  icon={<CloseCircleOutlined />}
-                  disabled={submitting !== null}
-                  onClick={() => setRejecting(true)}
-                >
-                  Reject
-                </Button>
-              )}
-            </Space>
-          </>
-        )}
+        {proposal.status === 'pending' && <DecisionControls proposal={proposal} onDecided={onClose} />}
       </Space>
     </Modal>
   )

@@ -20,6 +20,9 @@ export interface ProposalRow {
   recurrence_ms: number | null
   /** Orchestrator-maintained: when this proposal's act phase is next due, or null if nothing is pending. */
   next_run_at: string | null
+  /** Set only when a human edited the scope at approval time -- what the model originally asked for. */
+  original_required_tools: string | null
+  original_description: string | null
 }
 
 export interface OutcomeRow {
@@ -45,6 +48,10 @@ export interface LessonRow {
   times_contradicted: number
   created_at: string
   updated_at: string
+  /** 1 = excluded from the agent's lesson_search. Human-set; the model can't mute itself. */
+  muted: number
+  /** Set when a human rewrote the text. */
+  edited_at: string | null
 }
 
 export interface ResearchNoteRow {
@@ -92,6 +99,73 @@ export interface ActionWithProposal {
 export interface StatusResponse {
   domains: string[]
   totalCostUsd: number
+  control: ControlState
+  authRequired: boolean
+}
+
+export interface ControlState {
+  paused: boolean
+  domains: string[]
+  cycleIntervalMs: number
+  directive: string | null
+  runningProposalId: number | null
+  queuedProposalIds: number[]
+}
+
+/** How much damage a tool can do -- drives the risk badges on a proposal under review. */
+export type ToolRisk = 'write' | 'read' | 'memory' | 'unknown'
+
+export interface ToolInfo {
+  name: string
+  risk: ToolRisk
+}
+
+export interface SearchHit {
+  type: 'proposal' | 'lesson' | 'research_note' | 'action'
+  id: number
+  title: string
+  snippet: string
+  badge?: string
+  proposalId?: number
+}
+
+export interface PhaseSpend {
+  phase: string
+  runs: number
+  cost_usd: number
+  duration_ms: number
+}
+
+export interface DaySpend {
+  day: string
+  cost_usd: number
+  runs: number
+}
+
+export interface DomainScore {
+  domain: string
+  proposals: number
+  approved: number
+  outcomes: number
+  successes: number
+  revenue: number
+  reported_cost: number
+  /** Sum of expected_upside across proposals that produced an outcome -- compare against `revenue`. */
+  forecast_upside: number
+  api_spend: number
+}
+
+export interface EconomicsResponse {
+  spendByPhase: PhaseSpend[]
+  spendOverTime: DaySpend[]
+  domains: DomainScore[]
+  totalCostUsd: number
+}
+
+export interface DuplicateNotePair {
+  a: ResearchNoteRow
+  b: ResearchNoteRow
+  similarity: number
 }
 
 export type Phase = 'research_plan' | 'act' | 'reflect'

@@ -103,6 +103,28 @@ export async function upsertText(
   }
 }
 
+/** Remove a point whose backing SQLite row is gone, so it can't surface in a later search. */
+export async function deletePoint(collection: string, id: number): Promise<boolean> {
+  if (!qdrantAvailable) return false;
+  if (!(await ensureCollection(collection))) return false;
+
+  try {
+    const res = await fetch(`${BASE_URL}/collections/${collection}/points/delete?wait=true`, {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ points: [id] }),
+    });
+    if (!res.ok) {
+      console.error(`[qdrant] delete from ${collection} failed: ${res.status} ${await res.text()}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error(`[qdrant] delete from ${collection} failed:`, err);
+    return false;
+  }
+}
+
 interface QueryResponse {
   result: { points: { id: number; score: number }[] };
 }

@@ -13,6 +13,14 @@ export interface Decision {
   priority?: "low" | "normal" | "high" | "urgent";
   scheduledAt?: string | null;
   recurrenceMs?: number | null;
+  /**
+   * Human edits to the proposal's scope, applied just before approval. Editing
+   * required_tools edits the fence itself -- narrowing it is the operator's main lever
+   * for approving a good idea with a smaller blast radius. Validated against the tool
+   * catalog server-side, so this can only ever name tools that actually exist.
+   */
+  editedDescription?: string;
+  editedRequiredTools?: string[];
 }
 
 const pendingResolvers = new Map<number, (decision: Decision) => void>();

@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import { LinkOutlined } from '@ant-design/icons'
-import { Input, Segmented, Select, Space, Table, Tag, Typography } from 'antd'
+import { Input, Segmented, Select, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import type { ActionWithProposal, OutcomeRow, Priority, ProposalRow } from '../types'
 import { api } from '../api'
 import {
@@ -14,7 +15,10 @@ import {
   timeAgo,
 } from '../format'
 import { ActionDialog } from '../components/ActionDialog'
+import { TableToolbar } from '../components/TableToolbar'
 import { useResizableColumns } from '../hooks/useResizableColumns'
+import { useTableView } from '../hooks/useTableView'
+import { exportCsv, exportJson } from '../export'
 
 type PhaseFilter = 'all' | 'act' | 'reflect'
 type ReviewStatus = ProposalRow['review_status']
@@ -93,11 +97,21 @@ export function ActionsPage({
   outcomes: OutcomeRow[]
   onSetReview: (id: number, reviewStatus: ReviewStatus) => void
 }) {
+  const navigate = useNavigate()
+  const { id } = useParams()
   const [actions, setActions] = useState<ActionWithProposal[]>([])
   const [loading, setLoading] = useState(true)
   const [phase, setPhase] = useState<PhaseFilter>('all')
   const [selected, setSelected] = useState<ActionWithProposal | null>(null)
   const [search, setSearch] = useState('')
+
+  // The URL points at a proposal (that's how actions are grouped here), so a linked row
+  // opens with its action list already expanded.
+  const expandedProposalId = id ? Number(id) : null
+  const setExpandedProposalId = useCallback(
+    (next: number | null) => navigate(next === null ? '/actions' : `/actions/${next}`),
+    [navigate],
+  )
 
   useEffect(() => {
     api
@@ -144,7 +158,7 @@ export function ActionsPage({
     [groups],
   )
 
-  const { columns, components, scroll } = useResizableColumns<ProposalGroup>('actions', [
+  const { columns, components, scroll, tableProps, view } = useTableView<ProposalGroup>('actions', [
     {
       title: '#',
       width: 70,
@@ -251,43 +265,67 @@ export function ActionsPage({
       width: 130,
       sorter: (a, b) => a.lastActivity.localeCompare(b.lastActivity),
       defaultSortOrder: 'descend',
-      render: (_, g) => timeAgo(g.lastActivity),
+      render: (_, g) => (
+        <Tooltip title={new Date(g.lastActivity).toLocaleString()}>
+          <span>{timeAgo(g.lastActivity)}</span>
+        </Tooltip>
+      ),
     },
   ])
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
-      <Space size={16} wrap>
-        <Segmented
-          value={phase}
-          onChange={(v) => setPhase(v as PhaseFilter)}
-          options={[
-            { label: 'All phases', value: 'all' },
-            { label: PHASE_LABEL.act, value: 'act' },
-            { label: PHASE_LABEL.reflect, value: 'reflect' },
-          ]}
-        />
-        <Input.Search
-          allowClear
-          placeholder="Search proposal, action, or description…"
-          style={{ maxWidth: 360 }}
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
+      <Space size={12} wrap style={{ width: '100%', justifyContent: 'space-between' }}>
+        <Space size={16} wrap>
+          <Segmented
+            value={phase}
+            onChange={(v) => setPhase(v as PhaseFilter)}
+            options={[
+              { label: 'All phases', value: 'all' },
+              { label: PHASE_LABEL.act, value: 'act' },
+              { label: PHASE_LABEL.reflect, value: 'reflect' },
+            ]}
+          />
+          <Input.Search
+            allowClear
+            placeholder="Search proposal, action, or description…"
+            style={{ width: 320 }}
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        </Space>
+        <TableToolbar
+          view={view}
+          onExportCsv={() =>
+            exportCsv('actions', filteredActions, [
+              { key: 'id', title: '#' },
+              { key: 'proposal_id', title: 'Proposal' },
+              { key: 'proposal_domain', title: 'Domain' },
+              { key: 'phase', title: 'Phase' },
+              { key: 'tool_name', title: 'Tool' },
+              { key: 'tool_input', title: 'Input' },
+              { key: 'result_url', title: 'Result URL' },
+              { key: 'occurred_at', title: 'When' },
+            ])
+          }
+          onExportJson={() => exportJson('actions', filteredActions)}
         />
       </Space>
       <Table
         rowKey={(g) => g.proposal.id}
         loading={loading}
         dataSource={groups}
-        pagination={{ pageSize: 20 }}
         components={components}
         scroll={scroll}
         columns={columns}
         locale={{ emptyText: 'No actions taken on approved proposals yet' }}
         expandable={{
           expandRowByClick: true,
+          expandedRowKeys: expandedProposalId === null ? [] : [expandedProposalId],
+          onExpand: (expanded, g) => setExpandedProposalId(expanded ? g.proposal.id : null),
           expandedRowRender: (g) => <ExpandedActions actions={g.actions} onSelect={setSelected} />,
         }}
+        {...tableProps}
       />
       <ActionDialog action={selected} open={selected !== null} onClose={() => setSelected(null)} />
     </Space>

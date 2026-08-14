@@ -1,52 +1,33 @@
-import { useState } from 'react'
-import { App, Button, Card, Input, Space, Statistic, Tag, Typography } from 'antd'
-import { CheckCircleOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons'
+import { Card, Space, Statistic, Tag, Tooltip, Typography } from 'antd'
+import { WarningOutlined } from '@ant-design/icons'
 import type { ProposalRow } from '../types'
-import { api, type ScheduleOptions } from '../api'
 import { palette } from '../theme'
-import { SchedulePriorityFields } from './SchedulePriorityFields'
+import { timeAgo } from '../format'
 import { MarkdownLite } from './MarkdownLite'
+import { DecisionControls } from './DecisionControls'
 
 const { Title, Text } = Typography
 
 export function ProposalReviewCard({ proposal }: { proposal: ProposalRow }) {
-  const { message } = App.useApp()
-  const [rejecting, setRejecting] = useState(false)
-  const [notes, setNotes] = useState('')
-  const [submitting, setSubmitting] = useState<'approve' | 'reject' | null>(null)
-  const [showSchedule, setShowSchedule] = useState(false)
-  const [schedule, setSchedule] = useState<ScheduleOptions>({})
-
-  async function decide(approved: boolean) {
-    setSubmitting(approved ? 'approve' : 'reject')
-    try {
-      await api.decide(proposal.id, approved, notes || undefined, approved ? schedule : undefined)
-      message.success(approved ? `Approved proposal #${proposal.id}` : `Rejected proposal #${proposal.id}`)
-    } catch (err) {
-      message.error(err instanceof Error ? err.message : 'Decision failed')
-    } finally {
-      setSubmitting(null)
-    }
-  }
-
-  const tools = proposal.required_tools
-    .split(',')
-    .map((t) => t.trim())
-    .filter(Boolean)
-
   return (
     <Card
       className="pulse-attention"
-      style={{ borderLeft: `4px solid ${palette.pending}`, background: '#1B1F27' }}
+      style={{ borderLeft: `4px solid ${palette.pending}`, background: palette.bgRaised }}
       styles={{ body: { padding: 24 } }}
     >
       <Space direction="vertical" size={16} style={{ width: '100%' }}>
-        <Space align="center" size={10}>
+        <Space align="center" size={10} wrap>
           <WarningOutlined style={{ color: palette.pending, fontSize: 18 }} />
           <Title level={4} style={{ margin: 0 }}>
             Proposal #{proposal.id} awaiting your decision
           </Title>
           <Tag color="default">{proposal.domain}</Tag>
+          {/* How long someone has been sitting on this -- a proposal blocks its act phase until decided. */}
+          <Tooltip title={new Date(proposal.created_at).toLocaleString()}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              pending {timeAgo(proposal.created_at)}
+            </Text>
+          </Tooltip>
         </Space>
 
         <MarkdownLite text={proposal.description} style={{ maxWidth: 820 }} />
@@ -63,74 +44,7 @@ export function ProposalReviewCard({ proposal }: { proposal: ProposalRow }) {
           />
         </Space>
 
-        <div>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            TOOLS REQUIRED
-          </Text>
-          <div style={{ marginTop: 4 }}>
-            {tools.map((t) => (
-              <Tag key={t} className="mono">
-                {t}
-              </Tag>
-            ))}
-          </div>
-        </div>
-
-        {rejecting && (
-          <Input.TextArea
-            placeholder="Reason (optional) — saved with the rejection for future reference"
-            value={notes}
-            onChange={(e) => setNotes(e.target.value)}
-            autoSize={{ minRows: 2, maxRows: 4 }}
-          />
-        )}
-
-        {!rejecting && (
-          <div>
-            <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setShowSchedule((v) => !v)}>
-              {showSchedule ? 'Hide schedule & priority' : 'Schedule & priority…'}
-            </Button>
-            {showSchedule && (
-              <div style={{ marginTop: 8 }}>
-                <SchedulePriorityFields onChange={setSchedule} />
-              </div>
-            )}
-          </div>
-        )}
-
-        <Space>
-          <Button
-            type="primary"
-            icon={<CheckCircleOutlined />}
-            loading={submitting === 'approve'}
-            disabled={submitting !== null}
-            style={{ background: palette.approved, borderColor: palette.approved }}
-            onClick={() => decide(true)}
-          >
-            Approve
-          </Button>
-          {rejecting ? (
-            <Button
-              danger
-              icon={<CloseCircleOutlined />}
-              loading={submitting === 'reject'}
-              disabled={submitting !== null}
-              onClick={() => decide(false)}
-            >
-              Confirm reject
-            </Button>
-          ) : (
-            <Button
-              danger
-              ghost
-              icon={<CloseCircleOutlined />}
-              disabled={submitting !== null}
-              onClick={() => setRejecting(true)}
-            >
-              Reject
-            </Button>
-          )}
-        </Space>
+        <DecisionControls proposal={proposal} />
       </Space>
     </Card>
   )
