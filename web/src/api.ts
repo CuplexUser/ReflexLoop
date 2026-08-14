@@ -3,6 +3,7 @@ import type {
   ActionRow,
   ActionWithProposal,
   ControlState,
+  Deliverable,
   DuplicateNotePair,
   EconomicsResponse,
   LessonRow,
@@ -72,6 +73,7 @@ export const api = {
   economics: () => getJson<EconomicsResponse>('/api/economics'),
   events: () => getJson<PersistedEvent[]>('/api/events'),
   actions: () => getJson<ActionWithProposal[]>('/api/actions'),
+  deliverables: () => getJson<Deliverable[]>('/api/deliverables'),
   search: (q: string) => getJson<SearchHit[]>(`/api/search?q=${encodeURIComponent(q)}`),
 
   decide: (id: number, approved: boolean, notes?: string, schedule?: ScheduleOptions, edits?: ScopeEdits) =>

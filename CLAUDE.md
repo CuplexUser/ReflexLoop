@@ -223,6 +223,20 @@ on). A directive is consumed — injected into one research prompt, then cleared
   search instead of throwing. Model + dimension aren't hardcoded (Qdrant Cloud's free model lineup and
   each model's vector size are only listed per-cluster, in the Cloud Console's Inference tab), so both
   are required env config.
+- `tool-output.ts` — reading a field back out of `actions.tool_output`, which has carried **two**
+  storage shapes: MCP content blocks (`[{type,text}]`) under the old Agent SDK, and a plain
+  double-encoded string since `agent-loop.ts` replaced it. Both are still in the DB, so anything
+  extracting a URL has to handle both — the Actions page's result links were empty for every
+  post-SDK action because the extractor only knew the first shape. New readers of tool output go
+  through `parseToolResult` rather than parsing the column themselves.
+- `deliverables.ts` — derives "what has this agent actually built" from act-phase actions on approved
+  proposals: one record per proposal, carrying its repo / live deployment / PR as typed artifacts.
+  Purely derived on read (`GET /api/deliverables`), so it can't disagree with the action log and adds
+  no state to maintain. Deterministic on purpose: every artifact comes from a write tool's own
+  result (or, for commits, its `owner`/`repo` input), never from scanning outcome notes or model prose
+  for things that look like links. `DELIVERABLE_TOOLS` is both the SQL filter in
+  `store.listDeliverableActions()` and the switch in `buildDeliverables`, so the two can't drift.
+  Unit-tested (`deliverables.test.ts`) — it's pure functions over rows, no API key needed.
 - `integrations/{github,vercel,netlify}.ts` + `integrations-server.ts` — thin API wrappers and the tools
   that expose them (`buildIntegrationsTools()`). Read-only tools (`github_read_repo`, `vercel_list_projects`, etc.) are free for the research
   phase to call. Write tools (`github_create_repo`, `vercel_deploy`, `netlify_deploy`, etc.) only work in
@@ -252,11 +266,21 @@ on). A directive is consumed — injected into one research prompt, then cleared
 React + TypeScript + Ant Design, linted with oxlint, talking to `src/server.ts` over REST
 (`web/src/api.ts`) and WebSocket (`web/src/useAgentSocket.ts`). Pages live in `web/src/pages/`: Dashboard
 (pending proposals + stat tiles + recent activity), Live feed (full filterable activity stream),
-Proposals (full history, bulk approve/reject, click a row for `ProposalDialog`), Actions (every tool call
+Proposals (full history, bulk approve/reject, click a row for `ProposalDialog`), **Deliverables**,
+Actions (every tool call
 on an *approved* proposal — action type, an input-derived description, and a browsable result URL when
 the tool returned one; phase-filterable, click a row for full input/output JSON via `ActionDialog`),
 Economics (spend over time, spend by phase, spend by provider/model, per-domain scoreboard with
 forecast accuracy), Lessons, Research notes, Agent control.
+
+**Deliverables vs Actions — two different questions.** Actions answers "what did it do, call by call",
+and that's what it should keep doing. Deliverables answers "what exists now, and where do I click to
+see it": one card per approved proposal that produced something reachable, with every artifact as a
+real anchor on the card face. The links used to be four interactions deep (scroll the wide table →
+expand the row → scroll right to a column that's off-screen at the arriving scroll position → open a
+dialog), which is indistinguishable from their not being there. If you add a write tool that creates
+something browsable, teach `deliverables.ts` about it — otherwise the thing it builds is reachable
+only from raw JSON.
 
 **No vendor names in the UI.** The loop is provider-neutral and the provider is a config switch, so a
 label like "Claude API spend" is wrong the moment someone points `AGENT_PROVIDER` elsewhere — and the

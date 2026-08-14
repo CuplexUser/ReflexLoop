@@ -69,7 +69,9 @@ function ExpandedActions({
 
   const { columns, components, scroll } = useResizableColumns<ActionWithProposal>('action-detail', [
     { title: 'Action', dataIndex: 'tool_name', width: 140, render: (v: string) => actionLabel(v) },
-    { title: 'Description', ellipsis: true, render: (_, a) => actionDescription(a.tool_name, a.tool_input) },
+    // Ahead of Description on purpose: this sits inside the outer table's horizontal scroll,
+    // so a column parked on the right is off-screen at the scroll position you arrive at --
+    // which made the result links look like they didn't exist.
     {
       title: 'Result',
       width: 110,
@@ -82,6 +84,7 @@ function ExpandedActions({
           <Typography.Text type="secondary">—</Typography.Text>
         ),
     },
+    { title: 'Description', ellipsis: true, render: (_, a) => actionDescription(a.tool_name, a.tool_input) },
     { title: 'When', width: 110, render: (_, a) => timeAgo(a.occurred_at) },
   ])
 

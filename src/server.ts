@@ -27,6 +27,7 @@ import { emitAgentEvent, onAgentEvent, type AgentEvent } from "./events.js";
 import { submitDecision, hasPendingDecision } from "./review-gateway.js";
 import { fireReactiveTrigger } from "./reactive-triggers.js";
 import { ALL_GRANTABLE_TOOLS, toolRisk } from "./tool-catalog.js";
+import { buildDeliverables, type DeliverableOutcomeRow } from "./deliverables.js";
 import {
   getControlState,
   requestAbort,
@@ -411,6 +412,23 @@ export function startServer(store: MemoryStore, port: number): Server {
     res.json(store.listActionsForApprovedProposals());
   });
 
+  /**
+   * What the agent has actually built, one record per approved proposal that produced
+   * something reachable. Derived on read from the same action rows the Actions page
+   * shows -- no separate state to keep in step -- but the heavy JSON (committed file
+   * contents, fetched pages) is parsed here and never crosses the wire.
+   */
+  app.get("/api/deliverables", (_req, res) => {
+    res.json(
+      buildDeliverables(
+        store.listDeliverableActions(),
+        store.listAllProposals(),
+        store.listOutcomes() as unknown as DeliverableOutcomeRow[],
+        store.actActionCounts()
+      )
+    );
+  });
+
   // ---- runtime control ------------------------------------------------------
   //
   // Everything here either reduces what the agent does (pause, abort) or changes
@@ -483,6 +501,15 @@ export function startServer(store: MemoryStore, port: number): Server {
     }
     setDirective(directive === null || !directive.trim() ? null : directive.trim());
     res.json({ ok: true, control: getControlState() });
+  });
+
+  // An /api path that matched nothing above is a 404, and has to say so *before* the SPA
+  // fallback below sees it -- otherwise an unknown endpoint answers 200 with index.html,
+  // the console's fetch fails on parsing HTML as JSON, and the page renders as though the
+  // server had legitimately returned nothing. That is exactly how a console running ahead
+  // of a not-yet-restarted backend presents itself: an empty page with no error anywhere.
+  app.use("/api", (req: Request, res: Response) => {
+    res.status(404).json({ error: `No such endpoint: ${req.method} /api${req.path}` });
   });
 
   // Serve the built frontend, if present (npm run build in web/). In dev,

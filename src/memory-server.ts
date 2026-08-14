@@ -17,6 +17,10 @@ import { z } from "zod";
 import { defineTool, namespaceTools, type ToolDefinition } from "./tools/registry.js";
 import { emitAgentEvent } from "./events.js";
 import { deletePoint, qdrantAvailable, searchByText, upsertText } from "./qdrant.js";
+// tool_output has carried two storage shapes across this project's life and both are
+// still in the DB; tool-output.ts is the single place that knows how to read either.
+import { extractResultUrl } from "./tool-output.js";
+import { DELIVERABLE_TOOLS, type DeliverableActionRow } from "./deliverables.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS research_notes (
@@ -471,6 +475,37 @@ export class MemoryStore {
       )
       .all(limit) as unknown as ActionWithProposalRow[];
     return rows.map((r) => ({ ...r, result_url: extractResultUrl(r.tool_output) }));
+  }
+
+  /**
+   * The act-phase calls that can produce a browsable artifact -- what buildDeliverables
+   * turns into the Deliverables page. Narrowed to those tool names in SQL rather than
+   * filtered in JS because the rows this skips are the fat ones: a WebFetch of a whole
+   * page, or a research note's full text, none of which can name a repo or a deployment.
+   */
+  listDeliverableActions(): DeliverableActionRow[] {
+    const tools = DELIVERABLE_TOOLS.map(() => "?").join(",");
+    return this.db
+      .prepare(
+        `SELECT a.id, a.proposal_id, a.tool_name, a.tool_input, a.tool_output, a.occurred_at
+         FROM actions a JOIN proposals p ON p.id = a.proposal_id
+         WHERE p.status = 'approved' AND a.phase = 'act' AND a.tool_name IN (${tools})
+         ORDER BY a.occurred_at ASC`
+      )
+      .all(...DELIVERABLE_TOOLS) as unknown as DeliverableActionRow[];
+  }
+
+  /** Act-phase calls per approved proposal -- the full trail size behind each deliverable. */
+  actActionCounts(): Map<number, number> {
+    const rows = this.db
+      .prepare(
+        `SELECT a.proposal_id, COUNT(*) AS n
+         FROM actions a JOIN proposals p ON p.id = a.proposal_id
+         WHERE p.status = 'approved' AND a.phase = 'act'
+         GROUP BY a.proposal_id`
+      )
+      .all() as unknown as { proposal_id: number; n: number }[];
+    return new Map(rows.map((r) => [r.proposal_id, r.n]));
   }
 
   /**
@@ -1047,26 +1082,6 @@ function safeParseJson(raw: string | null): unknown {
     return JSON.parse(raw);
   } catch {
     return raw;
-  }
-}
-
-/**
- * Tool results that create/deploy something (github_create_repo, github_create_pr,
- * vercel_deploy, netlify_create_site, netlify_deploy) all return a plain `url` field.
- * tool_output is stored as the raw PostToolUse `tool_response` -- an MCP content-block
- * array whose text is itself a JSON-stringified result object -- so this unwraps both
- * layers and pulls `url` out generically rather than switching on tool name.
- */
-function extractResultUrl(toolOutput: string | null): string | null {
-  if (!toolOutput) return null;
-  try {
-    const content = JSON.parse(toolOutput) as { type?: string; text?: string }[];
-    const text = Array.isArray(content) ? content.find((c) => c?.type === "text")?.text : undefined;
-    if (!text) return null;
-    const data = JSON.parse(text) as { url?: unknown };
-    return typeof data?.url === "string" ? data.url : null;
-  } catch {
-    return null;
   }
 }
 

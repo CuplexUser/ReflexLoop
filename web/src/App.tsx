@@ -10,6 +10,7 @@ import {
   FileTextOutlined,
   FundOutlined,
   MoonOutlined,
+  RocketOutlined,
   SearchOutlined,
   SunOutlined,
   ThunderboltOutlined,
@@ -35,6 +36,7 @@ import type { OutcomeRow, ProposalRow, StatusResponse } from './types'
 const LiveFeedPage = lazy(() => import('./pages/LiveFeedPage').then((m) => ({ default: m.LiveFeedPage })))
 const ProposalsPage = lazy(() => import('./pages/ProposalsPage').then((m) => ({ default: m.ProposalsPage })))
 const ActionsPage = lazy(() => import('./pages/ActionsPage').then((m) => ({ default: m.ActionsPage })))
+const DeliverablesPage = lazy(() => import('./pages/DeliverablesPage').then((m) => ({ default: m.DeliverablesPage })))
 const LessonsPage = lazy(() => import('./pages/LessonsPage').then((m) => ({ default: m.LessonsPage })))
 const ResearchPage = lazy(() => import('./pages/ResearchPage').then((m) => ({ default: m.ResearchPage })))
 const EconomicsPage = lazy(() => import('./pages/EconomicsPage').then((m) => ({ default: m.EconomicsPage })))
@@ -43,13 +45,23 @@ const ControlPage = lazy(() => import('./pages/ControlPage').then((m) => ({ defa
 // Only mounts on Cmd-K, so its modal + search plumbing has no business in the initial payload.
 const CommandPalette = lazy(() => import('./components/CommandPalette').then((m) => ({ default: m.CommandPalette })))
 
-type PageKey = 'dashboard' | 'live' | 'proposals' | 'actions' | 'economics' | 'lessons' | 'research' | 'control'
+type PageKey =
+  | 'dashboard'
+  | 'live'
+  | 'proposals'
+  | 'deliverables'
+  | 'actions'
+  | 'economics'
+  | 'lessons'
+  | 'research'
+  | 'control'
 
 /** Nav key -> the path its menu item goes to. Routes below also accept a trailing /:id for deep links. */
 const PAGE_PATHS: Record<PageKey, string> = {
   dashboard: '/',
   live: '/live',
   proposals: '/proposals',
+  deliverables: '/deliverables',
   actions: '/actions',
   economics: '/economics',
   lessons: '/lessons',
@@ -166,6 +178,7 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
                 </Badge>
               ),
             },
+            { key: 'deliverables', icon: <RocketOutlined />, label: 'Deliverables' },
             { key: 'actions', icon: <ThunderboltOutlined />, label: 'Actions' },
             { key: 'economics', icon: <FundOutlined />, label: 'Economics' },
             { key: 'lessons', icon: <BulbOutlined />, label: 'Lessons' },
@@ -218,6 +231,16 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
                 <Route path="/live" element={<LiveFeedPage feed={socket.feed} />} />
                 <Route path="/proposals" element={<ProposalsPage proposals={proposals} outcomes={outcomes} />} />
                 <Route path="/proposals/:id" element={<ProposalsPage proposals={proposals} outcomes={outcomes} />} />
+                <Route
+                  path="/deliverables"
+                  element={
+                    <DeliverablesPage
+                      historyVersion={socket.historyVersion}
+                      proposals={proposals}
+                      onSetReview={setProposalReview}
+                    />
+                  }
+                />
                 <Route
                   path="/actions"
                   element={

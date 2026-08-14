@@ -96,6 +96,40 @@ export interface ActionWithProposal {
   result_url: string | null
 }
 
+export type ArtifactKind = 'site' | 'repo' | 'pull_request'
+export type ArtifactProvider = 'github' | 'vercel' | 'netlify'
+
+/** One reachable thing an approved proposal produced -- a repo, a deployment, a PR. */
+export interface DeliverableArtifact {
+  kind: ArtifactKind
+  provider: ArtifactProvider
+  label: string
+  url: string
+  /** "production" / "preview" / "merged" / "open", when the artifact has one. */
+  detail: string | null
+  occurredAt: string
+  actionId: number
+}
+
+/** What one approved proposal actually built, derived server-side from its act-phase actions. */
+export interface Deliverable {
+  proposalId: number
+  domain: string
+  description: string
+  name: string | null
+  reviewStatus: 'mvp_done' | 'needs_refinement' | null
+  priority: Priority
+  artifacts: DeliverableArtifact[]
+  siteUrl: string | null
+  repoUrl: string | null
+  filesCommitted: number
+  commits: number
+  actionCount: number
+  startedAt: string
+  lastActivityAt: string
+  outcome: { success: boolean; revenue: number; cost: number; notes: string | null; recordedAt: string } | null
+}
+
 export interface StatusResponse {
   domains: string[]
   totalCostUsd: number

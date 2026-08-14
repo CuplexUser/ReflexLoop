@@ -83,7 +83,9 @@ const ACTION_LABEL: Record<string, string> = {
   github_create_repo: 'Create repo',
   github_create_branch: 'Create branch',
   github_commit_file: 'Commit file',
+  github_commit_files: 'Commit files',
   github_create_pr: 'Open PR',
+  github_merge_pr: 'Merge PR',
   vercel_list_projects: 'List projects',
   vercel_get_project: 'Get project',
   vercel_deploy: 'Deploy',
@@ -127,6 +129,15 @@ export function actionDescription(toolName: string, inputRaw: string | null): st
       return `${input.owner}/${input.repo} → ${input.branch}`
     case 'github_commit_file':
       return `${input.owner}/${input.repo}@${input.branch}: ${input.path}`
+    case 'github_commit_files': {
+      const files = Array.isArray(input.files) ? (input.files as { path?: string }[]) : []
+      return `${input.owner}/${input.repo}@${input.branch}: ${files.length} files (${files
+        .slice(0, 3)
+        .map((f) => f.path)
+        .join(', ')}${files.length > 3 ? ', …' : ''})`
+    }
+    case 'github_merge_pr':
+      return `${input.owner}/${input.repo}: PR #${input.pullNumber} (${input.mergeMethod ?? 'squash'})`
     case 'github_create_pr':
       return `${input.owner}/${input.repo}: "${input.title}" (${input.head} → ${input.base})`
     case 'vercel_get_project':
