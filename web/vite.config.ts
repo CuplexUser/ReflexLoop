@@ -9,26 +9,20 @@ export default defineConfig({
   build: {
     rolldownOptions: {
       output: {
-        // An entries-aware group names each chunk after every route sharing it, which produces
-        // 100+ character filenames. Trim to the group prefix and let the hash disambiguate.
-        chunkFileNames: (chunk) => `assets/${(chunk.name ?? 'chunk').slice(0, 24)}-[hash].js`,
         codeSplitting: {
           groups: [
             // React and the router are needed before anything renders, so they get their own
             // long-lived chunks rather than riding along with app code that changes every commit.
             { name: 'react', test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/, priority: 30 },
             { name: 'router', test: /node_modules[\\/]react-router/, priority: 30 },
-            // antd is ~70% of the bundle. `entriesAware` splits it by which routes actually pull
-            // each part in, so the Table/Form/DatePicker machinery only a couple of pages use
-            // lands beside those pages instead of in everyone's first load. The merge threshold
-            // folds the resulting slivers back together so this doesn't become 30 tiny requests.
-            {
-              name: 'antd',
-              test: /node_modules[\\/](antd|@ant-design|rc-[^\\/]+|@rc-component)[\\/]/,
-              priority: 20,
-              entriesAware: true,
-              entriesAwareMergeThreshold: 40 * 1024,
-            },
+            // antd is ~70% of the bundle, and splitting it by route (`entriesAware`) is tempting.
+            // Don't: it partitions antd into chunks that import each other *circularly*, and antd
+            // has module-level initialization that can't survive an ESM cycle -- `modal/locale`
+            // does `{...enUS.Modal}` at the top level, which runs before the chunk holding `en_US`
+            // is evaluated and throws "Cannot read properties of undefined (reading 'Modal')".
+            // That kills the whole render, so the console serves a blank page in production while
+            // `npm run web:dev` (no chunking) looks fine. One antd chunk, cached across deploys.
+            { name: 'antd', test: /node_modules[\\/](antd|@ant-design|rc-[^\\/]+|@rc-component)[\\/]/, priority: 20 },
             { name: 'vendor', test: /node_modules/, priority: 10 },
           ],
         },

@@ -262,18 +262,21 @@ alongside the hex, since `rgba()` can't take a `var()` holding `#rrggbb`.
 keys off the first path segment, so `/proposals/12` still selects Proposals. New detail views should
 follow this rather than holding the selected row in local state.
 
-**Bundle splitting.** antd is ~70% of the console's JavaScript, so a single bundle was 1.3 MB. Two
-things keep it down, and they only work together. `App.tsx` loads every route except the landing
-Dashboard through `React.lazy` (and the Cmd-K palette, and `SchedulePriorityFields` inside
-`DecisionControls`, since `DatePicker` drags dayjs in for a control that renders on a click) — **add
-new pages the same way**; a static page import puts that page's whole antd surface back in everyone's
-first load. `vite.config.ts` then splits `node_modules` into groups, and the antd group is
-`entriesAware`, meaning rolldown partitions antd by *which routes actually reach each part* rather than
-merging it into one chunk every entry must download. Without the lazy routes there is only one entry,
-so `entriesAware` has nothing to partition by and the split collapses back to one chunk. The
-`chunkFileNames` truncation is cosmetic: entries-aware chunks are named after every route sharing them,
-which runs past 100 characters. Chunks and the whole `dist/` listing are what `npm run web:build`
-prints — check it after touching either half.
+**Bundle splitting.** `App.tsx` loads every route except the landing Dashboard through `React.lazy`
+(and the Cmd-K palette, and `SchedulePriorityFields` inside `DecisionControls`, since `DatePicker`
+drags dayjs in for a control that renders on a click) — **add new pages the same way**, so app code
+for a page you aren't on isn't in the first load. `vite.config.ts` then splits `node_modules` into a
+few long-lived chunks: `react`, `router`, `antd` (~1 MB / 320 KB gzip, ~70% of the console's JS), and
+`vendor` for the rest.
+
+**Don't try to split the antd chunk by route.** rolldown's `entriesAware` grouping does exactly that,
+and it partitions antd into chunks that import each other *circularly* — which antd cannot survive,
+because `modal/locale` does `{...enUS.Modal}` at module top level and that runs before the chunk
+holding `en_US` is evaluated. The result is `Uncaught TypeError: Cannot read properties of undefined
+(reading 'Modal')` before React mounts, i.e. **a blank page in production only** — `npm run web:dev`
+does no chunking, so it looks fine there. If you touch the chunking, verify a real build, not just
+the dev server. Chunks and the whole `dist/` listing are what `npm run web:build` prints; it warns
+about the antd chunk exceeding 500 KB, and that warning is expected.
 
 **Table plumbing.** Pages call `useTableView(storageKey, columns)`, which wraps `useResizableColumns`
 and adds column show/hide, density, and page size (all persisted per table), returning `tableProps` to
