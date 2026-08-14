@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS outcomes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   proposal_id INTEGER NOT NULL REFERENCES proposals(id),
   actual_revenue REAL NOT NULL DEFAULT 0,
-  actual_cost REAL NOT NULL DEFAULT 0,    -- include Claude API spend, not just external cost
+  actual_cost REAL NOT NULL DEFAULT 0,    -- include model API spend, not just external cost
   actual_time_hours REAL,
   success INTEGER NOT NULL,               -- 0 or 1
   notes TEXT,
@@ -662,7 +662,7 @@ export class MemoryStore {
     return this.db.prepare(`SELECT * FROM runs ORDER BY started_at DESC LIMIT ?`).all(limit) as unknown as RunRow[];
   }
 
-  /** Every phase run charged to one proposal -- what it actually cost in Claude API spend, vs its estimate. */
+  /** Every phase run charged to one proposal -- what it actually cost in model API spend, vs its estimate. */
   listRunsForProposal(proposalId: number) {
     return this.db
       .prepare(`SELECT * FROM runs WHERE proposal_id = ? ORDER BY started_at ASC`)
@@ -677,10 +677,16 @@ export class MemoryStore {
   // ---- economics ----------------------------------------------------------
   //
   // The loop's whole premise is that spend counts against profit, so these join
-  // Claude API spend (runs) to self-reported outcomes rather than reporting either
+  // model API spend (runs) to self-reported outcomes rather than reporting either
   // in isolation. `net` is the only number that answers "is this thing paying for
   // itself": revenue minus the agent's own reported cost minus what it cost in API
   // spend to produce.
+  //
+  // The console has to be able to show *where* a total came from, not just the total:
+  // `runs` accumulates across provider switches and across rows written before
+  // `provider`/`model` were recorded at all, so a lifetime figure on its own is a
+  // number nobody can reconcile. `spendByModel` and `unattributedSpend` exist so the
+  // headline decomposes into parts that add back up to it.
 
   spendByPhase() {
     return this.db
@@ -692,7 +698,37 @@ export class MemoryStore {
       .all() as unknown as { phase: string; runs: number; cost_usd: number; duration_ms: number }[];
   }
 
-  /** Daily Claude API spend, oldest first -- the series behind the spend-over-time chart. */
+  /**
+   * Spend split by the provider/model that produced it. `provider`/`model` are nullable --
+   * rows written before those columns existed have neither, and they are reported as their own
+   * bucket rather than folded into whatever is configured now, which would misattribute an
+   * earlier provider's spend to the current one.
+   */
+  spendByModel() {
+    return this.db
+      .prepare(
+        `SELECT provider, model, COUNT(*) AS runs, COALESCE(SUM(cost_usd), 0) AS cost_usd,
+                MIN(started_at) AS first_at, MAX(started_at) AS last_at
+         FROM runs GROUP BY provider, model ORDER BY cost_usd DESC`
+      )
+      .all() as unknown as ModelSpendRow[];
+  }
+
+  /**
+   * Spend on runs charged to no proposal -- research/plan cycles, which run before anything
+   * has been proposed. It is usually most of the total, and it is exactly the gap between the
+   * domain scoreboard's `api_spend` column (which can only see runs that have a proposal) and
+   * the lifetime figure, so the console can state the difference instead of leaving it as an
+   * unexplained shortfall.
+   */
+  unattributedSpend(): number {
+    const row = this.db
+      .prepare(`SELECT COALESCE(SUM(cost_usd), 0) AS total FROM runs WHERE proposal_id IS NULL`)
+      .get() as { total: number };
+    return row.total;
+  }
+
+  /** Daily model API spend, oldest first -- the series behind the spend-over-time chart. */
   spendOverTime(days = 30) {
     return this.db
       .prepare(
@@ -842,7 +878,21 @@ export interface DomainScoreRow {
   api_spend: number;
 }
 
-/** One phase run of the loop, with the Claude API cost it incurred -- spend counts against profit. */
+/**
+ * Lifetime spend on one provider/model pair. Both are null for runs recorded before the
+ * columns existed, which the console labels rather than silently attributing to the current
+ * provider.
+ */
+export interface ModelSpendRow {
+  provider: string | null;
+  model: string | null;
+  runs: number;
+  cost_usd: number;
+  first_at: string;
+  last_at: string;
+}
+
+/** One phase run of the loop, with the model API cost it incurred -- spend counts against profit. */
 interface RunRow {
   id: number;
   proposal_id: number | null;

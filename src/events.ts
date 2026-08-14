@@ -20,6 +20,12 @@ export type AgentEvent =
   | { type: "scheduled_run_starting"; proposal: ProposalRow }
   | { type: "outcome_recorded"; proposalId: number }
   | { type: "lesson_saved"; domain: string }
+  // A research cycle that proposes nothing is a legitimate outcome, but it used to be
+  // indistinguishable from a broken loop: stdout said "No proposal this cycle" and the
+  // console showed nothing at all between phase_done and cycle_idle. `toolCalls` is
+  // carried because zero of them means something different -- the phase never researched
+  // anything, which is a failure, not a decision.
+  | { type: "no_proposal"; reason: string; toolCalls: number }
   | { type: "cycle_idle"; nextCycleAt: string };
 
 const bus = new EventEmitter();

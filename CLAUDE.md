@@ -101,6 +101,13 @@ Each cycle: **research + plan → human review → act → outcome + reflect**.
   `AGENT_DOMAINS` per cycle and create 0-3 proposals; not forced to cover domains evenly. Calls
   `lesson_search`/`research_note_search` first so it doesn't re-research what's already known, and
   `action_history_search` to see what's already been built/deployed so it doesn't propose duplicate work.
+  Proposing **zero** is a legitimate result — the prompt tells it not to force a weak proposal, and a
+  domain whose ideas keep getting rejected will eventually stop producing any. That state used to be
+  invisible (stdout only), which is indistinguishable from a broken loop, so a cycle that creates
+  nothing now emits a `no_proposal` event carrying the model's own stated reason. It also carries the
+  phase's tool-call count, because **zero tool calls is a different thing entirely** — the phase never
+  researched at all (an empty or failed model response) and the console says so rather than reporting
+  it as a considered decision.
 - **human review** (`humanReviewPhase`) — emits a `proposal_pending` event and blocks on
   `waitForDecision()` (`review-gateway.ts`), resolved when a person clicks Approve/Reject in the web UI
   (`POST /api/proposals/:id/decision`). Multiple proposals can be under review concurrently, each on its
@@ -238,8 +245,19 @@ React + TypeScript + Ant Design, linted with oxlint, talking to `src/server.ts` 
 Proposals (full history, bulk approve/reject, click a row for `ProposalDialog`), Actions (every tool call
 on an *approved* proposal — action type, an input-derived description, and a browsable result URL when
 the tool returned one; phase-filterable, click a row for full input/output JSON via `ActionDialog`),
-Economics (spend over time, spend by phase, per-domain scoreboard with forecast accuracy), Lessons,
-Research notes, Agent control.
+Economics (spend over time, spend by phase, spend by provider/model, per-domain scoreboard with
+forecast accuracy), Lessons, Research notes, Agent control.
+
+**No vendor names in the UI.** The loop is provider-neutral and the provider is a config switch, so a
+label like "Claude API spend" is wrong the moment someone points `AGENT_PROVIDER` elsewhere — and the
+`runs` table outlives the switch, so a lifetime total legitimately spans several providers plus rows
+written before `provider`/`model` were recorded at all (those are nullable, and are reported as their
+own "unrecorded" bucket rather than credited to whatever is configured now). Spend is "model API
+spend", and `GET /api/economics` returns `spendByModel` so the total decomposes into who was actually
+paid. `unattributedSpend` is there for the same reason: the domain scoreboard can only see spend
+charged to a proposal, and research/plan runs never are, so the page states the remainder instead of
+leaving a gap between the column and the headline. Any figure the console derives (Net) prints its
+inputs next to it — a number the operator can't reconstruct is one they can't trust.
 
 **Theming.** Components import `palette` from `web/src/theme.ts` and get **CSS variables**
 (`var(--rl-approved)`, etc.), so a theme switch repaints without re-rendering. Ant Design can't use

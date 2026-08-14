@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Card, Col, Empty, Row, Space, Statistic, Table, Tag, Tooltip, Typography } from 'antd'
-import type { DomainScore, EconomicsResponse, OutcomeRow } from '../types'
+import type { DomainScore, EconomicsResponse, ModelSpend, OutcomeRow } from '../types'
 import { api } from '../api'
 import { money } from '../format'
 import { palette } from '../theme'
@@ -37,6 +37,18 @@ function SpendSparkbars({ data }: { data: { day: string; cost_usd: number }[] })
   )
 }
 
+/**
+ * `runs` only started recording provider/model partway through, and the column is nullable, so
+ * rows from before that have neither. Labelling them as whatever is configured now would credit
+ * one provider with another's spend — they get their own name instead.
+ */
+function modelLabel(row: ModelSpend): { provider: string; model: string } {
+  return {
+    provider: row.provider ?? 'unrecorded provider',
+    model: row.model ?? 'model not recorded',
+  }
+}
+
 /** Revenue vs the model's own forecast for the same proposals — how well it predicts its upside. */
 function forecastAccuracy(row: DomainScore): { label: string; color: string } {
   if (row.outcomes === 0 || row.forecast_upside === 0) return { label: '—', color: palette.textMuted }
@@ -63,8 +75,26 @@ export function EconomicsPage({ historyVersion, outcomes }: { historyVersion: nu
   const reportedCost = outcomes.reduce((sum, o) => sum + o.actual_cost, 0)
   const apiSpend = data?.totalCostUsd ?? 0
   // The number the whole loop is judged on: what it earned, minus what it said it spent,
-  // minus what it cost in Claude API spend to produce any of it.
+  // minus what it cost in model API spend to produce any of it. Its three inputs are printed
+  // under it, because a lone figure here is one nobody can check against the tiles beside it.
   const net = revenue - reportedCost - apiSpend
+
+  // Spend is lifetime and accumulates across provider switches, so name the providers behind
+  // the total rather than implying it all came from whichever one is configured today.
+  const providerSummary = useMemo(() => {
+    const byProvider = new Map<string, number>()
+    for (const row of data?.spendByModel ?? []) {
+      const { provider } = modelLabel(row)
+      byProvider.set(provider, (byProvider.get(provider) ?? 0) + row.cost_usd)
+    }
+    return [...byProvider.entries()].sort((a, b) => b[1] - a[1])
+  }, [data?.spendByModel])
+
+  // The scoreboard below can only attribute spend that was charged to a proposal; research
+  // and planning run before one exists. Stating the remainder is what makes the column and
+  // the headline reconcile instead of looking like one of them is wrong.
+  const unattributed = data?.unattributedSpend ?? 0
+  const attributed = apiSpend - unattributed
 
   const baseColumns = useMemo(
     () => [
@@ -154,47 +184,80 @@ export function EconomicsPage({ historyVersion, outcomes }: { historyVersion: nu
   return (
     <Space direction="vertical" size={20} style={{ width: '100%' }}>
       <Row gutter={[16, 16]}>
+        {/* Both of these are the agent's own claims, not measurements -- nothing in the system
+            observes real money. Saying so on the tile matters more than it looks: they are two
+            of the three inputs to Net, and the third (API spend) *is* measured, so a reader who
+            assumes they're all the same kind of number will over-trust the result. */}
         <Col xs={24} sm={12} lg={6}>
           <Card size="small">
-            <Statistic title="Reported revenue" value={revenue} precision={2} prefix="$" valueStyle={{ fontSize: 22 }} />
+            <Tooltip
+              title={`Self-reported: the sum of actualRevenue across ${outcomes.length} outcome${outcomes.length === 1 ? '' : 's'} the agent recorded via outcome_record at the end of an act phase. No payment processor is connected, so nothing here is measured.`}
+            >
+              <Statistic
+                title="Reported revenue"
+                value={revenue}
+                precision={2}
+                prefix="$"
+                valueStyle={{ fontSize: 22 }}
+              />
+            </Tooltip>
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
           <Card size="small">
-            <Statistic title="Reported cost" value={reportedCost} precision={2} prefix="$" valueStyle={{ fontSize: 22 }} />
+            <Tooltip title="Self-reported: external costs the agent says the work incurred (hosting, services). Model API spend is measured separately and is the tile to the right.">
+              <Statistic
+                title="Reported cost"
+                value={reportedCost}
+                precision={2}
+                prefix="$"
+                valueStyle={{ fontSize: 22 }}
+              />
+            </Tooltip>
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
           <Card size="small">
             <Statistic
-              title="Claude API spend"
+              title="Model API spend"
               value={apiSpend}
               precision={4}
               prefix="$"
               valueStyle={{ color: palette.active, fontSize: 22 }}
             />
+            <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+              {providerSummary.length === 0
+                ? 'no runs recorded yet'
+                : providerSummary.map(([provider, cost]) => `${provider} ${money(cost)}`).join(' · ')}
+            </Typography.Text>
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
           <Card size="small">
             <Statistic
-              title="Net (revenue − cost − spend)"
+              title="Net"
               value={net}
               precision={2}
               prefix="$"
               valueStyle={{ color: net >= 0 ? palette.approved : palette.rejected, fontSize: 22 }}
             />
+            <Typography.Text type="secondary" className="mono" style={{ fontSize: 11 }}>
+              {money(revenue)} revenue − {money(reportedCost)} cost − {money(apiSpend)} API spend
+            </Typography.Text>
           </Card>
         </Col>
       </Row>
 
       <Row gutter={[16, 16]}>
-        <Col xs={24} lg={14}>
-          <Card size="small" title="Daily Claude API spend" loading={loading}>
+        <Col xs={24}>
+          <Card size="small" title="Daily model API spend" loading={loading}>
             <SpendSparkbars data={data?.spendOverTime ?? []} />
           </Card>
         </Col>
-        <Col xs={24} lg={10}>
+      </Row>
+
+      <Row gutter={[16, 16]}>
+        <Col xs={24} lg={12}>
           <Card size="small" title="Spend by phase" loading={loading}>
             {(data?.spendByPhase ?? []).length === 0 ? (
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No runs recorded yet" />
@@ -209,6 +272,48 @@ export function EconomicsPage({ historyVersion, outcomes }: { historyVersion: nu
                     </Typography.Text>
                   </Space>
                 ))}
+              </Space>
+            )}
+          </Card>
+        </Col>
+        <Col xs={24} lg={12}>
+          {/* Spend is lifetime, and the provider is a config switch -- this is where a total
+              that looks too big becomes explicable, by showing which provider and which era
+              of runs it actually came from. */}
+          <Card size="small" title="Spend by model" loading={loading}>
+            {(data?.spendByModel ?? []).length === 0 ? (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="No runs recorded yet" />
+            ) : (
+              <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                {data?.spendByModel.map((m) => {
+                  const { provider, model } = modelLabel(m)
+                  const unknown = m.provider === null
+                  return (
+                    <Space
+                      key={`${m.provider ?? '?'}/${m.model ?? '?'}`}
+                      style={{ width: '100%', justifyContent: 'space-between' }}
+                    >
+                      <Tooltip
+                        title={
+                          unknown
+                            ? `${m.runs} run${m.runs === 1 ? '' : 's'} recorded before the provider/model was tracked, ${m.first_at.slice(0, 10)} to ${m.last_at.slice(0, 10)}`
+                            : `${m.first_at.slice(0, 10)} to ${m.last_at.slice(0, 10)}`
+                        }
+                      >
+                        <Typography.Text style={{ color: unknown ? palette.textMuted : undefined }}>
+                          {provider}
+                          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                            {' '}
+                            · {model}
+                          </Typography.Text>
+                        </Typography.Text>
+                      </Tooltip>
+                      <Typography.Text type="secondary" className="mono" style={{ fontSize: 12 }}>
+                        {m.runs} run{m.runs === 1 ? '' : 's'} · ${m.cost_usd.toFixed(4)}
+                      </Typography.Text>
+                    </Space>
+                  )
+                })}
               </Space>
             )}
           </Card>
@@ -248,6 +353,11 @@ export function EconomicsPage({ historyVersion, outcomes }: { historyVersion: nu
           locale={{ emptyText: 'No proposals yet' }}
           {...tableProps}
         />
+        <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
+          The API spend column adds up to {money(attributed)} of {money(apiSpend)}. The other{' '}
+          {money(unattributed)} is research and planning, which runs before any proposal exists and so
+          belongs to no domain — it still counts against Net.
+        </Typography.Text>
       </div>
     </Space>
   )

@@ -7,6 +7,7 @@ import { palette } from '../theme'
 function lineColor(type: AgentEvent['type']): string {
   switch (type) {
     case 'proposal_pending':
+    case 'no_proposal':
       return palette.pending
     case 'proposal_decided':
     case 'phase_done':
@@ -42,6 +43,12 @@ function renderLine(event: AgentEvent): string {
       return `$ outcome recorded for proposal #${event.proposalId}`
     case 'lesson_saved':
       return `◆ lesson saved — domain: ${event.domain}`
+    case 'no_proposal':
+      // Zero tool calls means the phase never researched anything -- that's a failed run
+      // dressed up as a quiet one, and it should not read like a considered decision.
+      return event.toolCalls === 0
+        ? `✗ no proposal — the research phase ran no tools and returned nothing; the model call likely failed`
+        : `○ no proposal this cycle (${event.toolCalls} tool calls) — ${preview(event.reason, 300)}`
     case 'cycle_idle':
       return `… idle until ${new Date(event.nextCycleAt).toLocaleTimeString()}`
     default:

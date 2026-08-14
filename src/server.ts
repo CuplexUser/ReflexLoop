@@ -389,9 +389,13 @@ export function startServer(store: MemoryStore, port: number): Server {
   app.get("/api/economics", (_req, res) => {
     res.json({
       spendByPhase: store.spendByPhase(),
+      spendByModel: store.spendByModel(),
       spendOverTime: store.spendOverTime(),
       domains: store.domainScoreboard(),
       totalCostUsd: store.totalRunCost(),
+      // Sent alongside the total so the console can account for the whole of it: the domain
+      // scoreboard only sees spend charged to a proposal, and research/plan runs never are.
+      unattributedSpend: store.unattributedSpend(),
     });
   });
 

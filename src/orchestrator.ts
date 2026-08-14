@@ -128,13 +128,16 @@ async function runPhase(opts: {
   maxTurns: number;
   proposalId: number | null;
   signal?: AbortSignal;
-}): Promise<{ finalText: string; costUsd: number }> {
+}): Promise<{ finalText: string; costUsd: number; toolCalls: number }> {
   // An aborted run still gets its cost and duration logged below -- spend already
   // incurred counts against profit whether or not the phase finished.
   const startedAt = new Date().toISOString();
   const t0 = Date.now();
   let finalText = "";
   let costUsd = 0;
+  // Returned so callers can tell "the model worked and concluded X" from "the model
+  // returned nothing" -- both otherwise look like a phase that completed normally.
+  let toolCalls = 0;
 
   emitAgentEvent({ type: "phase_start", phase: opts.phase, proposalId: opts.proposalId });
 
@@ -157,6 +160,7 @@ async function runPhase(opts: {
         emitAgentEvent({ type: "model_text", phase: opts.phase, proposalId: opts.proposalId, text });
       },
       onToolCall: (toolName, input, output) => {
+        toolCalls++;
         store.logAction(opts.proposalId, opts.phase, toolName, input, output);
         console.log(`[${opts.phase}] tool: ${toolName} ${preview(input)}`);
         emitAgentEvent({ type: "tool_call", phase: opts.phase, proposalId: opts.proposalId, toolName, input });
@@ -182,7 +186,7 @@ async function runPhase(opts: {
     });
   }
 
-  return { finalText, costUsd };
+  return { finalText, costUsd, toolCalls };
 }
 
 // ---- phase 1: research + plan -------------------------------------------
@@ -225,7 +229,7 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
   // only redirect what gets researched; the output is still a proposal needing approval.
   const directive = consumeDirective();
 
-  await runPhase({
+  const { finalText, toolCalls } = await runPhase({
     phase: "research_plan",
     proposalId: null,
     prompt: [
@@ -245,7 +249,22 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
     maxTurns: RESEARCH_MAX_TURNS,
   });
 
-  return store.listPendingProposals().filter((p) => !beforeIds.has(p.id));
+  const created = store.listPendingProposals().filter((p) => !beforeIds.has(p.id));
+
+  // Proposing nothing is allowed -- the prompt explicitly tells it not to force a weak
+  // proposal -- but several quiet cycles in a row look exactly like a stuck loop from the
+  // console. Emit the model's own stated reason so the operator can tell "it researched and
+  // found nothing worth your time" from "it never ran", and act on it (the domains, a
+  // directive and lesson muting are all levers for the first case).
+  if (created.length === 0) {
+    emitAgentEvent({
+      type: "no_proposal",
+      reason: preview(finalText, 400) || "(the model ended the phase without saying why)",
+      toolCalls,
+    });
+  }
+
+  return created;
 }
 
 // ---- reactive: a human action (marking a proposal "needs refinement") -----

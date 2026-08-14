@@ -44,6 +44,19 @@ function reviewRank(status: ReviewStatus): number {
   return 0
 }
 
+/** "commit files ×12 · web search ×8" — what a proposal's action count is actually made of. */
+function toolBreakdown(actions: ActionWithProposal[]): string {
+  const counts = new Map<string, number>()
+  for (const a of actions) {
+    const label = actionLabel(a.tool_name)
+    counts.set(label, (counts.get(label) ?? 0) + 1)
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([label, n]) => `${label} ×${n}`)
+    .join(' · ')
+}
+
 /** The action list for one proposal, shown inline when its group row is expanded. */
 function ExpandedActions({
   actions,
@@ -182,9 +195,18 @@ export function ActionsPage({
     },
     {
       title: 'Actions',
-      width: 90,
+      width: 130,
       sorter: (a, b) => a.actions.length - b.actions.length,
-      render: (_, g) => <Tag>{g.actions.length}</Tag>,
+      // A bare number under a column called "Actions" reads as an id, not a count -- and the
+      // count alone doesn't say what the agent actually did. Say the unit, and put the tool
+      // breakdown behind a hover for anyone who doesn't want to expand the row.
+      render: (_, g) => (
+        <Tooltip title={toolBreakdown(g.actions)}>
+          <Tag>
+            {g.actions.length} action{g.actions.length === 1 ? '' : 's'}
+          </Tag>
+        </Tooltip>
+      ),
     },
     {
       title: 'Priority',

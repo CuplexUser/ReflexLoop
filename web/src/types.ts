@@ -155,11 +155,24 @@ export interface DomainScore {
   api_spend: number
 }
 
+/** Lifetime spend on one provider/model. Both are null for runs predating those columns. */
+export interface ModelSpend {
+  provider: string | null
+  model: string | null
+  runs: number
+  cost_usd: number
+  first_at: string
+  last_at: string
+}
+
 export interface EconomicsResponse {
   spendByPhase: PhaseSpend[]
+  spendByModel: ModelSpend[]
   spendOverTime: DaySpend[]
   domains: DomainScore[]
   totalCostUsd: number
+  /** Spend on runs charged to no proposal (research/plan) -- the domain table can't show it. */
+  unattributedSpend: number
 }
 
 export interface DuplicateNotePair {
@@ -182,6 +195,7 @@ export type AgentEvent =
   | { type: 'scheduled_run_starting'; proposal: ProposalRow }
   | { type: 'outcome_recorded'; proposalId: number }
   | { type: 'lesson_saved'; domain: string }
+  | { type: 'no_proposal'; reason: string; toolCalls: number }
   | { type: 'cycle_idle'; nextCycleAt: string }
 
 export interface FeedEntry {
