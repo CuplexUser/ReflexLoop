@@ -98,6 +98,10 @@ export function buildAntdTheme(mode: ThemeMode): ThemeConfig {
         bodyBg: p.bgBase,
       },
       Menu: {
+        // The sider already paints `bgSunken`; both token sets are set because the nav menu
+        // switches between the dark and light variants with the mode.
+        itemBg: 'transparent',
+        subMenuItemBg: 'transparent',
         darkItemBg: 'transparent',
         darkSubMenuItemBg: 'transparent',
       },

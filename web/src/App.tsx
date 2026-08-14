@@ -21,7 +21,7 @@ import { StatusBar } from './components/StatusBar'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { TokenGate } from './components/TokenGate'
 import { DashboardPage } from './pages/DashboardPage'
-import type { ThemeMode } from './theme'
+import { palette, type ThemeMode } from './theme'
 import type { OutcomeRow, ProposalRow, StatusResponse } from './types'
 
 /**
@@ -140,7 +140,7 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
     <Layout style={{ minHeight: '100vh' }}>
       <Layout.Sider width={220} breakpoint="lg" collapsedWidth={0}>
         <div style={{ padding: '20px 24px 12px' }}>
-          <Typography.Title level={5} style={{ margin: 0, color: '#E7EAF0' }}>
+          <Typography.Title level={5} style={{ margin: 0, color: palette.textPrimary }}>
             agent-runner
           </Typography.Title>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
@@ -148,7 +148,9 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
           </Typography.Text>
         </div>
         <Menu
-          theme="dark"
+          // The sider is `bgSunken`, which follows the mode -- so the menu has to as well, or
+          // its light-on-dark text ends up light-on-light.
+          theme={themeMode}
           mode="inline"
           selectedKeys={[page]}
           onClick={(e) => navigate(PAGE_PATHS[e.key as PageKey])}

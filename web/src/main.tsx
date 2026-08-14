@@ -6,6 +6,8 @@ import './index.css'
 import App from './App.tsx'
 import { buildAntdTheme, type ThemeMode } from './theme.ts'
 
+// Also read by the inline script in index.html, which stamps data-theme before first paint so
+// light-theme users don't get a flash of dark. Change both together.
 const STORAGE_KEY = 'reflexloop:theme'
 
 function readStoredMode(): ThemeMode {

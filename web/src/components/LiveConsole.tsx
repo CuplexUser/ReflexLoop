@@ -64,8 +64,8 @@ export function LiveConsole({ feed, height = 420 }: { feed: FeedEntry[]; height?
       style={{
         height,
         overflowY: 'auto',
-        background: '#0D0F14',
-        border: '1px solid #262B35',
+        background: palette.bgSunken,
+        border: `1px solid ${palette.border}`,
         borderRadius: 8,
         padding: '12px 16px',
         fontSize: 13,
@@ -81,7 +81,7 @@ export function LiveConsole({ feed, height = 420 }: { feed: FeedEntry[]; height?
       ) : (
         feed.map(({ key, at, event }) => (
           <div key={key} style={{ display: 'flex', gap: 10, color: lineColor(event.type) }}>
-            <span style={{ color: '#5B6272', flexShrink: 0 }}>{new Date(at).toLocaleTimeString()}</span>
+            <span style={{ color: palette.textFaint, flexShrink: 0 }}>{new Date(at).toLocaleTimeString()}</span>
             <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{renderLine(event)}</span>
           </div>
         ))

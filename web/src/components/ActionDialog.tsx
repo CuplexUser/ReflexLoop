@@ -3,6 +3,7 @@ import { LinkOutlined } from '@ant-design/icons'
 import { Modal, Space, Tag, Typography } from 'antd'
 import type { ActionWithProposal } from '../types'
 import { PHASE_LABEL, actionLabel } from '../format'
+import { palette } from '../theme'
 
 function prettyInput(raw: string | null): string {
   if (!raw) return '—'
@@ -35,8 +36,8 @@ const codeBlockStyle: CSSProperties = {
   marginTop: 4,
   whiteSpace: 'pre-wrap',
   wordBreak: 'break-word',
-  background: '#0D0F14',
-  border: '1px solid #262B35',
+  background: palette.bgSunken,
+  border: `1px solid ${palette.border}`,
   borderRadius: 8,
   padding: 12,
   fontSize: 12,

@@ -245,7 +245,17 @@ Research notes, Agent control.
 (`var(--rl-approved)`, etc.), so a theme switch repaints without re-rendering. Ant Design can't use
 those — it derives hover/active shades with color math — so `HEX_PALETTES` holds real hex for
 `ConfigProvider`. The `--rl-*` definitions in `index.css` and `HEX_PALETTES` are two representations of
-one palette: **change both together**. `main.tsx` owns the mode and sets `data-theme` on `<html>`.
+one palette: **change both together**. `main.tsx` owns the mode and sets `data-theme` on `<html>`, but
+an inline script in `index.html` stamps the same attribute *before* first paint — an effect runs after
+it, which flashed the dark default at light-theme users. That script duplicates `main.tsx`'s storage key
+and OS-preference fallback; they have to agree.
+
+Light mode is a real mode, not a fallback, so **nothing may hardcode a hex color** — a literal is a
+dark-theme value that survives the switch and lands light-on-light (the sider) or a black slab on a
+white page (the activity console). Anything AntD styles for you needs the mode passed in too: the nav
+`Menu` takes `theme={themeMode}` because the sider it sits on is `bgSunken`. Where only an alpha varies
+(the pulse-ring keyframe, the column-resize handle) `index.css` carries `--rl-*-rgb` channel triples
+alongside the hex, since `rgba()` can't take a `var()` holding `#rrggbb`.
 
 **Deep links.** Every detail dialog is driven by the URL — `/proposals/:id`, `/actions/:id`,
 `/lessons/:id`, `/research/:id` — so rows are bookmarkable and Back closes the dialog. The nav highlight

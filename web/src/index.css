@@ -17,6 +17,9 @@
   --rl-active: #6c8cff;
   --rl-row-focus: #1f2531;
   --rl-scrollbar: #333a47;
+  /* Bare channels so the keyframes/handle below can vary only the alpha. */
+  --rl-pending-rgb: 232, 163, 61;
+  --rl-active-rgb: 108, 140, 255;
 }
 
 :root[data-theme='light'] {
@@ -35,6 +38,8 @@
   --rl-active: #3e63dd;
   --rl-row-focus: #e4e9f5;
   --rl-scrollbar: #c3cad6;
+  --rl-pending-rgb: 183, 119, 20;
+  --rl-active-rgb: 62, 99, 221;
 }
 
 * {
@@ -92,7 +97,7 @@ body {
 }
 .col-resize-handle:hover,
 .col-resize-handle:active {
-  background: #6c8cff33;
+  background: rgba(var(--rl-active-rgb), 0.2);
 }
 
 /* The row j/k navigation is pointing at -- has to read as "keys act here" without
@@ -104,10 +109,10 @@ body {
 
 @keyframes pulse-ring {
   0% {
-    box-shadow: 0 0 0 0 rgba(232, 163, 61, 0.45);
+    box-shadow: 0 0 0 0 rgba(var(--rl-pending-rgb), 0.45);
   }
   100% {
-    box-shadow: 0 0 0 10px rgba(232, 163, 61, 0);
+    box-shadow: 0 0 0 10px rgba(var(--rl-pending-rgb), 0);
   }
 }
 
