@@ -21,6 +21,7 @@
 import "dotenv/config";
 import { runAgent } from "./agent-loop.js";
 import { describeClients, resolveLlmClients } from "./llm/index.js";
+import { isConsoleOnlyMode } from "./console-mode.js";
 import { getSearchConfig } from "./search/index.js";
 import { ToolRegistry } from "./tools/registry.js";
 import { buildWebTools } from "./tools/web.js";
@@ -49,6 +50,10 @@ const DOMAINS = (process.env.AGENT_DOMAINS ?? "micro-SaaS tool for developers (s
   .split(",")
   .map((d) => d.trim())
   .filter(Boolean);
+// Console-only dev mode (`npm run start:console` / AGENT_CONSOLE_ONLY=1): serve the API and the
+// web console against the real database, opened read-only, and run no agent loop. See the
+// mainLoop branch below.
+const CONSOLE_ONLY = isConsoleOnlyMode();
 const DB_PATH = process.env.AGENT_DB_PATH ?? "./data/agent.db";
 const CYCLE_INTERVAL_MS = Number(process.env.AGENT_CYCLE_INTERVAL_MS ?? 1000 * 60 * 60); // 1h default
 const SERVER_PORT = Number(process.env.AGENT_SERVER_PORT ?? 4001);
@@ -58,7 +63,7 @@ const MAX_PENDING_PROPOSALS = Number(process.env.AGENT_MAX_PENDING_PROPOSALS ?? 
 // right away, see humanReviewPhase). Default: 15s.
 const SCHEDULER_TICK_MS = Number(process.env.AGENT_SCHEDULER_TICK_MS ?? 15_000);
 
-const store = new MemoryStore(DB_PATH);
+const store = new MemoryStore(DB_PATH, { readOnly: CONSOLE_ONLY });
 
 /**
  * Config problems (no AGENT_MODEL, an unknown provider, a search mode whose key is
@@ -79,7 +84,10 @@ function loadConfigOrExit<T>(load: () => T): T {
 // research is wide and cheap to get wrong, act writes real code into real repos with
 // no build step to catch mistakes, and reflect is two short memory calls. See the
 // AGENT_*_PROVIDER / AGENT_*_MODEL overrides in llm/index.ts.
-const llmByPhase = loadConfigOrExit(resolveLlmClients);
+//
+// Null in console-only mode: no phase runs there, so requiring a provider key and a
+// valid AGENT_MODEL just to look at the database would defeat the point of the mode.
+const llmByPhase = CONSOLE_ONLY ? null : loadConfigOrExit(resolveLlmClients);
 
 // One registry for the whole process; each phase gets a subset by name, never a
 // different registry. buildWebTools() contributes WebFetch always and WebSearch only
@@ -138,6 +146,10 @@ async function runPhase(opts: {
   // Returned so callers can tell "the model worked and concluded X" from "the model
   // returned nothing" -- both otherwise look like a phase that completed normally.
   let toolCalls = 0;
+
+  // Unreachable in console-only mode -- nothing calls a phase there -- but the check keeps
+  // that a stated invariant rather than a null dereference if something ever does.
+  if (!llmByPhase) throw new Error("No model client: this process is running console-only (--console-only).");
 
   emitAgentEvent({ type: "phase_start", phase: opts.phase, proposalId: opts.proposalId });
 
@@ -592,10 +604,38 @@ function enqueueForReview(proposal: ProposalRow): void {
 
 // ---- main loop --------------------------------------------------------------
 
+/**
+ * Console-only mode: start the API server against the read-only store and stop there.
+ *
+ * No research cycle, no scheduler, no pending-review queue, no model client -- every one
+ * of those exists to write something, and this mode exists to write nothing. What you get
+ * is the real database on screen, which is the whole point: an empty DB makes the console
+ * impossible to work on.
+ */
+function serveConsoleOnly(): void {
+  console.log(`Console-only mode (--console-only). Serving ${DB_PATH} READ-ONLY; the agent loop is not running.`);
+  console.log("No model API will be called and no row can change -- writes are refused by SQLite and by the API.");
+  // The console still needs control state to render the Agent control page; seeded from the
+  // DB as usual, with persistence pointed at nothing since saving it would be a write.
+  const saved = store.loadControlSettings();
+  initControl({
+    domains: saved.domains ?? DOMAINS,
+    cycleIntervalMs: saved.cycleIntervalMs ?? CYCLE_INTERVAL_MS,
+    paused: saved.paused,
+    directive: saved.directive,
+  });
+  startServer(store, SERVER_PORT);
+}
+
 async function mainLoop() {
+  if (CONSOLE_ONLY) {
+    serveConsoleOnly();
+    return;
+  }
+
   const search = getSearchConfig();
   console.log(`Agent runner starting. DB: ${DB_PATH}`);
-  console.log(`Models: ${describeClients(llmByPhase).join(", ")}. Web search: ${search.mode}.`);
+  console.log(`Models: ${describeClients(llmByPhase!).join(", ")}. Web search: ${search.mode}.`);
   if (search.mode === "none") {
     console.warn(
       "[search] No web search is configured -- research will run on WebFetch and the read-only " +

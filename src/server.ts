@@ -28,6 +28,7 @@ import { submitDecision, hasPendingDecision } from "./review-gateway.js";
 import { fireReactiveTrigger } from "./reactive-triggers.js";
 import { ALL_GRANTABLE_TOOLS, toolRisk } from "./tool-catalog.js";
 import { buildDeliverables, type DeliverableOutcomeRow } from "./deliverables.js";
+import { isConsoleOnlyMode } from "./console-mode.js";
 import {
   getControlState,
   requestAbort,
@@ -76,6 +77,17 @@ export function startServer(store: MemoryStore, port: number): Server {
       "[server] AGENT_API_TOKEN is not set -- the console's API is unauthenticated. " +
         `Bound to ${BIND_HOST}; set a token before binding anywhere else.`
     );
+  }
+
+  // Console-only mode (--console-only, see console-mode.ts) is read-only all the way down: the store
+  // is opened read-only, so a write would surface as a SQLite error from somewhere deep.
+  // Refusing it here instead means the UI gets one clear answer, and "nothing can change
+  // the database" is enforced at the entrance rather than discovered at the exit.
+  if (isConsoleOnlyMode()) {
+    app.use("/api", (req: Request, res: Response, next: NextFunction) => {
+      if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
+      res.status(403).json({ error: "Read-only console mode (--console-only): this instance cannot modify anything." });
+    });
   }
 
   // Tells the console whether it needs a token at all, without revealing it.
@@ -540,7 +552,12 @@ export function startServer(store: MemoryStore, port: number): Server {
   });
 
   onAgentEvent((event: AgentEvent) => {
-    const { id, occurredAt } = store.logEvent(event.type, event);
+    // Persisting is a write, so in read-only console mode the event is broadcast live and
+    // not stored. Nothing emits in that mode today (no loop, no write endpoints); this is
+    // here so that if something ever does, it can't take the server down.
+    const { id, occurredAt } = isConsoleOnlyMode()
+      ? { id: -Date.now(), occurredAt: new Date().toISOString() }
+      : store.logEvent(event.type, event);
     const payload = JSON.stringify({ id, occurredAt, event });
     for (const client of wss.clients) {
       if (client.readyState === WebSocket.OPEN) client.send(payload);

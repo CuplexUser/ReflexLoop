@@ -51,7 +51,22 @@ npm run smoke-test    # sanity-checks the DB + tool wiring directly, no API key 
 npm test              # vitest run — unit tests over src/**/*.test.ts, no API key needed
 npm run typecheck     # tsc --noEmit over src/
 npm start             # tsx src/orchestrator.ts — runs the agent loop + web console together (one process, one SQLite connection)
+npm run start:console # console-only: serves the real DB read-only, runs no loop, calls no model API
 ```
+
+**`start:console`** (equivalently `AGENT_CONSOLE_ONLY=1`; the CLI flag exists because `VAR=1 npm start`
+doesn't work on Windows) is the harness for working on `web/` and `server.ts`: it opens the real
+database **read-only**, starts the API and console against it, and stops there. No research cycle,
+no scheduler, no review queue, no model client — every one of those exists to write something, and
+this mode writes nothing. It needs no provider key and no `AGENT_MODEL`.
+
+Read-only is enforced twice on purpose: SQLite itself rejects writes (`new MemoryStore(path,
+{ readOnly: true })`), and `server.ts` refuses any non-GET `/api` request with a 403 so the UI gets
+one clear answer instead of a SQLite error surfacing from somewhere deep. That also means the
+console's write features (approve/reject, muting a lesson, editing scope) can't be exercised in this
+mode — that's the trade for touching nothing. The obvious alternative, a scripted model driving the
+real loop against a scratch DB, was tried and rejected: an empty DB makes the console useless to
+develop against, and a copy of the real one drifts.
 
 Vitest covers the parts that can be tested without an API key: `src/memory-server.test.ts`
 (`MemoryStore` against an in-memory SQLite DB, with `qdrant.ts` mocked so semantic-search tests exercise
@@ -172,7 +187,8 @@ on). A directive is consumed — injected into one research prompt, then cleared
   natively — worth its own file rather than going through Anthropic's OpenAI-compat shim, which lags on
   tool use. `providers.ts` is the registry of base URLs / key env vars / model-list links; `http.ts` is
   one retrying JSON POST (429 and 5xx only — a 400 from a bad model id is returned immediately);
-  `pricing.ts` turns tokens into dollars; `index.ts` resolves one client per phase from the env.
+  `pricing.ts` turns tokens into dollars; `index.ts` resolves one client per phase from the env, or
+  short-circuits to `mock.ts` (the scripted offline dev client — see Commands above).
   Adapters must normalize `Usage.inputTokens` to *total* prompt tokens including cached ones — Anthropic
   reports the uncached remainder, so its adapter adds the cache fields back or pricing under-counts.
 - `agent-loop.ts` — the replacement for the SDK's `query()`: ask the model, run the tools it asked for,

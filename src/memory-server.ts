@@ -115,8 +115,17 @@ const now = () => new Date().toISOString();
 export class MemoryStore {
   private db: DatabaseSync;
 
-  constructor(path: string) {
-    this.db = new DatabaseSync(path);
+  /**
+   * `readOnly` opens the file so SQLite itself rejects every write -- used by the
+   * console-only dev mode (see console-mode.ts), where the point is to look at the real
+   * database without any chance of changing it. The schema statements below still run:
+   * `CREATE ... IF NOT EXISTS` is a no-op on an existing object even read-only, and the
+   * migrations check `PRAGMA table_info` before altering anything. A DB that genuinely
+   * needs a migration will throw here, which is correct -- migrating is a write, so it
+   * has to happen in a normal run first.
+   */
+  constructor(path: string, { readOnly = false }: { readOnly?: boolean } = {}) {
+    this.db = new DatabaseSync(path, { readOnly });
     this.db.exec(SCHEMA);
     // Vector search moved to Qdrant Cloud (qdrant.ts) -- vectors live there now,
     // keyed by the same row id, instead of inline as a JSON column here. Drops
