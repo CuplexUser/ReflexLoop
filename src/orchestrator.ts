@@ -594,7 +594,7 @@ function enqueueForReview(proposal: ProposalRow): void {
 
 async function mainLoop() {
   const search = getSearchConfig();
-  console.log(`Agent runner started. Domains: ${DOMAINS.join("; ")}. DB: ${DB_PATH}`);
+  console.log(`Agent runner starting. DB: ${DB_PATH}`);
   console.log(`Models: ${describeClients(llmByPhase).join(", ")}. Web search: ${search.mode}.`);
   if (search.mode === "none") {
     console.warn(
@@ -603,9 +603,23 @@ async function mainLoop() {
     );
   }
   await store.syncToQdrant();
-  // Env values are the starting point; from here the operator's console owns them, so
-  // every later read goes through getControlState() rather than the module constants.
-  initControl({ domains: DOMAINS, cycleIntervalMs: CYCLE_INTERVAL_MS });
+  // Env values seed a fresh DB; anything the operator has since set in the console wins and
+  // is written back through `persist`, so a console change is no longer lost on restart.
+  // From here every read goes through getControlState() rather than the module constants.
+  const saved = store.loadControlSettings();
+  if (saved.domains) {
+    console.log(`[control] using ${saved.domains.length} operator-set domains from the DB, not AGENT_DOMAINS.`);
+  }
+  if (saved.paused) {
+    console.warn("[control] starting PAUSED -- the loop was paused from the console and that persists.");
+  }
+  initControl({
+    domains: saved.domains ?? DOMAINS,
+    cycleIntervalMs: saved.cycleIntervalMs ?? CYCLE_INTERVAL_MS,
+    paused: saved.paused,
+    directive: saved.directive,
+    persist: (patch) => store.saveControlSettings(patch),
+  });
   startServer(store, SERVER_PORT);
   onReactiveTrigger((t) => void handleReactiveTrigger(t.proposalId));
   onRunNow(() => wakeCycle());
@@ -615,7 +629,12 @@ async function mainLoop() {
       actAbortController.abort();
     }
   });
-  emitAgentEvent({ type: "run_started", domains: DOMAINS });
+  // The effective domains, not the env ones -- the console's "3 domains" and the feed's
+  // startup line both read this, and reporting AGENT_DOMAINS here would describe lanes the
+  // loop isn't actually researching once the operator has retargeted them.
+  const effectiveDomains = getControlState().domains;
+  console.log(`Domains: ${effectiveDomains.join("; ")}`);
+  emitAgentEvent({ type: "run_started", domains: effectiveDomains });
 
   // Pick up any proposals left pending from a previous run -- all queued for
   // review in parallel, not one at a time.

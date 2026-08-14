@@ -29,6 +29,14 @@ export interface ControlState {
   queuedProposalIds: number[];
 }
 
+/** What `initControl` is handed to write settings through -- the DB, in practice. */
+export type ControlPersister = (patch: {
+  domains?: string[];
+  cycleIntervalMs?: number;
+  paused?: boolean;
+  directive?: string | null;
+}) => void;
+
 const bus = new EventEmitter();
 bus.setMaxListeners(20);
 
@@ -41,10 +49,30 @@ const state: ControlState = {
   queuedProposalIds: [],
 };
 
-/** Called once at startup so the control state reflects the env-configured defaults. */
-export function initControl(opts: { domains: string[]; cycleIntervalMs: number }): void {
+// Set once at startup. Kept as an injected callback rather than importing MemoryStore so
+// this module stays dependency-free and testable in isolation -- and so it can't grow the
+// ability to read anything back out of the DB.
+let persist: ControlPersister = () => {};
+
+/**
+ * Called once at startup with the resolved starting state: env defaults, overridden by
+ * whatever the operator last set in the console (the caller merges the two). Every setter
+ * below then writes through `persist`, so a console change survives a restart instead of
+ * silently reverting to the env value the next time the process starts.
+ */
+export function initControl(opts: {
+  domains: string[];
+  cycleIntervalMs: number;
+  paused?: boolean;
+  directive?: string | null;
+  persist?: ControlPersister;
+}): void {
   state.domains = opts.domains;
   state.cycleIntervalMs = opts.cycleIntervalMs;
+  state.paused = opts.paused ?? false;
+  state.directive = opts.directive ?? null;
+  // Assigned last so seeding the initial state doesn't write it straight back out.
+  persist = opts.persist ?? (() => {});
 }
 
 export function getControlState(): ControlState {
@@ -53,30 +81,41 @@ export function getControlState(): ControlState {
 
 export function setPaused(paused: boolean): void {
   state.paused = paused;
+  persist({ paused });
   bus.emit("changed");
 }
 
 export function setDomains(domains: string[]): void {
   state.domains = domains;
+  persist({ domains });
   bus.emit("changed");
 }
 
 export function setCycleIntervalMs(ms: number): void {
   state.cycleIntervalMs = ms;
+  persist({ cycleIntervalMs: ms });
   bus.emit("changed");
 }
 
 /** Leaves a steer for the next research+plan run. Overwrites any directive not yet consumed. */
 export function setDirective(directive: string | null): void {
   state.directive = directive;
+  persist({ directive });
   bus.emit("changed");
 }
 
-/** Reads and clears the pending directive -- a directive steers exactly one cycle. */
+/**
+ * Reads and clears the pending directive -- a directive steers exactly one cycle. The clear
+ * is persisted too: a directive that survived a restart must not then survive being used,
+ * or it would quietly become the standing instruction it is explicitly not meant to be.
+ */
 export function consumeDirective(): string | null {
   const directive = state.directive;
   state.directive = null;
-  if (directive !== null) bus.emit("changed");
+  if (directive !== null) {
+    persist({ directive: null });
+    bus.emit("changed");
+  }
   return directive;
 }
 

@@ -266,6 +266,59 @@ describe("economics", () => {
     expect(byPhase.find((p) => p.phase === "research_plan")).toMatchObject({ runs: 2 });
     expect(byPhase.find((p) => p.phase === "research_plan")!.cost_usd).toBeCloseTo(0.3);
   });
+
+  it("separates spend by provider/model and keeps pre-tracking runs in their own bucket", () => {
+    store.logRun(null, "research_plan", 0.1, 100, new Date().toISOString(), "openrouter", "deepseek/v4");
+    store.logRun(null, "act", 0.2, 100, new Date().toISOString(), "openrouter", "deepseek/v4");
+    // No provider/model: a row from before those columns existed. Folding it into the
+    // configured provider would credit one vendor with another's spend.
+    store.logRun(null, "act", 5, 100, new Date().toISOString());
+
+    const byModel = store.spendByModel();
+    expect(byModel.find((m) => m.model === "deepseek/v4")).toMatchObject({ provider: "openrouter", runs: 2 });
+    expect(byModel.find((m) => m.model === "deepseek/v4")!.cost_usd).toBeCloseTo(0.3);
+    expect(byModel.find((m) => m.provider === null)!.cost_usd).toBeCloseTo(5);
+  });
+
+  it("reports spend charged to no proposal, which the domain scoreboard cannot see", () => {
+    const id = store.createProposal({
+      domain: "saas",
+      description: "A thing",
+      expectedCost: 1,
+      expectedTimeHours: 1,
+      expectedUpside: 1,
+      requiredTools: [],
+    });
+    store.logRun(null, "research_plan", 0.4, 100, new Date().toISOString());
+    store.logRun(id, "act", 0.1, 100, new Date().toISOString());
+
+    expect(store.unattributedSpend()).toBeCloseTo(0.4);
+    expect(store.totalRunCost() - store.unattributedSpend()).toBeCloseTo(0.1);
+  });
+});
+
+describe("operator control settings", () => {
+  it("round-trips each knob and leaves unset keys absent", () => {
+    expect(store.loadControlSettings()).toEqual({});
+
+    store.saveControlSettings({ domains: ["a", "b"], paused: true });
+    expect(store.loadControlSettings()).toEqual({ domains: ["a", "b"], paused: true });
+
+    // A patch only touches the keys it names -- saving a directive must not drop the domains.
+    store.saveControlSettings({ directive: "focus on X" });
+    expect(store.loadControlSettings()).toEqual({ domains: ["a", "b"], paused: true, directive: "focus on X" });
+
+    // Consuming a directive persists the clear, so it can't survive being used.
+    store.saveControlSettings({ directive: null });
+    expect(store.loadControlSettings().directive).toBeNull();
+  });
+
+  it("drops a value of the wrong shape rather than handing it to the loop", () => {
+    // A row left by an older/hand-edited schema. Startup must fall back to the env default
+    // for that key instead of seeding the control state with a string where a list belongs.
+    store.saveControlSettings({ domains: "not-a-list" as unknown as string[], paused: true });
+    expect(store.loadControlSettings()).toEqual({ paused: true });
+  });
 });
 
 describe("unified search", () => {

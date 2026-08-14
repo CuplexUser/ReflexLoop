@@ -154,7 +154,8 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
       <Card size="small" title="Domains">
         <Space direction="vertical" size={8} style={{ width: '100%' }}>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            One per line. Takes effect on the next research cycle; nothing already approved is affected.
+            One per line. Takes effect on the next research cycle; nothing already approved is affected. Saved
+            to the database — this overrides AGENT_DOMAINS and survives a restart.
           </Typography.Text>
           <Input.TextArea
             value={domainsText}
@@ -186,7 +187,8 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
         <Space direction="vertical" size={8} style={{ width: '100%' }}>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             Free-text steer injected into the next research+plan prompt, then cleared — it nudges one cycle rather
-            than quietly reshaping every future one. The output is still a proposal you have to approve.
+            than quietly reshaping every future one. The output is still a proposal you have to approve. A queued
+            directive survives a restart; being used clears it.
           </Typography.Text>
           <Input.TextArea
             placeholder="e.g. Focus on ideas that need no paid infrastructure, and prefer extending existing repos over new ones."

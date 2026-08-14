@@ -90,6 +90,15 @@ CREATE TABLE IF NOT EXISTS events (
   payload TEXT NOT NULL,
   occurred_at TEXT NOT NULL
 );
+
+-- Operator settings made from the console (agent-control.ts), which used to live only in
+-- process memory: retuning the domains in the UI looked permanent and then silently reverted
+-- to AGENT_DOMAINS on the next restart. Values are JSON so one table covers every knob.
+CREATE TABLE IF NOT EXISTS control_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `;
 
 // How many recent activity-feed events to keep around -- this is a live
@@ -674,6 +683,56 @@ export class MemoryStore {
     return row.total;
   }
 
+  // ---- operator control settings -------------------------------------------
+  //
+  // Not model-callable, and deliberately not part of buildMemoryTools(): these are the
+  // operator's knobs. The agent must not be able to widen its own domains, unpause itself
+  // or write its own directive, so they live here as plain methods the orchestrator and
+  // server.ts call, exactly like proposal approval does.
+
+  loadControlSettings(): PersistedControl {
+    const rows = this.db.prepare(`SELECT key, value FROM control_settings`).all() as unknown as {
+      key: string;
+      value: string;
+    }[];
+    const out: PersistedControl = {};
+    for (const row of rows) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(row.value);
+      } catch {
+        // A hand-edited or truncated row shouldn't stop the loop from starting -- the
+        // env default takes over for that key, which is the same state as never having
+        // set it from the console.
+        console.warn(`[control] ignoring unparseable setting "${row.key}"`);
+        continue;
+      }
+      if (row.key === "domains" && Array.isArray(parsed) && parsed.every((d) => typeof d === "string")) {
+        out.domains = parsed;
+      } else if (row.key === "cycleIntervalMs" && typeof parsed === "number" && Number.isFinite(parsed)) {
+        out.cycleIntervalMs = parsed;
+      } else if (row.key === "paused" && typeof parsed === "boolean") {
+        out.paused = parsed;
+      } else if (row.key === "directive" && (parsed === null || typeof parsed === "string")) {
+        out.directive = parsed;
+      }
+    }
+    return out;
+  }
+
+  /** Upserts each key present in the patch; `directive: null` clears it (a consumed directive). */
+  saveControlSettings(patch: PersistedControl): void {
+    const stmt = this.db.prepare(
+      `INSERT INTO control_settings (key, value, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    );
+    const at = now();
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === undefined) continue;
+      stmt.run(key, JSON.stringify(value), at);
+    }
+  }
+
   // ---- economics ----------------------------------------------------------
   //
   // The loop's whole premise is that spend counts against profit, so these join
@@ -876,6 +935,18 @@ export interface DomainScoreRow {
   /** Sum of expected_upside across proposals that actually produced an outcome -- compare to `revenue`. */
   forecast_upside: number;
   api_spend: number;
+}
+
+/**
+ * The operator-set half of `ControlState`. Every field is optional: an absent key means the
+ * console never set it, and the env default applies. The runtime-only parts of `ControlState`
+ * (what's currently executing) are not here -- they describe this process, not a preference.
+ */
+export interface PersistedControl {
+  domains?: string[];
+  cycleIntervalMs?: number;
+  paused?: boolean;
+  directive?: string | null;
 }
 
 /**

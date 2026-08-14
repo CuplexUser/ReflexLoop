@@ -148,7 +148,17 @@ produced each row, since phases can be pointed at different models.
 **Runtime control** (`agent-control.ts`) holds state the operator drives from the console: paused,
 domains, cycle interval, a one-shot research directive, and a live view of what's executing. `mainLoop`
 re-reads it each pass instead of closing over the env constants, so changes take effect without a
-restart. "Run a cycle now" resolves `sleepUntilNextCycle` early; aborting an act phase fires the
+restart. The operator-set half **persists** to `control_settings` (key/JSON-value) via a `persist`
+callback `initControl` is handed — `agent-control.ts` never imports `MemoryStore`, so it stays
+dependency-free and can't read anything back out of the DB. At startup the orchestrator merges: env
+seeds a fresh DB, saved settings win. That makes `AGENT_DOMAINS`/`AGENT_CYCLE_INTERVAL_MS` **seed
+values, not the source of truth** — editing `.env` after the console has set them does nothing, which
+is the opposite of the old behaviour where a console change looked permanent and silently reverted on
+restart. Consuming a directive persists the clear too, or a one-shot steer that survived a restart
+would then survive being used and quietly become standing instruction. `paused` persists as well: a
+pause is the operator saying "stop spending", and losing that on restart resumes activity they didn't
+ask for. Live execution state (`runningProposalId`, `queuedProposalIds`) is not persisted — it
+describes this process, not a preference. "Run a cycle now" resolves `sleepUntilNextCycle` early; aborting an act phase fires the
 `AbortController` passed to that run's `query()` (skipping reflect, since there's no outcome to reflect
 on). A directive is consumed — injected into one research prompt, then cleared.
 
