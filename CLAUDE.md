@@ -75,6 +75,8 @@ the deterministic LIKE-fallback path regardless of ambient `QDRANT_*` env vars),
 refuses loopback/private addresses), and `src/llm/pricing.test.ts` (the cost table, the OpenRouter
 reported-cost path, and the deliberate $0-for-unknown-model behaviour). The adapters and the loop itself
 aren't unit-tested — they're thin over HTTP, and a mock of a provider's wire format mostly tests the mock.
+`src/proposal-similarity.test.ts` (the duplicate check, against real proposals from the agent's
+own history — the pairs it must catch and the follow-up pair it must not).
 `smoke-test.ts` runs end-to-end against a throwaway `./data/smoke-test.db`, and also builds the real tool
 registry and serializes every schema — which is the cheap way to catch a zod shape that can't be converted,
 since otherwise it surfaces as a provider 400 on the first live cycle.
@@ -245,6 +247,27 @@ on). A directive is consumed — injected into one research prompt, then cleared
   extracting a URL has to handle both — the Actions page's result links were empty for every
   post-SDK action because the extractor only knew the first shape. New readers of tool output go
   through `parseToolResult` rather than parsing the column themselves.
+- `proposal-similarity.ts` — the duplicate check behind `proposal_create`. The agent kept
+  re-proposing ideas it already had pending, in three flavours: same idea under a new product
+  name (`PropertyManagerCompare` / `PropertyManagementSoftware.review` / "Property management
+  software comparison site" — two of them pending *simultaneously*), and same idea under a
+  different `domain` string, which is why the check is **not** scoped per-domain. Two layers now
+  stop it: `openProposalDigest()` in `orchestrator.ts` puts the open queue in the research
+  prompt (research+plan previously had no way to see it at all — `action_history_search` only
+  covers work that already *ran*, and `proposal_status` needs an id the model can't know), and
+  this module refuses the create outright when the new text is too close to an open one.
+  Lexical, not semantic, on purpose: it's a pure function over two strings, so it needs no
+  API key or Qdrant call on the create path, is unit-tested against the real history, and can
+  tell the model *which terms* collided. The tokenizer splits CamelCase and stems, so
+  `PropertyManagerCompare` and "property management … comparison" reduce to the same terms.
+  `DUPLICATE_THRESHOLD` (0.32) sits in a measured gap — every duplicate pair in the history
+  scores ≥0.36, the closest legitimately-distinct pair (two real follow-ups on one shipped
+  repo) scores 0.25; the comment there carries the full table. **If you retune it, re-measure
+  against the real DB rather than nudging the constant**, and keep the mcp-lint follow-up pair
+  under it — encouraging next-step proposals is the point, and blocking those would be worse
+  than the duplicates. Only **pending/approved** proposals are checked against, never rejected
+  ones: a rejection usually asks for a fix, and the improved retry necessarily resembles what
+  it improves on.
 - `deliverables.ts` — derives "what has this agent actually built" from act-phase actions on approved
   proposals: one record per proposal, carrying its repo / live deployment / PR as typed artifacts.
   Purely derived on read (`GET /api/deliverables`), so it can't disagree with the action log and adds

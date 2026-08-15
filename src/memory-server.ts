@@ -21,6 +21,7 @@ import { deletePoint, qdrantAvailable, searchByText, upsertText } from "./qdrant
 // still in the DB; tool-output.ts is the single place that knows how to read either.
 import { extractResultUrl } from "./tool-output.js";
 import { DELIVERABLE_TOOLS, type DeliverableActionRow } from "./deliverables.js";
+import { findNearDuplicate } from "./proposal-similarity.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS research_notes (
@@ -363,6 +364,25 @@ export class MemoryStore {
 
   listAllProposals() {
     return this.db.prepare(`SELECT * FROM proposals ORDER BY created_at DESC`).all() as unknown as ProposalRow[];
+  }
+
+  /** Pending or approved -- the proposals a new one would be a duplicate *of*. */
+  listOpenProposals() {
+    return this.db
+      .prepare(`SELECT * FROM proposals WHERE status IN ('pending', 'approved') ORDER BY created_at DESC`)
+      .all() as unknown as ProposalRow[];
+  }
+
+  /**
+   * The closest open proposal to a candidate, if it's close enough to be the same idea reworded.
+   *
+   * Rejected proposals are deliberately not checked against: a rejection usually comes with a
+   * reason, and the improved retry that reason asks for is a *good* proposal that would score
+   * as a near-duplicate of the thing it improves on. Blocking it would turn one "no" into a
+   * permanent ban on the whole subject.
+   */
+  findDuplicateProposal(candidate: { domain: string; description: string }) {
+    return findNearDuplicate(candidate, this.listOpenProposals());
   }
 
   decideProposal(id: number, status: "approved" | "rejected", humanNotes?: string) {
@@ -1212,6 +1232,26 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
       requiredTools: z.array(z.string()).describe("Exact tool names needed for execution, e.g. ['WebSearch','WebFetch']"),
     },
     async ({ domain, description, expectedCost, expectedTimeHours, expectedUpside, requiredTools }) => {
+      // Last line of defence against the same idea arriving under a new name. The research
+      // prompt already lists the open queue, but advice loses to a good-sounding rewording --
+      // this doesn't. Refused in-band (a normal tool result, not an exception) so the model
+      // reads it and gets another turn to propose something genuinely different.
+      const duplicate = store.findDuplicateProposal({ domain, description });
+      if (duplicate) {
+        const { proposal, score, shared } = duplicate;
+        const state = proposal.status === "pending" ? "still awaiting review" : "already approved";
+        console.log(
+          `[proposal_create] refused a near-duplicate of #${proposal.id} (${score.toFixed(2)} overlap)`
+        );
+        return [
+          `Not created -- this is too close to proposal #${proposal.id}, which is ${state}.`,
+          `Overlap: ${(score * 100).toFixed(0)}% of the distinctive terms in the two are shared (${shared.slice(0, 12).join(", ")}).`,
+          `#${proposal.id} [${proposal.domain}]: ${proposal.description.split("\n").find((l) => l.trim()) ?? proposal.description}`,
+          `Re-proposing it doesn't get it built any sooner -- it only buries the original in the review queue.`,
+          `If there is real work left here, propose the concrete *next step* on #${proposal.id} instead: name that id in your description and scope it to what #${proposal.id} does not already cover. If your idea genuinely differs, say how in the description -- restating the same pitch in different words will be refused again.`,
+        ].join("\n");
+      }
+
       const id = store.createProposal({
         domain,
         description,
