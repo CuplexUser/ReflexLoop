@@ -386,8 +386,9 @@ because `modal/locale` does `{...enUS.Modal}` at module top level and that runs 
 holding `en_US` is evaluated. The result is `Uncaught TypeError: Cannot read properties of undefined
 (reading 'Modal')` before React mounts, i.e. **a blank page in production only** — `npm run web:dev`
 does no chunking, so it looks fine there. If you touch the chunking, verify a real build, not just
-the dev server. Chunks and the whole `dist/` listing are what `npm run web:build` prints; it warns
-about the antd chunk exceeding 500 KB, and that warning is expected.
+the dev server. Chunks and the whole `dist/` listing are what `npm run web:build` prints.
+`build.chunkSizeWarningLimit` is raised to 1200 kB because the antd chunk is ~1 MB and can't be split
+further — it's raised just above that, not disabled, so a chunk that grows for a new reason still warns.
 
 **Table plumbing.** Pages call `useTableView(storageKey, columns)`, which wraps `useResizableColumns`
 and adds column show/hide, density, and page size (all persisted per table), returning `tableProps` to

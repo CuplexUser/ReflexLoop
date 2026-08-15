@@ -7,6 +7,10 @@ const backend = process.env.AGENT_SERVER_PORT ?? '4001'
 export default defineConfig({
   plugins: [react()],
   build: {
+    // The antd chunk is ~1 MB uncompressed (~320 KB gzip) and can't be split further -- see the
+    // note below -- so the default 500 kB warning fires on every build for a size we've accepted.
+    // Raised to just above it, not switched off, so a chunk that genuinely grows still says so.
+    chunkSizeWarningLimit: 1200,
     rolldownOptions: {
       output: {
         codeSplitting: {
