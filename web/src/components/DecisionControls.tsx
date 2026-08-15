@@ -1,8 +1,9 @@
 import { Suspense, lazy, useState } from 'react'
-import { App, Button, Divider, Input, Space, Spin, Typography } from 'antd'
+import { App, Button, Divider, Input, Space, Spin, Tooltip, Typography } from 'antd'
 import { CheckCircleOutlined, CloseCircleOutlined, EditOutlined } from '@ant-design/icons'
 import type { ProposalRow } from '../types'
 import { api, type ScheduleOptions, type ScopeEdits } from '../api'
+import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { palette } from '../theme'
 import { ToolFence } from './ToolFence'
 
@@ -24,6 +25,7 @@ const SchedulePriorityFields = lazy(() =>
  */
 export function DecisionControls({ proposal, onDecided }: { proposal: ProposalRow; onDecided?: () => void }) {
   const { message } = App.useApp()
+  const consoleOnly = useConsoleOnly()
   const [rejecting, setRejecting] = useState(false)
   const [notes, setNotes] = useState('')
   const [submitting, setSubmitting] = useState<'approve' | 'reject' | null>(null)
@@ -117,33 +119,43 @@ export function DecisionControls({ proposal, onDecided }: { proposal: ProposalRo
 
       <Divider style={{ margin: '4px 0' }} />
 
-      <Space>
-        <Button
-          type="primary"
-          icon={<CheckCircleOutlined />}
-          loading={submitting === 'approve'}
-          disabled={submitting !== null}
-          style={{ background: palette.approved, borderColor: palette.approved }}
-          onClick={() => decide(true)}
-        >
-          {edited ? 'Approve with edits' : 'Approve'}
-        </Button>
-        {rejecting ? (
+      {/* A decision resolves a promise inside the agent process. There is no such promise in
+          console-only mode, so the endpoint refuses it -- say that before the click. */}
+      <Tooltip title={consoleOnly ? READ_ONLY_HINT : undefined}>
+        <Space>
           <Button
-            danger
-            icon={<CloseCircleOutlined />}
-            loading={submitting === 'reject'}
-            disabled={submitting !== null}
-            onClick={() => decide(false)}
+            type="primary"
+            icon={<CheckCircleOutlined />}
+            loading={submitting === 'approve'}
+            disabled={submitting !== null || consoleOnly}
+            style={consoleOnly ? undefined : { background: palette.approved, borderColor: palette.approved }}
+            onClick={() => decide(true)}
           >
-            Confirm reject
+            {edited ? 'Approve with edits' : 'Approve'}
           </Button>
-        ) : (
-          <Button danger ghost icon={<CloseCircleOutlined />} disabled={submitting !== null} onClick={() => setRejecting(true)}>
-            Reject
-          </Button>
-        )}
-      </Space>
+          {rejecting ? (
+            <Button
+              danger
+              icon={<CloseCircleOutlined />}
+              loading={submitting === 'reject'}
+              disabled={submitting !== null || consoleOnly}
+              onClick={() => decide(false)}
+            >
+              Confirm reject
+            </Button>
+          ) : (
+            <Button
+              danger
+              ghost
+              icon={<CloseCircleOutlined />}
+              disabled={submitting !== null || consoleOnly}
+              onClick={() => setRejecting(true)}
+            >
+              Reject
+            </Button>
+          )}
+        </Space>
+      </Tooltip>
     </Space>
   )
 }

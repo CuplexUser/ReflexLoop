@@ -58,15 +58,35 @@ npm run start:console # console-only: serves the real DB read-only, runs no loop
 doesn't work on Windows) is the harness for working on `web/` and `server.ts`: it opens the real
 database **read-only**, starts the API and console against it, and stops there. No research cycle,
 no scheduler, no review queue, no model client — every one of those exists to write something, and
-this mode writes nothing. It needs no provider key and no `AGENT_MODEL`.
+this mode writes nothing to the record. It needs no provider key and no `AGENT_MODEL`.
 
 Read-only is enforced twice on purpose: SQLite itself rejects writes (`new MemoryStore(path,
-{ readOnly: true })`), and `server.ts` refuses any non-GET `/api` request with a 403 so the UI gets
-one clear answer instead of a SQLite error surfacing from somewhere deep. That also means the
-console's write features (approve/reject, muting a lesson, editing scope) can't be exercised in this
-mode — that's the trade for touching nothing. The obvious alternative, a scripted model driving the
-real loop against a scratch DB, was tried and rejected: an empty DB makes the console useless to
+{ readOnly: true })`), and `server.ts` refuses non-GET `/api` requests with a 403 so the UI gets
+one clear answer instead of a SQLite error surfacing from somewhere deep. So the console's write
+features (approve/reject, muting a lesson, editing scope, review verdicts) can't be exercised in
+this mode — that's the trade for touching nothing. The obvious alternative, a scripted model driving
+the real loop against a scratch DB, was tried and rejected: an empty DB makes the console useless to
 develop against, and a copy of the real one drifts.
+
+**The one exception: domains, cycle interval and pause are writable here.** They're the settings
+the *next* real run reads at startup, and `AGENT_DOMAINS` stops being the source of truth the moment
+the console first sets domains — so without this, retargeting the loop before starting it meant
+hand-editing `control_settings` with a sqlite one-liner. `MemoryStore` stays read-only; those three
+persist through `ControlSettingsWriter`, a **separate connection that can reach three keys of one
+table and nothing else**. Relaxing the store to read/write instead would have put every proposal,
+lesson and action one forgotten `if` away from a mode whose whole promise is that it writes nothing —
+this way the capability added is the small one, and the guarantee over everything else is untouched
+rather than re-defended. Both layers still apply: `CONSOLE_ONLY_WRITABLE_ROUTES` is the server's
+allowlist, and the writer independently ignores any other key.
+
+`directive`, run-now and abort are **excluded on purpose** even though a directive persists like the
+others: all three need a research loop, and this mode has none. Run-now especially would answer 200
+and wake nothing — a control that reports success and has no effect is worse than one that refuses.
+`GET /api/status` returns `consoleOnly` so the UI disables exactly what the server would reject
+(`web/src/consoleOnly.ts` → `useConsoleOnly()` / `READ_ONLY_HINT`) instead of offering every write
+button and failing after the click; a header tag says which mode you're in. **New write controls
+should read that hook**, and new writable routes have to be added to the allowlist *and* the
+writer's key set, or they'll 403 in this mode.
 
 Vitest covers the parts that can be tested without an API key: `src/memory-server.test.ts`
 (`MemoryStore` against an in-memory SQLite DB, with `qdrant.ts` mocked so semantic-search tests exercise

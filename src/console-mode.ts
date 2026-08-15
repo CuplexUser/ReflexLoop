@@ -11,8 +11,13 @@
  *
  * In this mode the process serves the API and the web console against the real database,
  * opened READ-ONLY, and runs no agent loop at all. So: your real data on screen, no model
- * API called, no token spent, and nothing that can modify a row -- not by the agent, which
- * isn't running, and not by the console, whose write endpoints are refused.
+ * API called, no token spent, and nothing that can modify the record -- not by the agent,
+ * which isn't running, and not by the console, whose write endpoints are refused.
+ *
+ * The one exception is the three operator settings the *next* real run reads at startup:
+ * domains, cycle interval and pause. They persist through a connection that can reach nothing
+ * else (control-settings-writer.ts) while the store itself stays read-only, so the guarantee
+ * over proposals, actions, lessons, notes, outcomes and runs is unchanged.
  *
  * Nothing here is mocked or simulated. It is the real database and the real server; the
  * only thing missing is the agent.

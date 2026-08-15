@@ -45,6 +45,7 @@ import {
   reportExecutionState,
 } from "./agent-control.js";
 import { startServer } from "./server.js";
+import { ControlSettingsWriter } from "./control-settings-writer.js";
 
 const DOMAINS = (process.env.AGENT_DOMAINS ?? "micro-SaaS tool for developers (self-built and self-hosted),Chrome extension for developers,VS Code extension for developers")
   .split(",")
@@ -651,21 +652,31 @@ function enqueueForReview(proposal: ProposalRow): void {
  * Console-only mode: start the API server against the read-only store and stop there.
  *
  * No research cycle, no scheduler, no pending-review queue, no model client -- every one
- * of those exists to write something, and this mode exists to write nothing. What you get
- * is the real database on screen, which is the whole point: an empty DB makes the console
- * impossible to work on.
+ * of those exists to write something, and this mode exists to write nothing to *the record*:
+ * no proposal, action, lesson, note, outcome or run can change here.
+ *
+ * The one exception is the three operator settings the next real run reads at startup --
+ * domains, cycle interval, and the pause switch. Without them, retargeting the loop before
+ * starting it meant hand-editing `control_settings` with a sqlite one-liner, because
+ * AGENT_DOMAINS stops being the source of truth the first time the console sets domains.
+ * They persist through `ControlSettingsWriter`, a connection that can reach three keys of one
+ * table and nothing else -- the store itself stays read-only, so the guarantee that covers
+ * everything else is untouched rather than relaxed and re-defended. See that module, and the
+ * matching route allowlist in server.ts.
  */
 function serveConsoleOnly(): void {
   console.log(`Console-only mode (--console-only). Serving ${DB_PATH} READ-ONLY; the agent loop is not running.`);
-  console.log("No model API will be called and no row can change -- writes are refused by SQLite and by the API.");
-  // The console still needs control state to render the Agent control page; seeded from the
-  // DB as usual, with persistence pointed at nothing since saving it would be a write.
+  console.log("No model API will be called; the only writable settings are domains, cycle interval and pause.");
   const saved = store.loadControlSettings();
+  const settingsWriter = new ControlSettingsWriter(DB_PATH);
   initControl({
     domains: saved.domains ?? DOMAINS,
     cycleIntervalMs: saved.cycleIntervalMs ?? CYCLE_INTERVAL_MS,
     paused: saved.paused,
+    // A directive read from the DB is still shown (it's part of control state), but this
+    // mode's writer drops it, and the API refuses the route -- nothing here can queue one.
     directive: saved.directive,
+    persist: (patch) => settingsWriter.save(patch),
   });
   startServer(store, SERVER_PORT);
 }

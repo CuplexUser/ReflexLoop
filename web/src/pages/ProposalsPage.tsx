@@ -4,6 +4,7 @@ import { App, Button, Input, Popconfirm, Space, Table, Tag, Tooltip, Typography 
 import { CheckCircleOutlined, CloseCircleOutlined } from '@ant-design/icons'
 import type { OutcomeRow, Priority, ProposalRow } from '../types'
 import { api } from '../api'
+import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { ProposalDialog } from '../components/ProposalDialog'
 import { TableToolbar } from '../components/TableToolbar'
 import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, markdownPreview, recurrenceLabel, timeAgo } from '../format'
@@ -22,6 +23,7 @@ const PRIORITY_RANK: Record<Priority, number> = { urgent: 3, high: 2, normal: 1,
 
 export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[]; outcomes: OutcomeRow[] }) {
   const { message } = App.useApp()
+  const consoleOnly = useConsoleOnly()
   const navigate = useNavigate()
   const { id } = useParams()
   const outcomeByProposal = new Map(outcomes.map((o) => [o.proposal_id, o]))
@@ -214,25 +216,32 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
           <Popconfirm
             title={`Approve ${pendingSelected.length} proposal${pendingSelected.length === 1 ? '' : 's'}?`}
             description="Each runs with default priority and no schedule. To edit scope, open one individually."
+            disabled={consoleOnly}
             onConfirm={() => bulkDecide(true)}
           >
-            <Button
-              type="primary"
-              size="small"
-              icon={<CheckCircleOutlined />}
-              loading={bulkSubmitting}
-              style={{ background: palette.approved, borderColor: palette.approved }}
-            >
-              Approve all
-            </Button>
+            <Tooltip title={consoleOnly ? READ_ONLY_HINT : undefined}>
+              <Button
+                type="primary"
+                size="small"
+                icon={<CheckCircleOutlined />}
+                loading={bulkSubmitting}
+                disabled={consoleOnly}
+                style={consoleOnly ? undefined : { background: palette.approved, borderColor: palette.approved }}
+              >
+                Approve all
+              </Button>
+            </Tooltip>
           </Popconfirm>
           <Popconfirm
             title={`Reject ${pendingSelected.length} proposal${pendingSelected.length === 1 ? '' : 's'}?`}
+            disabled={consoleOnly}
             onConfirm={() => bulkDecide(false)}
           >
-            <Button danger ghost size="small" icon={<CloseCircleOutlined />} loading={bulkSubmitting}>
-              Reject all
-            </Button>
+            <Tooltip title={consoleOnly ? READ_ONLY_HINT : undefined}>
+              <Button danger ghost size="small" icon={<CloseCircleOutlined />} loading={bulkSubmitting} disabled={consoleOnly}>
+                Reject all
+              </Button>
+            </Tooltip>
           </Popconfirm>
           <Button size="small" type="link" onClick={() => setSelectedIds([])}>
             Clear

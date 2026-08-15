@@ -1,8 +1,24 @@
 import { useEffect, useState } from 'react'
-import { Alert, App, Button, Card, Col, Input, InputNumber, Popconfirm, Row, Space, Switch, Tag, Typography } from 'antd'
+import {
+  Alert,
+  App,
+  Button,
+  Card,
+  Col,
+  Input,
+  InputNumber,
+  Popconfirm,
+  Row,
+  Space,
+  Switch,
+  Tag,
+  Tooltip,
+  Typography,
+} from 'antd'
 import { PauseCircleOutlined, PlayCircleOutlined, StopOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import type { ControlState } from '../types'
 import { api } from '../api'
+import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { recurrenceLabel } from '../format'
 import { palette } from '../theme'
 
@@ -10,9 +26,15 @@ import { palette } from '../theme'
  * Runtime knobs that used to require an env change and a restart. Everything here either
  * reduces what the agent does (pause, abort) or redirects what it researches — none of it can
  * approve a proposal or widen the act-phase fence, which stay with the review flow.
+ *
+ * Under `start:console` this is the only page that still writes, and only in part: domains,
+ * cycle interval and the running switch persist for the next real run, while the directive,
+ * run-now and abort need a loop that isn't there. Those three are disabled rather than left
+ * to fail — run-now especially, which would otherwise report success and wake nothing.
  */
 export function ControlPage({ historyVersion }: { historyVersion: number }) {
   const { message } = App.useApp()
+  const consoleOnly = useConsoleOnly()
   const [control, setControl] = useState<ControlState | null>(null)
   const [domainsText, setDomainsText] = useState('')
   const [directive, setDirective] = useState('')
@@ -84,16 +106,20 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
               </Space>
 
               <Space size={12} wrap>
-                <Button
-                  icon={<ThunderboltOutlined />}
-                  disabled={control.paused}
-                  loading={busy === 'run-now'}
-                  onClick={() => run('run-now', api.runNow, 'Research cycle starting now')}
-                >
-                  Run a cycle now
-                </Button>
+                <Tooltip title={consoleOnly ? READ_ONLY_HINT : undefined}>
+                  <Button
+                    icon={<ThunderboltOutlined />}
+                    disabled={control.paused || consoleOnly}
+                    loading={busy === 'run-now'}
+                    onClick={() => run('run-now', api.runNow, 'Research cycle starting now')}
+                  >
+                    Run a cycle now
+                  </Button>
+                </Tooltip>
                 <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  Skips the rest of the wait, currently {recurrenceLabel(control.cycleIntervalMs)}.
+                  {consoleOnly
+                    ? 'No loop is running to wake — start the agent with npm start.'
+                    : `Skips the rest of the wait, currently ${recurrenceLabel(control.cycleIntervalMs)}.`}
                 </Typography.Text>
               </Space>
 
@@ -133,11 +159,14 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
                     title="Abort the running act phase?"
                     description="Side effects that already landed stay landed — there is no rollback. Nothing further is attempted, and no outcome or lesson is recorded."
                     okButtonProps={{ danger: true }}
+                    disabled={consoleOnly}
                     onConfirm={() => run('abort', () => api.abort(control.runningProposalId ?? undefined), 'Abort requested')}
                   >
-                    <Button danger icon={<StopOutlined />} loading={busy === 'abort'}>
-                      Abort
-                    </Button>
+                    <Tooltip title={consoleOnly ? READ_ONLY_HINT : undefined}>
+                      <Button danger icon={<StopOutlined />} loading={busy === 'abort'} disabled={consoleOnly}>
+                        Abort
+                      </Button>
+                    </Tooltip>
                   </Popconfirm>
                 </Space>
               )}
@@ -190,16 +219,24 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
             than quietly reshaping every future one. The output is still a proposal you have to approve. A queued
             directive survives a restart; being used clears it.
           </Typography.Text>
+          {consoleOnly && (
+            <Alert
+              type="info"
+              showIcon
+              message="Not settable from the read-only console — a directive steers a research cycle, and this mode runs none."
+            />
+          )}
           <Input.TextArea
             placeholder="e.g. Focus on ideas that need no paid infrastructure, and prefer extending existing repos over new ones."
             value={directive}
             onChange={(e) => setDirective(e.target.value)}
+            disabled={consoleOnly}
             autoSize={{ minRows: 2, maxRows: 6 }}
           />
           <Space>
             <Button
               type="primary"
-              disabled={directive.trim() === (control.directive ?? '')}
+              disabled={consoleOnly || directive.trim() === (control.directive ?? '')}
               loading={busy === 'directive'}
               onClick={() => run('directive', () => api.setDirective(directive.trim() || null), 'Directive saved')}
             >
@@ -207,6 +244,7 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
             </Button>
             {control.directive && (
               <Button
+                disabled={consoleOnly}
                 loading={busy === 'clear-directive'}
                 onClick={() =>
                   run(

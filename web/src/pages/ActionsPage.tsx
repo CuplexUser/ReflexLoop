@@ -4,6 +4,7 @@ import { LinkOutlined } from '@ant-design/icons'
 import { Input, Segmented, Select, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import type { ActionWithProposal, OutcomeRow, Priority, ProposalRow } from '../types'
 import { api } from '../api'
+import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import {
   PHASE_LABEL,
   PRIORITY_LABEL,
@@ -114,6 +115,7 @@ export function ActionsPage({
   onSetReview: (id: number, reviewStatus: ReviewStatus) => void
 }) {
   const navigate = useNavigate()
+  const consoleOnly = useConsoleOnly()
   const { id } = useParams()
   const [actions, setActions] = useState<ActionWithProposal[]>([])
   const [loading, setLoading] = useState(true)
@@ -275,13 +277,16 @@ export function ActionsPage({
       onFilter: (value, record) => (record.proposal.review_status ?? 'unreviewed') === value,
       render: (_, g) => (
         <div onClick={(e) => e.stopPropagation()}>
-          <Select<'unreviewed' | 'mvp_done' | 'needs_refinement'>
-            size="small"
-            style={{ width: 168 }}
-            value={g.proposal.review_status ?? 'unreviewed'}
-            onChange={(v) => onSetReview(g.proposal.id, v === 'unreviewed' ? null : v)}
-            options={REVIEW_OPTIONS}
-          />
+          <Tooltip title={consoleOnly ? READ_ONLY_HINT : undefined}>
+            <Select<'unreviewed' | 'mvp_done' | 'needs_refinement'>
+              size="small"
+              style={{ width: 168 }}
+              value={g.proposal.review_status ?? 'unreviewed'}
+              disabled={consoleOnly}
+              onChange={(v) => onSetReview(g.proposal.id, v === 'unreviewed' ? null : v)}
+              options={REVIEW_OPTIONS}
+            />
+          </Tooltip>
         </div>
       ),
     },

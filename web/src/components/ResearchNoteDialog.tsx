@@ -1,7 +1,8 @@
-import { App, Button, Modal, Popconfirm, Progress, Space, Typography } from 'antd'
+import { App, Button, Modal, Popconfirm, Progress, Space, Tooltip, Typography } from 'antd'
 import { DeleteOutlined } from '@ant-design/icons'
 import type { ResearchNoteRow } from '../types'
 import { api } from '../api'
+import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { palette } from '../theme'
 import { MarkdownLite } from './MarkdownLite'
 
@@ -17,6 +18,7 @@ export function ResearchNoteDialog({
   onChanged?: () => void
 }) {
   const { message } = App.useApp()
+  const readOnly = useConsoleOnly()
   if (!note) return null
 
   async function remove() {
@@ -67,11 +69,14 @@ export function ResearchNoteDialog({
             title="Delete this research note?"
             description="Permanent, and removes it from the agent's semantic search."
             okButtonProps={{ danger: true }}
+            disabled={readOnly}
             onConfirm={remove}
           >
-            <Button danger ghost icon={<DeleteOutlined />}>
-              Delete
-            </Button>
+            <Tooltip title={readOnly ? READ_ONLY_HINT : undefined}>
+              <Button danger ghost icon={<DeleteOutlined />} disabled={readOnly}>
+                Delete
+              </Button>
+            </Tooltip>
           </Popconfirm>
         </div>
       </Space>

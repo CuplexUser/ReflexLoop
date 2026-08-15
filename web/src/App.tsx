@@ -1,6 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { App as AntApp, Badge, Button, Layout, Menu, Spin, Tooltip, Typography } from 'antd'
+import { App as AntApp, Badge, Button, Layout, Menu, Spin, Tag, Tooltip, Typography } from 'antd'
 import {
   BulbOutlined,
   CodeOutlined,
@@ -21,6 +21,7 @@ import { getToken } from './auth'
 import { StatusBar } from './components/StatusBar'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { TokenGate } from './components/TokenGate'
+import { ConsoleOnlyContext, READ_ONLY_HINT } from './consoleOnly'
 import { DashboardPage } from './pages/DashboardPage'
 import { palette, type ThemeMode } from './theme'
 import type { OutcomeRow, ProposalRow, StatusResponse } from './types'
@@ -149,6 +150,7 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
   }
 
   return (
+    <ConsoleOnlyContext.Provider value={status?.consoleOnly ?? false}>
     <Layout style={{ minHeight: '100vh' }}>
       <Layout.Sider width={220} breakpoint="lg" collapsedWidth={0}>
         <div style={{ padding: '20px 24px 12px' }}>
@@ -195,7 +197,16 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
             domains={socket.domains.length > 0 ? socket.domains : (status?.domains ?? [])}
             runningPhase={socket.runningPhase}
           />
-          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+            {status?.consoleOnly && (
+              // Sits in the header rather than on the page, because it is true of every page:
+              // whichever one you're on, its write controls are disabled and this says why.
+              <Tooltip title={READ_ONLY_HINT}>
+                <Tag color="warning" style={{ marginInlineEnd: 0 }}>
+                  read-only console
+                </Tag>
+              </Tooltip>
+            )}
             <Tooltip title="Search everything (Cmd-K)">
               <Button icon={<SearchOutlined />} onClick={() => setPaletteOpen(true)}>
                 Search
@@ -285,6 +296,7 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
         </Suspense>
       )}
     </Layout>
+    </ConsoleOnlyContext.Provider>
   )
 }
 

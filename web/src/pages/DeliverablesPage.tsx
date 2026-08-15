@@ -10,6 +10,7 @@ import {
 import { Alert, Button, Card, Empty, Input, Segmented, Select, Space, Spin, Tag, Tooltip, Typography } from 'antd'
 import type { Deliverable, DeliverableArtifact, ProposalRow } from '../types'
 import { api } from '../api'
+import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { markdownPreview, money, timeAgo } from '../format'
 import { MarkdownLite } from '../components/MarkdownLite'
 import { palette } from '../theme'
@@ -114,6 +115,7 @@ function DeliverableCard({
   onOpenTrail: (proposalId: number) => void
   onOpenProposal: (proposalId: number) => void
 }) {
+  const readOnly = useConsoleOnly()
   const { outcome } = deliverable
   return (
     <Card
@@ -171,13 +173,16 @@ function DeliverableCard({
 
       <Space style={{ width: '100%', justifyContent: 'space-between' }}>
         {/* Same verdict the Actions page sets -- this is where you'd form it, having just opened the thing. */}
-        <Select<'unreviewed' | 'mvp_done' | 'needs_refinement'>
-          size="small"
-          style={{ width: 168 }}
-          value={deliverable.reviewStatus ?? 'unreviewed'}
-          onChange={(v) => onSetReview(deliverable.proposalId, v === 'unreviewed' ? null : v)}
-          options={REVIEW_OPTIONS}
-        />
+        <Tooltip title={readOnly ? READ_ONLY_HINT : undefined}>
+          <Select<'unreviewed' | 'mvp_done' | 'needs_refinement'>
+            size="small"
+            style={{ width: 168 }}
+            value={deliverable.reviewStatus ?? 'unreviewed'}
+            disabled={readOnly}
+            onChange={(v) => onSetReview(deliverable.proposalId, v === 'unreviewed' ? null : v)}
+            options={REVIEW_OPTIONS}
+          />
+        </Tooltip>
         <Button type="link" size="small" style={{ padding: 0 }} onClick={() => onOpenTrail(deliverable.proposalId)}>
           {deliverable.actionCount} actions →
         </Button>

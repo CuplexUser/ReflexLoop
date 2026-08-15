@@ -4,6 +4,7 @@ import { App, Badge, Button, Card, Empty, Input, Modal, Progress, Space, Table, 
 import { MergeCellsOutlined } from '@ant-design/icons'
 import type { DuplicateNotePair, ResearchNoteRow } from '../types'
 import { api } from '../api'
+import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { markdownPreview, timeAgo } from '../format'
 import { palette } from '../theme'
 import { ResearchNoteDialog } from '../components/ResearchNoteDialog'
@@ -27,6 +28,7 @@ function DuplicatesModal({
   onMerged: () => void
 }) {
   const { message } = App.useApp()
+  const readOnly = useConsoleOnly()
   const [pairs, setPairs] = useState<DuplicateNotePair[]>([])
   const [loading, setLoading] = useState(true)
   const [merging, setMerging] = useState<number | null>(null)
@@ -68,14 +70,17 @@ function DuplicatesModal({
           <Typography.Text type="secondary" style={{ fontSize: 11 }}>
             {note.source ?? 'no source'} · {timeAgo(note.fetched_at)}
           </Typography.Text>
-          <Button
-            size="small"
-            icon={<MergeCellsOutlined />}
-            loading={merging === other.id}
-            onClick={() => merge(note, other)}
-          >
-            Keep this, merge #{other.id} in
-          </Button>
+          <Tooltip title={readOnly ? READ_ONLY_HINT : undefined}>
+            <Button
+              size="small"
+              icon={<MergeCellsOutlined />}
+              loading={merging === other.id}
+              disabled={readOnly}
+              onClick={() => merge(note, other)}
+            >
+              Keep this, merge #{other.id} in
+            </Button>
+          </Tooltip>
         </Space>
       </Card>
     )

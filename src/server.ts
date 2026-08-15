@@ -29,6 +29,7 @@ import { fireReactiveTrigger } from "./reactive-triggers.js";
 import { ALL_GRANTABLE_TOOLS, toolRisk } from "./tool-catalog.js";
 import { buildDeliverables, type DeliverableOutcomeRow } from "./deliverables.js";
 import { isConsoleOnlyMode } from "./console-mode.js";
+import { CONSOLE_ONLY_WRITABLE_ROUTES } from "./control-settings-writer.js";
 import {
   getControlState,
   requestAbort,
@@ -79,14 +80,26 @@ export function startServer(store: MemoryStore, port: number): Server {
     );
   }
 
-  // Console-only mode (--console-only, see console-mode.ts) is read-only all the way down: the store
-  // is opened read-only, so a write would surface as a SQLite error from somewhere deep.
-  // Refusing it here instead means the UI gets one clear answer, and "nothing can change
-  // the database" is enforced at the entrance rather than discovered at the exit.
+  // Console-only mode (--console-only, see console-mode.ts) is read-only apart from three
+  // operator settings. The store is opened read-only, so anything else would surface as a
+  // SQLite error from somewhere deep; refusing it here instead means the UI gets one clear
+  // answer, and the refusal is enforced at the entrance rather than discovered at the exit.
+  //
+  // The allowlist is routes, not a general "control endpoints are fine": run-now and abort
+  // are control endpoints too, and both would answer 200 while doing nothing at all in this
+  // mode (no loop is sleeping for run-now to wake, and no act phase is running to abort).
+  // A button that reports success and has no effect is worse than one that refuses. The
+  // writer behind these three enforces the same three keys independently -- see
+  // control-settings-writer.ts.
   if (isConsoleOnlyMode()) {
     app.use("/api", (req: Request, res: Response, next: NextFunction) => {
       if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
-      res.status(403).json({ error: "Read-only console mode (--console-only): this instance cannot modify anything." });
+      const path = req.path.replace(/\/+$/, "");
+      if (req.method === "POST" && CONSOLE_ONLY_WRITABLE_ROUTES.includes(path)) return next();
+      res.status(403).json({
+        error:
+          "Read-only console mode (--console-only): only the domains, cycle interval and pause settings can be changed here.",
+      });
     });
   }
 
@@ -98,6 +111,9 @@ export function startServer(store: MemoryStore, port: number): Server {
       totalCostUsd: store.totalRunCost(),
       control,
       authRequired: Boolean(API_TOKEN),
+      // So the UI can disable what this instance would refuse, instead of offering every
+      // write button and letting each one fail with a 403 toast once clicked.
+      consoleOnly: isConsoleOnlyMode(),
     });
   });
 

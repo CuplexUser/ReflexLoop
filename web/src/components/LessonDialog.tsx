@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
-import { Alert, App, Button, Input, Modal, Popconfirm, Progress, Space, Switch, Tag, Typography } from 'antd'
+import { Alert, App, Button, Input, Modal, Popconfirm, Progress, Space, Switch, Tag, Tooltip, Typography } from 'antd'
 import { DeleteOutlined, EditOutlined } from '@ant-design/icons'
 import type { LessonRow } from '../types'
 import { api } from '../api'
+import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { palette } from '../theme'
 
 /**
@@ -22,6 +23,7 @@ export function LessonDialog({
   onChanged?: () => void
 }) {
   const { message } = App.useApp()
+  const readOnly = useConsoleOnly()
   const [editing, setEditing] = useState(false)
   const [domain, setDomain] = useState('')
   const [text, setText] = useState('')
@@ -165,27 +167,30 @@ export function LessonDialog({
           {lesson.derived_from_outcome_id != null && <> · Derived from outcome #{lesson.derived_from_outcome_id}</>}
         </Typography.Text>
 
-        <Space size={16} wrap style={{ borderTop: `1px solid ${palette.border}`, paddingTop: 12, width: '100%' }}>
-          {!editing && (
-            <Button icon={<EditOutlined />} onClick={() => setEditing(true)}>
-              Edit
-            </Button>
-          )}
-          <Space size={8}>
-            <Switch checked={lesson.muted === 1} loading={muting} onChange={toggleMute} />
-            <Typography.Text>Mute (hide from the agent)</Typography.Text>
+        <Tooltip title={readOnly ? READ_ONLY_HINT : undefined}>
+          <Space size={16} wrap style={{ borderTop: `1px solid ${palette.border}`, paddingTop: 12, width: '100%' }}>
+            {!editing && (
+              <Button icon={<EditOutlined />} disabled={readOnly} onClick={() => setEditing(true)}>
+                Edit
+              </Button>
+            )}
+            <Space size={8}>
+              <Switch checked={lesson.muted === 1} loading={muting} disabled={readOnly} onChange={toggleMute} />
+              <Typography.Text type={readOnly ? 'secondary' : undefined}>Mute (hide from the agent)</Typography.Text>
+            </Space>
+            <Popconfirm
+              title="Delete this lesson?"
+              description="Permanent. Mute instead if you only want the agent to stop using it."
+              okButtonProps={{ danger: true }}
+              disabled={readOnly}
+              onConfirm={remove}
+            >
+              <Button danger ghost icon={<DeleteOutlined />} disabled={readOnly}>
+                Delete
+              </Button>
+            </Popconfirm>
           </Space>
-          <Popconfirm
-            title="Delete this lesson?"
-            description="Permanent. Mute instead if you only want the agent to stop using it."
-            okButtonProps={{ danger: true }}
-            onConfirm={remove}
-          >
-            <Button danger ghost icon={<DeleteOutlined />}>
-              Delete
-            </Button>
-          </Popconfirm>
-        </Space>
+        </Tooltip>
       </Space>
     </Modal>
   )

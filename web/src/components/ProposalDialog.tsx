@@ -3,6 +3,7 @@ import { App, Button, Descriptions, Modal, Skeleton, Space, Statistic, Table, Ta
 import { ClockCircleOutlined, EditOutlined } from '@ant-design/icons'
 import type { ActionRow, OutcomeRow, ProposalRow, RunRow } from '../types'
 import { api } from '../api'
+import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, preview, recurrenceLabel, timeAgo } from '../format'
 import { palette } from '../theme'
 import { MarkdownLite } from './MarkdownLite'
@@ -27,6 +28,7 @@ export function ProposalDialog({
   onClose: () => void
 }) {
   const { message } = App.useApp()
+  const readOnly = useConsoleOnly()
   const [actions, setActions] = useState<ActionRow[] | null>(null)
   const [runs, setRuns] = useState<RunRow[]>([])
   const [cancellingSchedule, setCancellingSchedule] = useState(false)
@@ -68,7 +70,9 @@ export function ProposalDialog({
   // button from appearing when it would obviously fail. `actions === null` means the fetch
   // hasn't landed yet, so hold off rather than offering an edit we may have to reject.
   const hasActed = (actions ?? []).some((a) => a.phase === 'act')
-  const scopeEditable = proposal.status === 'approved' && actions !== null && !hasActed
+  // Read-only console: this endpoint is refused there, and narrowing a fence that no act phase
+  // will read is meaningless anyway, so don't offer the edit at all.
+  const scopeEditable = proposal.status === 'approved' && actions !== null && !hasActed && !readOnly
 
   async function saveScope() {
     if (!proposal) return
@@ -217,9 +221,18 @@ export function ProposalDialog({
               </Tag>
             )}
             {(proposal.next_run_at || proposal.recurrence_ms) && (
-              <Button size="small" danger ghost loading={cancellingSchedule} onClick={cancelSchedule}>
-                Cancel schedule
-              </Button>
+              <Tooltip title={readOnly ? READ_ONLY_HINT : undefined}>
+                <Button
+                  size="small"
+                  danger
+                  ghost
+                  loading={cancellingSchedule}
+                  disabled={readOnly}
+                  onClick={cancelSchedule}
+                >
+                  Cancel schedule
+                </Button>
+              </Tooltip>
             )}
           </Space>
         )}

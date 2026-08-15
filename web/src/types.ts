@@ -135,6 +135,12 @@ export interface StatusResponse {
   totalCostUsd: number
   control: ControlState
   authRequired: boolean
+  /**
+   * The backend is `npm run start:console`: the database is open read-only and every write
+   * is refused except domains, cycle interval and pause. Drives `useConsoleOnly()`, which
+   * disables the affordances this backend would reject.
+   */
+  consoleOnly: boolean
 }
 
 export interface ControlState {
