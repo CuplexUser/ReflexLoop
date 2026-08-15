@@ -233,6 +233,37 @@ const RESEARCH_SYSTEM = [
 
 const RESEARCH_MAX_TURNS = 60;
 
+/** How many existing proposals to show research+plan. Newest first -- old ones are the least likely to be re-proposed. */
+const OPEN_PROPOSAL_DIGEST_LIMIT = 30;
+
+/**
+ * The research phase's view of what has already been proposed.
+ *
+ * Without this it has none: `action_history_search` only covers work that already *ran*
+ * (approved proposals with act-phase actions), and `proposal_status` needs an id the model
+ * has no way to know. So everything sitting in the review queue, and everything approved but
+ * not yet executed, was invisible -- which is exactly how a cycle ends up re-proposing an
+ * idea that's already pending. Injected as prompt context rather than offered as a tool: a
+ * duplicate has to be prevented on every cycle, and a tool only helps on the cycles the model
+ * remembers to call it.
+ */
+function openProposalDigest(): string {
+  const open = store
+    .listAllProposals()
+    .filter((p) => p.status === "pending" || p.status === "approved")
+    .slice(0, OPEN_PROPOSAL_DIGEST_LIMIT);
+  if (open.length === 0) return "";
+
+  const lines = open.map((p) => {
+    // Descriptions are Markdown whose first line is a bold headline -- that line alone
+    // identifies the idea, and the bullets underneath would bloat the prompt for no gain.
+    const headline = p.description.split("\n").find((l) => l.trim().length > 0) ?? p.description;
+    const state = p.status === "pending" ? "awaiting review" : store.hasActed(p.id) ? "already built" : "approved, not yet run";
+    return `- #${p.id} [${p.domain}] (${state}): ${preview(headline.replace(/[*_#`]/g, "").trim(), 160)}`;
+  });
+  return lines.join("\n");
+}
+
 async function researchAndPlanPhase(): Promise<ProposalRow[]> {
   const beforeIds = new Set(store.listPendingProposals().map((p) => p.id));
   const domains = getControlState().domains;
@@ -240,6 +271,7 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
   // run, not a standing instruction that quietly reshapes every future cycle. It can
   // only redirect what gets researched; the output is still a proposal needing approval.
   const directive = consumeDirective();
+  const openProposals = openProposalDigest();
 
   const { finalText, toolCalls } = await runPhase({
     phase: "research_plan",
@@ -247,6 +279,11 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
     prompt: [
       `Domains to research this cycle (pick whichever look most promising -- you don't need to cover all of them evenly): ${domains.join("; ")}.`,
       ...(directive ? [`The operator left a directive for this cycle -- weight it heavily: ${directive}`] : []),
+      ...(openProposals
+        ? [
+            `Proposals that already exist -- do NOT propose any of these again, or a near-identical variant of one (same product, same audience, reworded):\n${openProposals}\nIf one of them is the right direction, the useful move is a concrete next step on it -- say which #id it builds on in your description -- not a second proposal for the same thing. A pending one hasn't been rejected; it just hasn't been reviewed yet, and re-proposing it only buries the original.`,
+          ]
+        : []),
       `Before anything else, call lesson_search and research_note_search for each domain/topic you're about to look into -- don't re-research what's already known. lesson_search does semantic matching now, so it can surface relevant lessons even when your domain's wording doesn't exactly match a past one.`,
       `Also call action_history_search for each domain -- it shows what's actually been built/deployed/committed on approved proposals so far, so you don't propose duplicate work (e.g. a second repo for something already shipped). Prefer proposing the next step on existing work over starting over.`,
       `You can use the read-only tools github_read_repo, github_read_file, github_search_repos, vercel_list_projects, vercel_get_project, netlify_list_sites, netlify_get_site to check the existing landscape (competing projects, your own prior projects) before proposing.`,
@@ -301,6 +338,7 @@ async function handleReactiveTrigger(proposalId: number): Promise<void> {
   reactiveInFlight.add(proposalId);
   try {
     const beforeIds = new Set(store.listPendingProposals().map((p) => p.id));
+    const openProposals = openProposalDigest();
 
     await runPhase({
       phase: "research_plan",
@@ -309,6 +347,11 @@ async function handleReactiveTrigger(proposalId: number): Promise<void> {
         `Proposal #${proposal.id} in domain "${proposal.domain}" was marked "needs refinement" by a human reviewer after its deliverable was built: ${proposal.description}`,
         `Call lesson_search and research_note_search for this domain first -- don't re-research what's already known.`,
         `Investigate what's likely missing or broken -- re-read the shipped repo with github_read_repo/github_read_file if that helps.`,
+        ...(openProposals
+          ? [
+              `Proposals that already exist -- don't duplicate one of these. A refinement is a tightly-scoped next step on #${proposal.id}, never a re-proposal of it:\n${openProposals}`,
+            ]
+          : []),
         `If you find something concrete and boundable, call proposal_create for a tightly-scoped follow-up fix addressing the refinement need.`,
         `If there isn't enough signal yet to propose something concrete, save a research_note explaining what's unclear and stop -- don't force a proposal.`,
       ].join("\n"),

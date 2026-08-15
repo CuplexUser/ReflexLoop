@@ -222,9 +222,16 @@ export function DeliverablesPage({
 
   // The review status lives on the proposal, and App owns that list -- so an edit made here
   // (or on the Actions page) is reflected without refetching this page's own data.
+  //
+  // The proposal wins whenever it's present, including when it says null: null is a real
+  // value here ("unreviewed"), not a missing one, so `??` would fall back to this page's
+  // stale copy and make setting a card back to Unreviewed look like it did nothing.
   const withCurrentReview = useMemo(() => {
     const byId = new Map(proposals.map((p) => [p.id, p]))
-    return deliverables.map((d) => ({ ...d, reviewStatus: byId.get(d.proposalId)?.review_status ?? d.reviewStatus }))
+    return deliverables.map((d) => {
+      const proposal = byId.get(d.proposalId)
+      return { ...d, reviewStatus: proposal ? proposal.review_status : d.reviewStatus }
+    })
   }, [deliverables, proposals])
 
   const shown = useMemo(() => {
