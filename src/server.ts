@@ -22,13 +22,20 @@ import path from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
-import { goalTitleFromDomain, type GoalStatus, type MemoryStore, type Priority } from "./memory-server.js";
+import {
+  compareByPriorityThenDue,
+  goalTitleFromDomain,
+  type GoalStatus,
+  type MemoryStore,
+  type Priority,
+  type ProposalRow,
+} from "./memory-server.js";
 import { emitAgentEvent, onAgentEvent, type AgentEvent } from "./events.js";
 import { submitDecision, hasPendingDecision } from "./review-gateway.js";
 import { fireReactiveTrigger } from "./reactive-triggers.js";
 import { ALL_GRANTABLE_TOOLS, toolRisk } from "./tool-catalog.js";
 import { configuredConnectorTools, connectorOperation, connectorStatus } from "./connectors/load.js";
-import { listSettings, updateSettings } from "./settings.js";
+import { getSetting, listSettings, updateSettings } from "./settings.js";
 import { PROVIDERS, PROVIDER_IDS, resolveLlmClients } from "./llm/index.js";
 import { getSearchConfig } from "./search/index.js";
 import { buildDeliverables, type DeliverableOutcomeRow } from "./deliverables.js";
@@ -612,6 +619,68 @@ export function startServer(
 
   app.get("/api/control", (_req, res) => {
     res.json(getControlState());
+  });
+
+  /**
+   * What is building, what is next, and roughly how long it takes.
+   *
+   * Assembled from two sources that answer different halves. The in-memory control state knows
+   * what this process is *doing* -- which proposal the worker holds and which ids are queued
+   * behind it -- and only it can, since the queue never touches the database. The proposals
+   * table knows everything about those ids, plus the work that is due later and hasn't reached
+   * the queue yet. Neither alone is the queue an operator wants to see.
+   *
+   * Ordered with `compareByPriorityThenDue`, the same function `pickNext` pops with, because a
+   * queue view that lists a different order than the worker takes is worse than no view at all.
+   */
+  app.get("/api/queue", (_req, res) => {
+    const control = getControlState();
+    const actModel = String(getSetting("actModel") ?? "") || null;
+    const byId = new Map(store.listAllProposals().map((p) => [p.id, p]));
+    const summarize = (p: ProposalRow) => ({
+      proposalId: p.id,
+      domain: p.domain,
+      description: p.description,
+      priority: p.priority,
+      nextRunAt: p.next_run_at,
+      actStatus: p.act_status,
+      recurrenceMs: p.recurrence_ms,
+    });
+
+    const running = control.runningProposalId === null ? null : byId.get(control.runningProposalId);
+    const queued = control.queuedProposalIds
+      .map((id) => byId.get(id))
+      .filter((p): p is ProposalRow => Boolean(p))
+      .sort(compareByPriorityThenDue);
+
+    // Due later and not yet handed to the worker. `schedulerTick` moves these across when their
+    // time arrives, so from the operator's side it's the same queue one step further out --
+    // showing only the in-memory half would hide every scheduled and recurring build.
+    const inFlight = new Set([...control.queuedProposalIds, control.runningProposalId]);
+    const scheduled = store
+      .listAllProposals()
+      .filter((p) => p.status === "approved" && p.next_run_at && !inFlight.has(p.id))
+      .sort(compareByPriorityThenDue);
+
+    // Approved work with nothing scheduling it: an act phase that was interrupted or didn't
+    // finish is descheduled rather than silently re-run, which means it will sit here forever
+    // until a human says so. That is the intended behaviour and it is also the easiest state to
+    // forget about, so the queue view names it rather than leaving it to be inferred from an
+    // absence.
+    const stalled = store.listStalledBuilds().filter((p) => !inFlight.has(p.id));
+
+    res.json({
+      running: running
+        ? { ...summarize(running), startedAt: control.runningSince, model: actModel }
+        : null,
+      queued: queued.map(summarize),
+      scheduled: scheduled.map(summarize),
+      stalled: stalled.map(summarize),
+        // Scoped when an act-phase model is pinned, unfiltered otherwise -- `actModel` is empty
+      // whenever the phase just uses AGENT_MODEL, and filtering on "" would match nothing.
+      forecast: store.actDurationStats({ model: actModel }),
+      forecastAllModels: store.actDurationStats({}),
+    });
   });
 
   app.post("/api/control/pause", (req, res) => {

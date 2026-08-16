@@ -30,6 +30,7 @@ import { buildWebTools } from "./tools/web.js";
 import {
   MemoryStore,
   buildMemoryTools,
+  compareByPriorityThenDue,
   goalTitleFromDomain,
   parseMonetization,
   parseSteps,
@@ -943,7 +944,8 @@ async function reflectPhase(proposal: ProposalRow, verdict?: ActVerdict): Promis
 // when it's due right now) or later via the scheduler tick (schedulerTick,
 // for anything with a future scheduled_at or a recurring next_run_at).
 
-const PRIORITY_RANK: Record<Priority, number> = { urgent: 3, high: 2, normal: 1, low: 0 };
+// Ordering lives in memory-server.ts (`compareByPriorityThenDue`) so this and GET /api/queue
+// can't disagree about what runs next -- see the note there.
 
 interface QueuedRun {
   proposal: ProposalRow;
@@ -968,11 +970,7 @@ function enqueueDue(proposal: ProposalRow, wasScheduled: boolean): void {
 
 function pickNext(): QueuedRun | undefined {
   if (runQueue.length === 0) return undefined;
-  runQueue.sort((a, b) => {
-    const rankDiff = PRIORITY_RANK[b.proposal.priority] - PRIORITY_RANK[a.proposal.priority];
-    if (rankDiff !== 0) return rankDiff;
-    return (a.proposal.next_run_at ?? "").localeCompare(b.proposal.next_run_at ?? "");
-  });
+  runQueue.sort((a, b) => compareByPriorityThenDue(a.proposal, b.proposal));
   return runQueue.shift();
 }
 

@@ -51,6 +51,13 @@ export interface ControlState {
   /** Live snapshot for the UI -- set by the orchestrator, not by the API. */
   runningProposalId: number | null;
   queuedProposalIds: number[];
+  /**
+   * When the current act phase started, ISO. Derived here rather than passed in, from the
+   * transition into a new `runningProposalId` -- the queue view needs an elapsed time and the
+   * `runs` row that would carry it isn't written until the phase is over, which is exactly the
+   * window where someone is watching and wants to know how long it has been going.
+   */
+  runningSince: string | null;
 }
 
 /** What `initControl` is handed to write settings through -- the DB, in practice. */
@@ -72,6 +79,7 @@ const state: ControlState = {
   directive: null,
   runningProposalId: null,
   queuedProposalIds: [],
+  runningSince: null,
 };
 
 /** A goal is only researched while it's active -- `paused`, `retired` and `suggested` are all out. */
@@ -110,6 +118,7 @@ export function getControlState(): ControlState {
     goals: state.goals.map((g) => ({ ...g })),
     domains: [...state.domains],
     queuedProposalIds: [...state.queuedProposalIds],
+    runningSince: state.runningSince,
   };
 }
 
@@ -166,6 +175,11 @@ export function consumeDirective(): string | null {
 
 /** Orchestrator-owned: keeps the UI's view of what's executing honest. */
 export function reportExecutionState(runningProposalId: number | null, queuedProposalIds: number[]): void {
+  // Only restamped when the running proposal actually changes, so a report that merely updates
+  // the queue doesn't reset the elapsed clock on a build that has been going for twenty minutes.
+  if (runningProposalId !== state.runningProposalId) {
+    state.runningSince = runningProposalId === null ? null : new Date().toISOString();
+  }
   state.runningProposalId = runningProposalId;
   state.queuedProposalIds = queuedProposalIds;
   bus.emit("changed");

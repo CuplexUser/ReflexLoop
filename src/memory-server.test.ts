@@ -261,6 +261,55 @@ describe("recovering from an unclean shutdown", () => {
     expect(store.getProposal(id)!.act_status).toBe("interrupted");
   });
 
+  it("lists a stalled build, but never a pre-migration one that actually shipped", () => {
+    // Recorded as unfinished, nothing scheduling it: genuinely stalled.
+    const stopped = approved()
+    store.markActStarted(stopped);
+    store.recordActVerdict(stopped, { complete: false, problems: ["never committed"] });
+    store.advanceOrClearSchedule(stopped, { recurring: false, recurrenceMs: null });
+
+    // The trap: act_status null because the phase ran before the column existed. Eight rows in
+    // the live DB look like this and several of them shipped. Offering a retry would mean a
+    // duplicate commit or a second deploy.
+    const legacy = approved();
+    store.logAction(legacy, "act", "mcp__integrations__github_commit_files", {}, { commitSha: "abc" });
+    store.advanceOrClearSchedule(legacy, { recurring: false, recurrenceMs: null });
+
+    // Approved and never touched: nothing scheduling it, so it is stalled too.
+    const neverRan = approved();
+    store.advanceOrClearSchedule(neverRan, { recurring: false, recurrenceMs: null });
+
+    const ids = store.listStalledBuilds().map((p) => p.id);
+    expect(ids).toContain(stopped);
+    expect(ids).toContain(neverRan);
+    expect(ids).not.toContain(legacy);
+  });
+
+  it("leaves a queued or completed build out of the stalled list", () => {
+    const queued = approved(); // still has next_run_at from approval
+    const done = approved();
+    store.markActStarted(done);
+    store.recordActVerdict(done, { complete: true, problems: [] });
+    store.advanceOrClearSchedule(done, { recurring: false, recurrenceMs: null });
+
+    const ids = store.listStalledBuilds().map((p) => p.id);
+    expect(ids).not.toContain(queued);
+    expect(ids).not.toContain(done);
+  });
+
+  it("forecasts act duration from the ledger, scoped by model", () => {
+    expect(store.actDurationStats({})).toMatchObject({ samples: 0, medianMs: null });
+
+    const id = approved();
+    store.logRun(id, "act", 0.01, 600_000, new Date().toISOString(), "openrouter", "fast-model");
+    store.logRun(id, "act", 0.01, 1_800_000, new Date().toISOString(), "openrouter", "slow-model");
+    store.logRun(id, "research_plan", 0.01, 5_000, new Date().toISOString(), "openrouter", "fast-model");
+
+    // research_plan is excluded -- this forecasts builds, not cycles.
+    expect(store.actDurationStats({})).toMatchObject({ samples: 2, minMs: 600_000, maxMs: 1_800_000 });
+    expect(store.actDurationStats({ model: "slow-model" })).toMatchObject({ samples: 1, medianMs: 1_800_000 });
+  });
+
   it("re-runs only on an explicit request, and only for approved work", () => {
     const id = approved();
     store.markActStarted(id);

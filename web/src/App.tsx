@@ -3,6 +3,7 @@ import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-
 import { App as AntApp, Badge, Button, Layout, Menu, Spin, Tag, Tooltip, Typography } from 'antd'
 import {
   BulbOutlined,
+  BuildOutlined,
   CodeOutlined,
   AimOutlined,
   ControlOutlined,
@@ -37,6 +38,7 @@ import type { OutcomeRow, ProposalRow, StatusResponse } from './types'
  * add a request round-trip in front of the first paint.
  */
 const LiveFeedPage = lazy(() => import('./pages/LiveFeedPage').then((m) => ({ default: m.LiveFeedPage })))
+const BuildsPage = lazy(() => import('./pages/BuildsPage').then((m) => ({ default: m.BuildsPage })))
 const ProposalsPage = lazy(() => import('./pages/ProposalsPage').then((m) => ({ default: m.ProposalsPage })))
 const ActionsPage = lazy(() => import('./pages/ActionsPage').then((m) => ({ default: m.ActionsPage })))
 const DeliverablesPage = lazy(() => import('./pages/DeliverablesPage').then((m) => ({ default: m.DeliverablesPage })))
@@ -53,6 +55,7 @@ const CommandPalette = lazy(() => import('./components/CommandPalette').then((m)
 type PageKey =
   | 'dashboard'
   | 'live'
+  | 'builds'
   | 'proposals'
   | 'deliverables'
   | 'actions'
@@ -67,6 +70,7 @@ type PageKey =
 const PAGE_PATHS: Record<PageKey, string> = {
   dashboard: '/',
   live: '/live',
+  builds: '/builds',
   proposals: '/proposals',
   deliverables: '/deliverables',
   actions: '/actions',
@@ -179,6 +183,7 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
           items={[
             { key: 'dashboard', icon: <DashboardOutlined />, label: 'Dashboard' },
             { key: 'live', icon: <CodeOutlined />, label: 'Live feed' },
+            { key: 'builds', icon: <BuildOutlined />, label: 'Build queue' },
             {
               key: 'proposals',
               icon: <FileTextOutlined />,
@@ -250,6 +255,10 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
                   }
                 />
                 <Route path="/live" element={<LiveFeedPage feed={socket.feed} />} />
+                <Route
+                  path="/builds"
+                  element={<BuildsPage feed={socket.feed} historyVersion={socket.historyVersion} />}
+                />
                 <Route path="/proposals" element={<ProposalsPage proposals={proposals} outcomes={outcomes} />} />
                 <Route path="/proposals/:id" element={<ProposalsPage proposals={proposals} outcomes={outcomes} />} />
                 <Route

@@ -379,6 +379,36 @@ export type AgentEvent =
     }
   | { type: 'cycle_idle'; nextCycleAt: string }
 
+export interface QueuedBuild {
+  proposalId: number
+  domain: string
+  description: string
+  priority: Priority
+  nextRunAt: string | null
+  actStatus: ProposalRow['act_status']
+  recurrenceMs: number | null
+}
+
+/** Duration stats over recent act phases. Null fields mean there is no history to forecast from. */
+export interface DurationForecast {
+  samples: number
+  medianMs: number | null
+  minMs: number | null
+  maxMs: number | null
+}
+
+export interface BuildQueue {
+  running: (QueuedBuild & { startedAt: string | null; model: string | null }) | null
+  queued: QueuedBuild[]
+  /** Approved and due later — the scheduler hands these to the worker when their time comes. */
+  scheduled: QueuedBuild[]
+  /** Approved, unfinished, and nothing will run it: descheduled after a stopped build, awaiting a deliberate retry. */
+  stalled: QueuedBuild[]
+  /** Scoped to the pinned act model when there is one. */
+  forecast: DurationForecast
+  forecastAllModels: DurationForecast
+}
+
 export interface FeedEntry {
   key: string
   at: number

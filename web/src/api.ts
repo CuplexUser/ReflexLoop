@@ -1,5 +1,6 @@
 import { authHeaders } from './auth'
 import type {
+  BuildQueue,
   ActionRow,
   ActionWithProposal,
   ControlState,
@@ -111,6 +112,9 @@ export const api = {
    * The scheduler picks this up on its next tick, so the build starts within ~15s.
    */
   rerunBuild: (id: number) => send<{ ok: true; proposal: ProposalRow }>(`/api/proposals/${id}/rerun`, 'POST'),
+
+  /** What is building, what is queued behind it, what is due later, and how long act phases take. */
+  queue: () => getJson<BuildQueue>('/api/queue'),
   /**
    * Narrow or widen an already-approved proposal's scope, up until its act phase starts.
    * Pending proposals use `decide` instead, which applies edits before the status flips.

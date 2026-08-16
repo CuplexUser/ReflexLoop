@@ -706,7 +706,7 @@ React + TypeScript + Ant Design, linted with oxlint, talking to `src/server.ts` 
 (`web/src/api.ts`) and WebSocket (`web/src/useAgentSocket.ts`). Pages live in `web/src/pages/`: Dashboard
 (pending proposals + stat tiles + recent activity), Live feed (full filterable activity stream),
 Proposals (full history, bulk approve/reject, click a row for `ProposalDialog`), **Deliverables**,
-Actions (every tool call
+**Build queue** (`/builds`, `GET /api/queue`), Actions (every tool call
 on an *approved* proposal — action type, an input-derived description, and a browsable result URL when
 the tool returned one; phase-filterable, click a row for full input/output JSON via `ActionDialog`),
 Economics (spend over time, spend by phase, spend by provider/model, per-domain scoreboard with
@@ -729,6 +729,29 @@ goal that had gone quiet looked exactly like one nobody had gotten to yet; and a
 kept rather than deleted so the work stays attributed and the agent is refused if it re-suggests the
 lane. Deep-linked at `/goals/:id` like every other detail view, and lazy-loaded like every route
 except the Dashboard.
+
+**Build queue** answers the one question the console couldn't: what is the agent building, in
+what order, and how long will it take. The Dashboard said a phase was running, the Live feed said
+what it was doing, and Proposals said what was approved — but the queue itself was an in-memory
+array nothing exposed. Four sections: the **running** build (elapsed clock, model, abort, and a
+build log that is the existing activity feed narrowed to that `proposalId` — not a second
+stream), **up next**, **scheduled later**, and **stalled**.
+
+Three things it must keep getting right. Ordering comes from `compareByPriorityThenDue`, the
+same function `pickNext` pops with — a queue that lists a different order than the worker takes
+invites planning around a sequence that won't happen. The duration figure is always **median +
+range + sample size**, never a bare number: real act phases in the ledger span 8 to 32 minutes,
+so one confident estimate would be wrong nearly always and believed anyway; it's scoped to the
+pinned act model, falling back to all models when that one has no history (exactly the situation
+right after a model switch). And it **polls on a 5s timer as well as on `historyVersion`**,
+because the worker picking work up emits no event and a stale queue view is the one thing this
+page must not be.
+
+**`listStalledBuilds` is where the subtlety lives.** `act_status IS NULL` does *not* mean
+unfinished — it means no verdict on record, which is true of every act phase that ran before the
+column existed (eight rows in the live DB, several of which shipped a repo and a live site).
+Offering those a retry would mean a duplicate commit or a second deploy, so the null case counts
+as stalled only when the proposal has no act-phase actions at all.
 
 **Deliverables vs Actions — two different questions.** Actions answers "what did it do, call by call",
 and that's what it should keep doing. Deliverables answers "what exists now, and where do I click to

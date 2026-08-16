@@ -1152,6 +1152,74 @@ export class MemoryStore {
       .run(verdict.complete ? "complete" : "incomplete", verdict.problems.length ? JSON.stringify(verdict.problems) : null, id);
   }
 
+  /**
+   * How long act phases have actually taken, from the ledger.
+   *
+   * A forecast rather than a promise, and shaped to say so: act durations in the real history
+   * span 8 to 32 minutes, so a single confident number would be wrong nearly always. The caller
+   * gets the median, the range and the sample size and can present all three.
+   *
+   * `model` scopes it, because that is the variable that moves this most -- comparing a run on
+   * the model you're about to use against the median of a model you've since switched away from
+   * is a forecast of the wrong thing.
+   */
+  actDurationStats(opts: { model?: string | null; limit?: number } = {}) {
+    const limit = opts.limit ?? 20;
+    const rows = (
+      opts.model
+        ? this.db
+            .prepare(
+              `SELECT duration_ms FROM runs WHERE phase = 'act' AND duration_ms IS NOT NULL AND model = ?
+                ORDER BY id DESC LIMIT ?`
+            )
+            .all(opts.model, limit)
+        : this.db
+            .prepare(
+              `SELECT duration_ms FROM runs WHERE phase = 'act' AND duration_ms IS NOT NULL
+                ORDER BY id DESC LIMIT ?`
+            )
+            .all(limit)
+    ) as unknown as { duration_ms: number }[];
+
+    if (rows.length === 0) return { samples: 0, medianMs: null, minMs: null, maxMs: null };
+    const sorted = rows.map((r) => r.duration_ms).sort((a, b) => a - b);
+    return {
+      samples: sorted.length,
+      medianMs: sorted[Math.floor(sorted.length / 2)],
+      minMs: sorted[0],
+      maxMs: sorted[sorted.length - 1],
+    };
+  }
+
+  /**
+   * Approved work that nothing is going to run: no `next_run_at`, and not finished.
+   *
+   * The `act_status IS NULL` half is the subtle one and it must not be read as "unfinished".
+   * Null means "no verdict on record", which is true of every act phase that ran before the
+   * column existed -- eight proposals in the live DB, including ones that shipped a repo and a
+   * live site. Listing those as stalled would invite re-running builds that already succeeded,
+   * which is a duplicate commit or a second deploy, so the null case is only stalled when the
+   * proposal genuinely has no act-phase actions at all.
+   *
+   * The recorded statuses need no such care: `interrupted` and `incomplete` are positive
+   * findings, and `complete` and `running` are excluded outright.
+   */
+  listStalledBuilds(): ProposalRow[] {
+    return this.db
+      .prepare(
+        `SELECT p.* FROM proposals p
+          WHERE p.status = 'approved'
+            AND p.next_run_at IS NULL
+            AND (
+              p.act_status IN ('interrupted', 'incomplete')
+              OR (p.act_status IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM actions a WHERE a.proposal_id = p.id AND a.phase = 'act'))
+            )
+          ORDER BY p.decided_at DESC`
+      )
+      .all() as unknown as ProposalRow[];
+  }
+
   /** Approved proposals whose act phase started and never reached a verdict, or reached a bad one. */
   listUnfinishedActs(): ProposalRow[] {
     return this.db
@@ -2001,6 +2069,25 @@ interface LessonRow {
 }
 
 export type Priority = "low" | "normal" | "high" | "urgent";
+
+export const PRIORITY_RANK: Record<Priority, number> = { urgent: 3, high: 2, normal: 1, low: 0 };
+
+/**
+ * The order approved work actually runs in: priority first, then earliest due.
+ *
+ * Exported because two places need the same answer and must not drift -- `pickNext` in the
+ * orchestrator, which pops the queue, and `GET /api/queue`, which shows the operator what's
+ * coming. A queue view that lists work in a different order than the worker takes it is worse
+ * than no queue view, because it invites planning around a sequence that won't happen.
+ */
+export function compareByPriorityThenDue(
+  a: Pick<ProposalRow, "priority" | "next_run_at">,
+  b: Pick<ProposalRow, "priority" | "next_run_at">
+): number {
+  const byPriority = PRIORITY_RANK[b.priority] - PRIORITY_RANK[a.priority];
+  if (byPriority !== 0) return byPriority;
+  return (a.next_run_at ?? "").localeCompare(b.next_run_at ?? "");
+}
 
 /** How money actually arrives. Its own column, not folded into the JSON, so it can be grouped on. */
 export const REVENUE_MODELS = [
