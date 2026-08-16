@@ -51,6 +51,10 @@ export interface ProposalRow {
   /** Set only when a human edited the scope at approval time -- what the model originally asked for. */
   original_required_tools: string | null
   original_description: string | null
+  /** How the act phase went. Null until it has run at all. */
+  act_status: 'running' | 'interrupted' | 'complete' | 'incomplete' | null
+  /** JSON-encoded string[] of what the act verifier objected to; null when it had no objections. */
+  act_problems: string | null
   /** All three are null on proposals written before the monetization block existed. */
   revenue_model: RevenueModel | null
   /** JSON-encoded {@link Monetization} -- parse with parseMonetization in MonetizationBlock. */

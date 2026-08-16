@@ -102,6 +102,15 @@ export const api = {
     send(`/api/proposals/${id}/review`, 'POST', { reviewStatus }),
 
   cancelSchedule: (id: number) => send(`/api/proposals/${id}/cancel-schedule`, 'POST'),
+
+  /**
+   * Put an approved proposal's act phase back in the run queue.
+   *
+   * The manual counterpart to the startup sweep, which deschedules anything whose act phase
+   * started and didn't finish rather than silently re-running it and repeating side effects.
+   * The scheduler picks this up on its next tick, so the build starts within ~15s.
+   */
+  rerunBuild: (id: number) => send<{ ok: true; proposal: ProposalRow }>(`/api/proposals/${id}/rerun`, 'POST'),
   /**
    * Narrow or widen an already-approved proposal's scope, up until its act phase starts.
    * Pending proposals use `decide` instead, which applies edits before the status flips.

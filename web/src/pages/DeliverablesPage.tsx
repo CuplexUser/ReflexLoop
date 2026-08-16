@@ -6,12 +6,14 @@ import {
   GithubOutlined,
   GlobalOutlined,
   LinkOutlined,
+  PlayCircleOutlined,
   PullRequestOutlined,
 } from '@ant-design/icons'
-import { Alert, Button, Card, Empty, Input, Segmented, Select, Space, Spin, Tag, Tooltip, Typography } from 'antd'
+import { Alert, App, Button, Card, Empty, Input, Segmented, Select, Space, Spin, Tag, Tooltip, Typography } from 'antd'
 import type { Deliverable, DeliverableArtifact, ProposalRow } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
+import { UNFINISHED_ACT, rerunLabel } from '../actStatus'
 import { markdownPreview, money, timeAgo } from '../format'
 import { MarkdownLite } from '../components/MarkdownLite'
 import { palette } from '../theme'
@@ -32,19 +34,8 @@ const REVIEW_OPTIONS = [
   { value: 'needs_refinement', label: '⚠ Needs refinement' },
 ]
 
-/**
- * Act-phase states that mean the artifacts on a card are not the finished thing, keyed for a
- * plain lookup so a null status and a completed one both fall through to nothing.
- *
- * A card exists as soon as one write tool succeeded — `github_create_repo` alone builds one —
- * so "there is a card" has never meant "the build finished". Proposal #27 sat here looking
- * shipped while its repo was empty and no deploy existed.
- */
-const UNFINISHED_ACT: Record<string, string> = {
-  running: 'This build is executing right now — what you see is partial.',
-  interrupted: 'The process stopped mid-build. Whatever had already landed is here; the rest never ran.',
-  incomplete: 'The act phase ended without finishing the approved plan. Check the proposal for which steps never ran.',
-}
+// UNFINISHED_ACT / canRerun / rerunLabel live in ../actStatus so this page and ProposalDialog
+// agree on what "unfinished" means and offer the same control for it.
 
 function artifactIcon(artifact: DeliverableArtifact) {
   if (artifact.kind === 'payment_link') return <CreditCardOutlined />
@@ -125,11 +116,13 @@ function DeliverableCard({
   onSetReview,
   onOpenTrail,
   onOpenProposal,
+  onRerun,
 }: {
   deliverable: Deliverable
   onSetReview: (id: number, reviewStatus: ProposalRow['review_status']) => void
   onOpenTrail: (proposalId: number) => void
   onOpenProposal: (proposalId: number) => void
+  onRerun?: (proposalId: number) => void
 }) {
   const readOnly = useConsoleOnly()
   const { outcome } = deliverable
@@ -216,9 +209,34 @@ function DeliverableCard({
             options={REVIEW_OPTIONS}
           />
         </Tooltip>
-        <Button type="link" size="small" style={{ padding: 0 }} onClick={() => onOpenTrail(deliverable.proposalId)}>
-          {deliverable.actionCount} actions →
-        </Button>
+        <Space size={4}>
+          {/* The point of putting it here: this card *is* the empty repo. Finding out the build
+              stopped and being able to restart it should not be two different screens.
+
+              Offered on every card that isn't mid-run, not only ones the badge calls unfinished.
+              `actStatus` is null for any act phase that ran before the column existed -- #27 and
+              #15/#16/#17 among them -- and gating the button on the badge made re-running exactly
+              the oldest stuck builds impossible. Every card here is an approved proposal by
+              construction (`listDeliverableActions` filters on it), so there is nothing else to
+              check; `rerunLabel` says whether this is a retry or a deliberate re-run. */}
+          {onRerun && deliverable.actStatus !== 'running' && (
+            <Tooltip title={readOnly ? READ_ONLY_HINT : 'Queue this build to run again'}>
+              <Button
+                size="small"
+                type="primary"
+                ghost
+                icon={<PlayCircleOutlined />}
+                disabled={readOnly}
+                onClick={() => onRerun(deliverable.proposalId)}
+              >
+                {rerunLabel(deliverable.actStatus)}
+              </Button>
+            </Tooltip>
+          )}
+          <Button type="link" size="small" style={{ padding: 0 }} onClick={() => onOpenTrail(deliverable.proposalId)}>
+            {deliverable.actionCount} actions →
+          </Button>
+        </Space>
       </Space>
     </Card>
   )
@@ -239,11 +257,23 @@ export function DeliverablesPage({
   onSetReview: (id: number, reviewStatus: ProposalRow['review_status']) => void
 }) {
   const navigate = useNavigate()
+  const { message } = App.useApp()
   const [deliverables, setDeliverables] = useState<Deliverable[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState<Filter>('all')
   const [search, setSearch] = useState('')
+
+  async function rerun(proposalId: number) {
+    try {
+      await api.rerunBuild(proposalId)
+      // "Queued", not "started" -- the scheduler picks it up on its own tick, and saying it's
+      // running sends someone looking for output that doesn't exist yet.
+      message.success(`Build queued — proposal #${proposalId} runs on the next scheduler tick`)
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : 'Queueing the build failed')
+    }
+  }
 
   useEffect(() => {
     api
@@ -351,6 +381,7 @@ export function DeliverablesPage({
               onSetReview={onSetReview}
               onOpenTrail={(id) => navigate(`/actions/${id}`)}
               onOpenProposal={(id) => navigate(`/proposals/${id}`)}
+              onRerun={rerun}
             />
           ))}
         </div>

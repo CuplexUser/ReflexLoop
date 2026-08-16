@@ -435,11 +435,20 @@ export function startServer(
       res.status(404).json({ error: "No such proposal." });
       return;
     }
+    if (proposal.act_status === "running") {
+      res.status(409).json({ error: `Proposal #${id} is executing right now -- wait for it to finish, or abort it first.` });
+      return;
+    }
     if (!store.requeueApprovedProposal(id)) {
       res.status(409).json({ error: `Proposal #${id} is ${proposal.status}, not approved -- only approved work can be re-run.` });
       return;
     }
-    res.json({ ok: true, proposal: store.getProposal(id) });
+    const requeued = store.getProposal(id)!;
+    // Announced so the console reflects it: this is the event that says "this proposal has a run
+    // due", the same one a future-dated approval emits, and it's in the set that invalidates the
+    // REST caches -- without it the button would work and the page would look unchanged.
+    emitAgentEvent({ type: "proposal_scheduled", proposal: requeued });
+    res.json({ ok: true, proposal: requeued });
   });
 
   app.post("/api/proposals/:id/review", (req, res) => {

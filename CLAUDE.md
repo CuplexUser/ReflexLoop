@@ -544,6 +544,20 @@ on). A directive is consumed — injected into one research prompt, then cleared
   `interrupted` / `incomplete` in the error colour ahead of the outcome tag. Carried rather than
   filtered: an abandoned build's repo is still a real thing the operator needs to open, usually
   to clean it up, and hiding the card recreates the original problem from the other side.
+
+  **Dispatching a build by hand** is `POST /api/proposals/:id/rerun`, offered from two places:
+  the Deliverables card (which *is* the empty repo — finding out a build stopped and restarting
+  it shouldn't be two screens) and `ProposalDialog`, which covers a proposal that produced no
+  artifact and so has no card. Both read `web/src/actStatus.ts` so they agree on what
+  "unfinished" means. It only re-triggers already-approved work, refuses while `act_status` is
+  `running`, and emits `proposal_scheduled` so the console reflects it — a button that works
+  while the page looks unchanged reads as a button that doesn't work.
+
+  **Offer the button on `act_status !== 'running'`, never on "the badge says it failed."**
+  `act_status` is null for every act phase that ran before the column existed (#15, #16, #17, #27
+  in the live DB), and gating on the badge made re-running exactly the oldest stuck builds
+  impossible — #27, the empty machwatch repo this whole thread started from, had no button. The
+  null resolves itself the first time a proposal runs again; the button must not depend on it.
 - `act-verification.ts` — `verifyAct`: did the act phase do what the human approved? Pure functions
   over the phase's tool calls plus the proposal's `steps_json`, in the same style as
   `deliverables.ts`, so no store and no API key.

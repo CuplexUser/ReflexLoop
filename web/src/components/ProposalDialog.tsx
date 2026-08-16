@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
 import { App, Button, Descriptions, Modal, Skeleton, Space, Statistic, Table, Tag, Tooltip, Typography } from 'antd'
-import { ClockCircleOutlined, EditOutlined } from '@ant-design/icons'
+import { ClockCircleOutlined, EditOutlined, PlayCircleOutlined } from '@ant-design/icons'
 import type { ActionRow, OutcomeRow, ProposalRow, RunRow } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
+import { UNFINISHED_ACT, canRerun, rerunLabel } from '../actStatus'
 import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, preview, recurrenceLabel, timeAgo } from '../format'
 import { palette } from '../theme'
 import { MarkdownLite } from './MarkdownLite'
@@ -33,6 +34,7 @@ export function ProposalDialog({
   const [actions, setActions] = useState<ActionRow[] | null>(null)
   const [runs, setRuns] = useState<RunRow[]>([])
   const [cancellingSchedule, setCancellingSchedule] = useState(false)
+  const [rerunning, setRerunning] = useState(false)
   const [editingScope, setEditingScope] = useState(false)
   const [scopeTools, setScopeTools] = useState<string[]>([])
   const [savingScope, setSavingScope] = useState(false)
@@ -86,6 +88,22 @@ export function ProposalDialog({
       message.error(err instanceof Error ? err.message : 'Editing the fence failed')
     } finally {
       setSavingScope(false)
+    }
+  }
+
+  async function rerunBuild() {
+    if (!proposal) return
+    setRerunning(true)
+    try {
+      await api.rerunBuild(proposal.id)
+      // "Queued" rather than "started": the scheduler picks it up on its own tick, and telling
+      // someone a build is running when it hasn't begun sends them looking for output that
+      // isn't there yet.
+      message.success(`Build queued — proposal #${proposal.id} runs on the next scheduler tick`)
+    } catch (err) {
+      message.error(err instanceof Error ? err.message : 'Queueing the build failed')
+    } finally {
+      setRerunning(false)
     }
   }
 
@@ -217,6 +235,31 @@ export function ProposalDialog({
         {proposal.status === 'approved' && (
           <Space align="center" size={10} wrap>
             <Tag color={PRIORITY_TAG_COLOR[proposal.priority]}>{PRIORITY_LABEL[proposal.priority]} priority</Tag>
+            {/* Why the build isn't done, next to the button that does something about it. An
+                unfinished act phase is descheduled at startup rather than re-run, so without a
+                control here the only way to resume one was a curl. */}
+            {UNFINISHED_ACT[proposal.act_status ?? ''] && (
+              <Tooltip title={UNFINISHED_ACT[proposal.act_status ?? '']}>
+                <Tag color={proposal.act_status === 'running' ? 'processing' : 'error'}>
+                  build {proposal.act_status}
+                </Tag>
+              </Tooltip>
+            )}
+            {canRerun(proposal) && (
+              <Tooltip title={readOnly ? READ_ONLY_HINT : 'Queue this proposal’s act phase to run again'}>
+                <Button
+                  size="small"
+                  type="primary"
+                  ghost
+                  icon={<PlayCircleOutlined />}
+                  loading={rerunning}
+                  disabled={readOnly}
+                  onClick={rerunBuild}
+                >
+                  {rerunLabel(proposal.act_status)}
+                </Button>
+              </Tooltip>
+            )}
             {proposal.next_run_at && (
               <Tag icon={<ClockCircleOutlined />} color="processing">
                 next run {inWords(proposal.next_run_at)}
