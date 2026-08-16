@@ -97,8 +97,10 @@ function toAnthropicMessages(messages: ChatMessage[]): unknown[] {
     flush();
     if (message.role === "user") {
       out.push({ role: "user", content: message.content });
-    } else if (Array.isArray(message.providerRaw)) {
+    } else if (Array.isArray(message.providerRaw) && message.providerRaw.length > 0) {
       // Replay the original blocks so thinking / server-tool pairs survive the round trip.
+      // The emptiness check matters on the nudge path in agent-loop.ts, which replays a turn
+      // that produced nothing: an empty content array is a 400 from this API, not an empty turn.
       out.push({ role: "assistant", content: message.providerRaw });
     } else {
       const blocks: unknown[] = [];

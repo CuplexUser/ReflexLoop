@@ -365,7 +365,14 @@ export type AgentEvent =
   | { type: 'outcome_recorded'; proposalId: number }
   | { type: 'lesson_saved'; domain: string }
   | { type: 'no_proposal'; reason: string; toolCalls: number }
-  | { type: 'act_incomplete'; proposalId: number; problems: string[]; toolCalls: number; stopReason: string }
+  | {
+      type: 'act_incomplete'
+      proposalId: number
+      problems: string[]
+      toolCalls: number
+      stopReason: string
+      providerStopReason?: string
+    }
   | { type: 'cycle_idle'; nextCycleAt: string }
 
 export interface FeedEntry {

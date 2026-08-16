@@ -30,7 +30,17 @@ export type AgentEvent =
   // through the approved plan emitted `phase_done` exactly like one that finished it. See
   // act-verification.ts for how "partway" is decided and why it's the steps' declared tools
   // rather than their `doneWhen` prose.
-  | { type: "act_incomplete"; proposalId: number; problems: string[]; toolCalls: number; stopReason: string }
+  // `providerStopReason` is the provider's own word for why the model stopped, carried verbatim
+  // because it is the one fact that separates "the model gave up" from "the request died
+  // upstream" -- and the second machwatch failure could not be told apart without it.
+  | {
+      type: "act_incomplete";
+      proposalId: number;
+      problems: string[];
+      toolCalls: number;
+      stopReason: string;
+      providerStopReason?: string;
+    }
   // The agent pointing at a lane it isn't allowed to enter. Surfaced live because a suggestion
   // sits inert until a human accepts it -- an operator who never sees it is a suggestion that
   // silently does nothing, which is the same as not having the tool.

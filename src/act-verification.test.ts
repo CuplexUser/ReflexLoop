@@ -114,6 +114,19 @@ describe("verifyAct", () => {
     expect(verdict.unrunSteps.map((s) => s.tool)).toEqual(["mcp__integrations__github_commit_files"]);
   });
 
+  it("names the provider's finish reason on a failure, so it doesn't have to be guessed later", () => {
+    const verdict = verifyAct(MACHWATCH_STEPS, attempt({ toolCalls: MACHWATCH_CALLS, providerStopReason: "stop" }));
+    expect(verdict.problems.at(-1)).toBe('Provider finish_reason on the final turn: "stop".');
+  });
+
+  it("does not report a finish reason on a clean run -- it is a diagnostic, not a fault", () => {
+    const verdict = verifyAct(
+      [],
+      attempt({ toolCalls: [ok("mcp__memory__outcome_record")], providerStopReason: "stop" })
+    );
+    expect(verdict).toMatchObject({ complete: true, problems: [] });
+  });
+
   it("reports truncation separately from the unrun steps it caused", () => {
     const verdict = verifyAct(
       MACHWATCH_STEPS,

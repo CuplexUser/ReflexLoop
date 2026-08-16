@@ -34,6 +34,18 @@ export interface AgentRunOptions {
   onAssistantText?: (text: string) => void;
   onToolCall?: (name: string, input: unknown, output: string, isError: boolean) => void;
   /**
+   * Consulted when the model stops calling tools, to decide whether that's actually the end.
+   *
+   * The loop treats "no tool calls" as "done", which is right for a phase whose only output is
+   * prose and wrong for one with a checkable definition of finished. Twice now an act phase has
+   * read everything it needed, written "Now I'll write the full prototype and commit it in one
+   * call", and returned no tool call -- and the run ended there, leaving an empty repo. The
+   * caller knows what was supposed to happen; this is where it gets to say so.
+   *
+   * Return the text to push back at the model, or null to let the run end. See MAX_NUDGES.
+   */
+  nudge?: (context: { calls: ObservedCall[]; finalText: string; stopReason: string }) => string | null;
+  /**
    * Fired after every model call with that call's cost. The caller accumulates from
    * here rather than from the return value, so an aborted or failed phase still lands
    * in the ledger with the spend it actually incurred instead of a zero.
@@ -52,6 +64,29 @@ export interface AgentRunOptions {
  * finish. Callers that care whether the work actually got done must branch on this.
  */
 export type AgentStopReason = "end_turn" | "max_turns" | "truncated";
+
+/** A tool call the run made, as the nudge callback and the act verifier both see it. */
+export interface ObservedCall {
+  name: string;
+  isError: boolean;
+}
+
+/**
+ * How many times one run may be told it isn't finished.
+ *
+ * Two, not one, because the realistic recovery is two-step: the first nudge gets the build
+ * committed, and the model can then still stop without calling `outcome_record` -- a second
+ * nudge catches that. Capped low regardless: a model that ignores being told twice is stuck,
+ * and further nudges just spend money on the same turn. The act verdict handles it from there.
+ */
+const MAX_NUDGES = 2;
+
+/**
+ * Stands in for an assistant turn that produced no text at all, so the nudge below has
+ * something to attach to. Anthropic rejects an empty assistant message outright, and skipping
+ * the turn instead would put two user messages back to back, which it also rejects.
+ */
+const EMPTY_TURN_PLACEHOLDER = "(no output)";
 
 export interface AgentRunResult {
   /** The model's last text, i.e. what it said when it stopped calling tools. */
@@ -118,6 +153,9 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
   let finalText = "";
   let turns = 0;
   let lastStopReason = "";
+  let nudgesUsed = 0;
+  /** Everything dispatched so far, so `nudge` can judge what's still outstanding. */
+  const observedCalls: ObservedCall[] = [];
 
   for (turns = 1; turns <= opts.maxTurns; turns++) {
     if (signal?.aborted) throw new Error("Aborted");
@@ -148,6 +186,28 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
           `[agent-loop] the model's last turn was cut off at the output limit (${MAX_OUTPUT_TOKENS} tokens, finish_reason=${response.stopReason}) before it called any tool; the run stopped mid-task.`
         );
       }
+
+      // Before accepting that as the end, let the caller check it against what was supposed
+      // to happen. The nudge goes back as an ordinary user turn, so the model keeps its whole
+      // transcript -- all the reading it just did stays in context, which is the difference
+      // between finishing the job and starting a fresh phase that re-derives everything.
+      const message =
+        nudgesUsed < MAX_NUDGES
+          ? opts.nudge?.({ calls: observedCalls, finalText: response.text, stopReason: response.stopReason })
+          : null;
+      if (message) {
+        nudgesUsed++;
+        console.warn(`[agent-loop] the model stopped without finishing; nudging (${nudgesUsed}/${MAX_NUDGES}).`);
+        messages.push({
+          role: "assistant",
+          content: response.text || EMPTY_TURN_PLACEHOLDER,
+          toolCalls: [],
+          providerRaw: response.providerRaw,
+        });
+        messages.push({ role: "user", content: message });
+        continue;
+      }
+
       return {
         finalText,
         costUsd,
@@ -195,6 +255,7 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
       const done = precomputed?.[index];
       if (done) {
         messages.push({ role: "tool", toolCallId: call.id, name: call.name, content: done.text, isError: done.isError });
+        observedCalls.push({ name: call.name, isError: done.isError });
         opts.onToolCall?.(call.name, call.args, done.text, done.isError);
         continue;
       }
@@ -204,6 +265,7 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
       const nativeResult = client.handleNativeToolCall(call);
       if (nativeResult !== null) {
         messages.push({ role: "tool", toolCallId: call.id, name: call.name, content: nativeResult });
+        observedCalls.push({ name: call.name, isError: false });
         opts.onToolCall?.(call.name, call.args, nativeResult, false);
         continue;
       }
@@ -230,6 +292,7 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
         content: result.text,
         isError: result.isError,
       });
+      observedCalls.push({ name: call.name, isError: result.isError });
       opts.onToolCall?.(call.name, call.args, result.text, result.isError);
     }
   }

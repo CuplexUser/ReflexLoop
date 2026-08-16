@@ -56,7 +56,9 @@ function renderLine(event: AgentEvent): string {
     case 'act_incomplete':
       // Spelled out rather than summarised: every entry here is a step of the approved plan
       // that never ran, and the operator has to decide what to do about each one.
-      return `✗ proposal #${event.proposalId} act phase INCOMPLETE (${event.toolCalls} tool calls, ${event.stopReason}) — ${event.problems.join(' ')}`
+      return `✗ proposal #${event.proposalId} act phase INCOMPLETE (${event.toolCalls} tool calls, ${event.stopReason}${
+        event.providerStopReason ? `/${event.providerStopReason}` : ''
+      }) — ${event.problems.join(' ')}`
     case 'cycle_idle':
       return `… idle until ${new Date(event.nextCycleAt).toLocaleTimeString()}`
     default:

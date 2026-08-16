@@ -111,5 +111,14 @@ export function verifyAct(steps: ProposalStep[], attempt: ActAttempt): ActVerdic
     problems.push("outcome_record was never called, so nothing recorded what actually happened.");
   }
 
+  // Appended last, and only to a report that already has something wrong in it, because on its
+  // own a finish reason is not a fault -- it's the diagnostic. Threading this all the way here
+  // and then dropping it is what made the second machwatch failure another archaeology session:
+  // the verdict could say the model stopped, but not a word about what the provider called it,
+  // which is the one fact separating "the model gave up" from "the request died upstream".
+  if (problems.length > 0 && attempt.providerStopReason) {
+    problems.push(`Provider finish_reason on the final turn: "${attempt.providerStopReason}".`);
+  }
+
   return { complete: problems.length === 0, unrunSteps, outcomeRecorded, problems };
 }

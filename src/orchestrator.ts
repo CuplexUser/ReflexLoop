@@ -19,9 +19,10 @@
 // Run with: npx tsx src/orchestrator.ts
 
 import "dotenv/config";
-import { runAgent, type AgentStopReason } from "./agent-loop.js";
+import { runAgent, type AgentRunOptions, type AgentStopReason } from "./agent-loop.js";
 import { verifyAct, type ActVerdict } from "./act-verification.js";
 import { describeClients, resolveLlmClients } from "./llm/index.js";
+import { isTruncationStop } from "./llm/types.js";
 import { isConsoleOnlyMode } from "./console-mode.js";
 import { getSearchConfig } from "./search/index.js";
 import { ToolRegistry } from "./tools/registry.js";
@@ -200,6 +201,7 @@ async function runPhase(opts: {
   maxTurns: number;
   proposalId: number | null;
   signal?: AbortSignal;
+  nudge?: AgentRunOptions["nudge"];
 }): Promise<PhaseResult> {
   // An aborted run still gets its cost and duration logged below -- spend already
   // incurred counts against profit whether or not the phase finished.
@@ -234,6 +236,7 @@ async function runPhase(opts: {
       allowedTools: opts.allowedTools,
       maxTurns: opts.maxTurns,
       signal: opts.signal,
+      nudge: opts.nudge,
       // Accumulated per turn rather than read off the result, so an abort or a crash
       // mid-phase still records what was already spent.
       onTurnCost: (usd) => {
@@ -254,6 +257,12 @@ async function runPhase(opts: {
     finalText = result.finalText;
     stopReason = result.stopReason;
     providerStopReason = result.providerStopReason;
+    // Logged for every phase, not just the failures. The provider's own word for why the model
+    // stopped was computed on every turn and read by nothing, so the only way to find out after
+    // the fact was to not be able to.
+    console.log(
+      `[${opts.phase}] stopped: ${result.stopReason} (provider finish_reason="${result.providerStopReason}") after ${result.turns} turn(s), ${toolCalls} tool call(s).`
+    );
     if (result.stopReason === "max_turns") {
       console.warn(`[${opts.phase}] hit the ${opts.maxTurns}-turn limit; stopping with whatever it had done so far.`);
     }
@@ -794,7 +803,38 @@ async function actPhase(proposal: ProposalRow): Promise<ActVerdict> {
   // looking like it's still queued.
   store.markActStarted(proposal.id);
 
+  const steps = parseSteps(proposal);
+
   const result = await runPhase({
+    // Consulted when the model stops calling tools, before the run is allowed to end. Twice the
+    // act phase has read everything it needed, announced "now I'll write the full prototype and
+    // commit it in one call", and returned nothing -- and the phase ended there with an empty
+    // repo. The plan says exactly which tools were meant to run, so "it stopped early" is a fact
+    // here, not a guess, and telling the model beats writing the failure down and moving on.
+    //
+    // Only ever names what's outstanding, and only tools already in the approved fence. It
+    // cannot widen anything: a nudge is text, and the model still can't call what it wasn't
+    // granted. Nor can it cause a repeat -- a step whose tool already ran successfully isn't
+    // mentioned.
+    nudge: ({ calls, stopReason: providerStop }) => {
+      const check = verifyAct(steps, { toolCalls: calls, stopReason: "end_turn" });
+      if (check.unrunSteps.length === 0 && check.outcomeRecorded) return null;
+
+      const outstanding = check.unrunSteps.map((s) => `  - step ${s.position}: ${s.title} -- call ${unqualified(s.tool)}`);
+      return [
+        `Stop. You have not finished, and this run does not end until you have.`,
+        ...(isTruncationStop(providerStop)
+          ? [
+              `Your last turn was cut off at the output limit, so whatever you were writing never arrived. Commit the files in several smaller ${unqualified("mcp__integrations__github_commit_files")} calls instead of one large one.`,
+            ]
+          : []),
+        ...(outstanding.length > 0
+          ? [`These approved steps have not run:`, ...outstanding, `Make those calls now. Do not describe them -- call them.`]
+          : []),
+        ...(check.outcomeRecorded ? [] : [`Then call outcome_record with what actually happened.`]),
+        `If a step genuinely cannot be done, call outcome_record saying so plainly. What you must not do is stop silently.`,
+      ].join("\n");
+    },
     phase: "act",
     proposalId: proposal.id,
     prompt: [
@@ -819,7 +859,7 @@ async function actPhase(proposal: ProposalRow): Promise<ActVerdict> {
     if (actAbortController === abortController) actAbortController = null;
   });
 
-  const verdict = verifyAct(parseSteps(proposal), {
+  const verdict = verifyAct(steps, {
     toolCalls: result.calls,
     stopReason: result.stopReason,
     providerStopReason: result.providerStopReason,
@@ -834,6 +874,7 @@ async function actPhase(proposal: ProposalRow): Promise<ActVerdict> {
     problems: verdict.problems,
     toolCalls: result.toolCalls,
     stopReason: result.stopReason,
+    providerStopReason: result.providerStopReason,
   });
 
   // Only when the agent recorded nothing at all. If it *did* call outcome_record and the plan

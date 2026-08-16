@@ -126,7 +126,8 @@ own history — the pairs it must catch and the follow-up pair it must not).
 `src/act-verification.test.ts` (whether an act phase finished the approved plan, run against
 proposal #27's real step list and real tool calls — the case that motivated the module) and
 `src/llm/types.test.ts` (the truncation-vocabulary list, which a new provider can quietly break),
-and `src/shutdown.test.ts` (the teardown order, the grace period, and the forced second signal).
+`src/shutdown.test.ts` (the teardown order, the grace period, and the forced second signal), and
+`src/agent-loop.test.ts` (the nudge — the exception to the no-loop-tests rule, see that module).
 `smoke-test.ts` runs end-to-end against a throwaway `./data/smoke-test.db`, and also builds the real tool
 registry and serializes every schema — which is the cheap way to catch a zod shape that can't be converted,
 since otherwise it surfaces as a provider 400 on the first live cycle.
@@ -314,6 +315,22 @@ on). A directive is consumed — injected into one research prompt, then cleared
   provider's spelling straight through. **A new provider means checking that list.** Truncation *with*
   tool calls is left to self-correct (the last call's JSON is incomplete, `parseArgs` hands the tool
   `{}`, zod rejects it) but is warned about, since a payload that overflows once overflows on retry too.
+  `providerStopReason` is carried out of the run verbatim and **logged on every phase, pass or fail** —
+  it was computed on every turn and read by nothing, so the only way to learn it after the fact was to
+  not be able to.
+
+  **`nudge` is what stops one bad turn losing the phase.** "No tool calls" means "done" only for a
+  phase whose output is prose; for one with a checkable definition of finished it's a question the
+  caller can answer. Twice an act phase read everything it needed, wrote *"Now I'll write the full
+  prototype and commit it in one call"*, and returned nothing — proposals #27 and #29, both leaving
+  `CuplexUser/machwatch` empty. The callback (see `actPhase`, which builds it from `verifyAct`) returns
+  text to push back or null to finish. It goes in as an ordinary user turn **after** the model's own,
+  so the whole transcript survives and the model finishes the job rather than a fresh phase
+  re-deriving everything. `MAX_NUDGES` is 2: the realistic recovery is two-step (commit, then
+  `outcome_record`), and a model that ignores being told twice is stuck. It can't widen the fence — a
+  nudge is text — and it names only tools that haven't already run, so it can't cause a repeat.
+  `agent-loop.test.ts` is the deliberate exception to "don't unit-test the loop": this is loop logic
+  driven through our own `LlmClient` interface, not a mock of anyone's wire format.
 
   **Tool calls run concurrently only when the whole batch is pure reads** (`canRunConcurrently`, gated
   on `toolRisk`). Research is latency-bound on the network — one run in the ledger took 39 minutes,
