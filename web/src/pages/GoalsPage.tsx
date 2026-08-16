@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import {
   Alert,
   App,
@@ -304,6 +304,38 @@ const STALE_AFTER_EMPTY_CYCLES = 3
 /** Roughly three lines of brief; past that the card gets a Show more toggle. */
 const BRIEF_COLLAPSED_HEIGHT = 66
 
+/**
+ * Whether `ref`'s content is actually taller than the clamp — i.e. whether there is anything
+ * to show more *of*. Most briefs are one line, and offering the toggle on all of them made it
+ * meaningless: a control that does nothing on most cards teaches you to ignore it on the ones
+ * where it matters.
+ *
+ * Measured rather than estimated from the text length, since how many lines a brief wraps to
+ * depends on the card's width, which depends on the viewport.
+ *
+ * Two details keep the measurement stable. The observed element keeps `overflow: hidden` in
+ * both states (only `maxHeight` is toggled), so it always establishes a block formatting
+ * context — otherwise the child's margins would collapse out of it once expanded and
+ * `scrollHeight` would read short, retracting the Show less button and stranding the reader.
+ * And the ResizeObserver fires on the *width* change when a card is resized, which is what a
+ * height-clamped element can still report.
+ */
+function useOverflows(ref: React.RefObject<HTMLElement | null>, maxHeight: number, content: string) {
+  const [overflows, setOverflows] = useState(false)
+
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const measure = () => setOverflows(el.scrollHeight > maxHeight + 1)
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [ref, maxHeight, content])
+
+  return overflows
+}
+
 function GoalCard({
   goal,
   health,
@@ -321,6 +353,8 @@ function GoalCard({
 }) {
   const [expanded, setExpanded] = useState(false)
   const brief = goal.brief?.trim() ?? ''
+  const briefRef = useRef<HTMLDivElement>(null)
+  const briefOverflows = useOverflows(briefRef, BRIEF_COLLAPSED_HEIGHT, brief)
   const stale = (health?.empty_cycles ?? 0) >= STALE_AFTER_EMPTY_CYCLES
   const paused = goal.status === 'paused'
 
@@ -389,23 +423,28 @@ function GoalCard({
       {brief ? (
         <div>
           <div
-            style={
-              expanded
-                ? undefined
-                : { maxHeight: BRIEF_COLLAPSED_HEIGHT, overflow: 'hidden', position: 'relative' }
-            }
+            ref={briefRef}
+            style={{
+              maxHeight: expanded || !briefOverflows ? undefined : BRIEF_COLLAPSED_HEIGHT,
+              // Kept in both states so the block formatting context — and with it the
+              // scrollHeight useOverflows reads — doesn't change when the card expands.
+              overflow: 'hidden',
+              position: 'relative',
+            }}
           >
             <MarkdownLite text={brief} style={{ fontSize: 13, color: palette.textMuted }} />
-            {!expanded && <FadeOut />}
+            {!expanded && briefOverflows && <FadeOut />}
           </div>
-          <Button
-            type="link"
-            size="small"
-            style={{ padding: 0, height: 'auto', fontSize: 12 }}
-            onClick={() => setExpanded((v) => !v)}
-          >
-            {expanded ? 'Show less' : 'Show more'}
-          </Button>
+          {briefOverflows && (
+            <Button
+              type="link"
+              size="small"
+              style={{ padding: 0, height: 'auto', fontSize: 12 }}
+              onClick={() => setExpanded((v) => !v)}
+            >
+              {expanded ? 'Show less' : 'Show more'}
+            </Button>
+          )}
         </div>
       ) : (
         <Typography.Text type="secondary" italic style={{ fontSize: 13 }}>
