@@ -489,6 +489,17 @@ on). A directive is consumed — injected into one research prompt, then cleared
   than the duplicates. Only **pending/approved** proposals are checked against, never rejected
   ones: a rejection usually asks for a fix, and the improved retry necessarily resembles what
   it improves on.
+
+  **The same carve-out covers an approved proposal whose act phase didn't finish**
+  (`store.listDuplicateCandidates`, filtering on `act_status`). A proposal to complete unbuilt
+  work is by construction near-identical to the work — there is no wording that describes
+  finishing #27 without resembling #27. The refinement pass on #27 hit this for real:
+  `proposal_create` was refused twice (43%, then 32% overlap) and landed only on the third
+  attempt, once the model had reworded it under the threshold. It got through by sounding
+  different rather than being different, which is the opposite of what this check should
+  select for. `interrupted` and `incomplete` are excluded; `running` is **not**, because
+  research runs concurrently with act and a proposal being built right now is exactly one a
+  new proposal must not duplicate.
 - `deliverables.ts` — derives "what has this agent actually built" from act-phase actions on approved
   proposals: one record per proposal, carrying its repo / live deployment / PR as typed artifacts.
   Purely derived on read (`GET /api/deliverables`), so it can't disagree with the action log and adds
@@ -514,6 +525,25 @@ on). A directive is consumed — injected into one research prompt, then cleared
   Truncation, exhausted turns, a phase with zero tool calls, and a missing `outcome_record` are all
   reported separately, because they call for different responses. `act-verification.test.ts` runs the
   real #27 step list and tool calls through it.
+
+  The verdict persists to `proposals.act_status` / `act_problems` (`ActStatus`:
+  `running` → `interrupted` | `complete` | `incomplete`). **Stored rather than derived from
+  `actions` the way `deliverables.ts` is**, for two reasons: the verdict depends on the model's
+  finish reason, which no table records, and the state that matters most — an act phase the
+  process died inside — is exactly the one with no completion row to derive from.
+  `markActStarted` writes `running` *before* the model is called, so anything that kills the
+  process in between leaves a marker; `reapInterruptedActPhases()` turns those into
+  `interrupted` at the next startup, which is sound because act phases only ever run in the
+  orchestrator process.
+
+  **The reap marks state; it does not decide what runs next.** `next_run_at` is the resume
+  marker, and it is cleared only in `drainQueue`'s `finally` — which a killed process never
+  reaches. So an interrupted act phase (and a *completed* one whose reflect was cut short) still
+  reads as due, and `schedulerTick()` re-runs act from the top on the next start. The act prompt
+  tells the model to read back real state first, so a re-run often reconciles, but nothing
+  guarantees it: a second `github_commit_files` is a second commit, and a connector that sends
+  an email or creates a payment link is not idempotent at all. Anything touching this has to
+  choose between "resume the build" and "never repeat a side effect" deliberately.
 - `integrations/{github,vercel,netlify}.ts` + `integrations-server.ts` — thin API wrappers and the tools
   that expose them (`buildIntegrationsTools()`). Read-only tools (`github_read_repo`, `vercel_list_projects`, etc.) are free for the research
   phase to call. Write tools (`github_create_repo`, `vercel_deploy`, `netlify_deploy`, etc.) only work in

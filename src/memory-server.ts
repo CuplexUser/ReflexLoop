@@ -356,6 +356,39 @@ export class MemoryStore {
     this.ensureColumn("proposals", "revenue_model", "TEXT");
     this.ensureColumn("proposals", "monetization_json", "TEXT");
     this.ensureColumn("proposals", "steps_json", "TEXT");
+
+    // Whether the approved work actually got done. See ActStatus for the states and why this
+    // is a stored column rather than derived from `actions` the way deliverables.ts is: the
+    // verdict depends on the model's finish reason, which no table records, and the state that
+    // matters most -- an act phase the process died in the middle of -- is precisely the one
+    // with no completion row to derive from.
+    //
+    // NULL on every proposal that has never acted, including all pre-existing ones, which is
+    // the correct reading for them rather than a backfill guess.
+    this.ensureColumn("proposals", "act_status", "TEXT");
+    this.ensureColumn("proposals", "act_problems", "TEXT");
+  }
+
+  /**
+   * Clears the `running` act marker left behind by a process that died mid-phase.
+   *
+   * Safe as an unconditional startup sweep because act phases only ever run in the
+   * orchestrator process, one at a time: if this process is only starting now, nothing
+   * is running, so every `running` row is a corpse. Distinguishing the two matters --
+   * `running` means "in flight, don't touch", `interrupted` means "nobody is coming
+   * back for this", and they get opposite treatment in the duplicate check.
+   *
+   * Returns the proposals it reset, so startup can say so out loud instead of silently
+   * repairing state.
+   */
+  reapInterruptedActPhases(): ProposalRow[] {
+    const stranded = this.db
+      .prepare(`SELECT * FROM proposals WHERE act_status = 'running'`)
+      .all() as unknown as ProposalRow[];
+    if (stranded.length > 0) {
+      this.db.exec(`UPDATE proposals SET act_status = 'interrupted' WHERE act_status = 'running'`);
+    }
+    return stranded;
   }
 
   /** Returns true if the column didn't already exist and was just added. */
@@ -1019,15 +1052,68 @@ export class MemoryStore {
   }
 
   /**
-   * The closest open proposal to a candidate, if it's close enough to be the same idea reworded.
+   * The open proposals a new one is actually checked against.
    *
-   * Rejected proposals are deliberately not checked against: a rejection usually comes with a
-   * reason, and the improved retry that reason asks for is a *good* proposal that would score
-   * as a near-duplicate of the thing it improves on. Blocking it would turn one "no" into a
-   * permanent ban on the whole subject.
+   * Two carve-outs, and they are the same carve-out twice.
+   *
+   * **Rejected** proposals were never in `listOpenProposals` to begin with: a rejection comes
+   * with a reason, and the improved retry that reason asks for is a *good* proposal that scores
+   * as a near-duplicate of the thing it improves on. Blocking it turns one "no" into a permanent
+   * ban on the subject.
+   *
+   * **Approved proposals whose act phase didn't finish** are excluded here for exactly that
+   * reason. A proposal to complete unbuilt work is, by construction, near-identical to the work
+   * -- there is no wording that both describes finishing #27 and doesn't resemble #27. The
+   * refinement pass on #27 hit this for real: `proposal_create` was refused twice (43% then 32%
+   * overlap) and only landed on the third attempt, after the model had reworded it enough to
+   * slip under the threshold. It got through by sounding different, not by being different,
+   * which is the exact selection pressure this check exists to avoid creating.
+   *
+   * `interrupted` is included in the carve-out and `running` is deliberately not: research runs
+   * concurrently with act, so a proposal being built *right now* is precisely one a new proposal
+   * must not duplicate. See `reapInterruptedActPhases` for what separates the two.
    */
+  listDuplicateCandidates() {
+    return this.db
+      .prepare(
+        `SELECT * FROM proposals
+          WHERE status IN ('pending', 'approved')
+            AND (act_status IS NULL OR act_status IN ('running', 'complete'))
+          ORDER BY created_at DESC`
+      )
+      .all() as unknown as ProposalRow[];
+  }
+
+  /** The closest open proposal to a candidate, if it's close enough to be the same idea reworded. */
   findDuplicateProposal(candidate: { domain: string; description: string }) {
-    return findNearDuplicate(candidate, this.listOpenProposals());
+    return findNearDuplicate(candidate, this.listDuplicateCandidates());
+  }
+
+  /**
+   * Marks an act phase as in flight. Written before the model is called, so a crash between
+   * here and the verdict leaves a `running` row for the next startup to reap rather than a
+   * proposal that looks like it never acted.
+   */
+  markActStarted(id: number) {
+    this.db.prepare(`UPDATE proposals SET act_status = 'running', act_problems = NULL WHERE id = ?`).run(id);
+  }
+
+  /** Records what `verifyAct` concluded once the act phase returned. */
+  recordActVerdict(id: number, verdict: { complete: boolean; problems: string[] }) {
+    this.db
+      .prepare(`UPDATE proposals SET act_status = ?, act_problems = ? WHERE id = ?`)
+      .run(verdict.complete ? "complete" : "incomplete", verdict.problems.length ? JSON.stringify(verdict.problems) : null, id);
+  }
+
+  /** Approved proposals whose act phase started and never reached a verdict, or reached a bad one. */
+  listUnfinishedActs(): ProposalRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM proposals
+          WHERE status = 'approved' AND act_status IN ('interrupted', 'incomplete')
+          ORDER BY decided_at DESC`
+      )
+      .all() as unknown as ProposalRow[];
   }
 
   decideProposal(id: number, status: "approved" | "rejected", humanNotes?: string) {
@@ -1930,7 +2016,25 @@ export interface ProposalRow {
   monetization_json: string | null;
   /** JSON-encoded {@link ProposalStep}[]. */
   steps_json: string | null;
+  /** How the approved work went. NULL on anything that has never reached the act phase. */
+  act_status: ActStatus | null;
+  /** JSON-encoded string[] of what `verifyAct` objected to. NULL when it had no objections. */
+  act_problems: string | null;
 }
+
+/**
+ * The life of an act phase, as the record sees it.
+ *
+ * - `running` — started, still going. Only ever true of the live process; see `reapInterruptedActPhases`.
+ * - `interrupted` — started and the process went away before it finished. Nobody is coming back for it.
+ * - `complete` — ran, did every agent-owned step, recorded an outcome.
+ * - `incomplete` — ran and didn't. Truncated, out of turns, steps skipped, or no outcome recorded.
+ *
+ * `interrupted` and `incomplete` are separate because they need different responses: one is an
+ * infrastructure failure that a re-run may simply fix, the other is the model not finishing the
+ * job, which is a reason to look at the proposal.
+ */
+export type ActStatus = "running" | "interrupted" | "complete" | "incomplete";
 
 /** Parses a proposal's stored monetization block, tolerating the nulls on legacy rows. */
 export function parseMonetization(row: Pick<ProposalRow, "monetization_json">): Monetization | null {

@@ -776,6 +776,13 @@ async function actPhase(proposal: ProposalRow): Promise<ActVerdict> {
   const abortController = new AbortController();
   actAbortController = abortController;
 
+  // Before the model is called, not after: everything between here and the verdict below --
+  // an abort, a crash, the machine going away -- leaves the row saying `running`, which the
+  // next startup reaps into `interrupted`. Without this marker an act phase that died halfway
+  // is indistinguishable from one that never started, and the proposal sits approved forever
+  // looking like it's still queued.
+  store.markActStarted(proposal.id);
+
   const result = await runPhase({
     phase: "act",
     proposalId: proposal.id,
@@ -806,6 +813,7 @@ async function actPhase(proposal: ProposalRow): Promise<ActVerdict> {
     stopReason: result.stopReason,
     providerStopReason: result.providerStopReason,
   });
+  store.recordActVerdict(proposal.id, verdict);
   if (verdict.complete) return verdict;
 
   console.warn(`[act] proposal #${proposal.id} did not complete:\n  - ${verdict.problems.join("\n  - ")}`);
@@ -1087,6 +1095,34 @@ async function mainLoop() {
   // review in parallel, not one at a time.
   for (const leftover of store.listPendingProposals()) {
     enqueueForReview(leftover);
+  }
+
+  // An act phase can only run in this process, so anything still marked `running` when this
+  // process is only now starting belongs to one that died. Reaped here rather than left as-is
+  // because `running` means "in flight, don't duplicate it" to the duplicate check, and a
+  // corpse holding that marker would suppress the follow-up proposal forever.
+  //
+  // NOTE: this marks the state, it does not decide what happens next -- and what happens next
+  // is that `schedulerTick()` below re-queues the proposal and act runs again from the top.
+  // `next_run_at` is the resume marker and it is only cleared in `drainQueue`'s `finally`,
+  // which a killed process never reaches, so an interrupted (or even a fully completed) act
+  // phase still looks due. The act prompt does tell the model to read back real state first,
+  // so a re-run often reconciles, but nothing guarantees it: a second `github_commit_files`
+  // makes a second commit, and a connector operation that sends an email or creates a payment
+  // link is not idempotent at all. Clearing `next_run_at` here would stop the re-run; it is
+  // left alone for now because "resume the build" and "never repeat a side effect" are both
+  // defensible defaults and the choice is the operator's, not this comment's.
+  for (const stranded of store.reapInterruptedActPhases()) {
+    console.warn(
+      `[act] proposal #${stranded.id} was mid-act when the previous process stopped; marked interrupted. Whatever it already committed or deployed stands, and the scheduler is about to run its act phase again from the top.`
+    );
+    emitAgentEvent({
+      type: "act_incomplete",
+      proposalId: stranded.id,
+      problems: ["The act phase was still running when the previous process stopped, so it never finished or reported."],
+      toolCalls: 0,
+      stopReason: "interrupted",
+    });
   }
 
   // Catch up on anything already due (scheduled/recurring proposals whose time

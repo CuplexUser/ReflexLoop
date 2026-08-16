@@ -109,6 +109,95 @@ describe("proposals", () => {
   });
 });
 
+describe("act status and the duplicate carve-out", () => {
+  // The real shape of the #27 failure: an approved proposal whose build never landed, and a
+  // follow-up that necessarily reads as a near-duplicate of it because finishing the work and
+  // describing the work are the same words.
+  const MACHWATCH = {
+    domain: "IoT condition-monitoring prototype",
+    description:
+      "MachWatch, a working MQTT to dashboard to email-alert condition-monitoring prototype for small machine shops, deployed static to Vercel with threshold alerts",
+    expectedCost: 0,
+    expectedTimeHours: 5,
+    expectedUpside: 1200,
+    requiredTools: ["mcp__integrations__github_create_repo", "mcp__integrations__github_commit_files"],
+  };
+  const FOLLOW_UP = {
+    domain: "IoT condition-monitoring prototype",
+    description:
+      "MachWatch, actually build the approved prototype: the MQTT dashboard condition-monitoring repo for small machine shops is empty, so commit the files and deploy it to Vercel with threshold alerts",
+  };
+
+  function approvedMachwatch() {
+    const id = store.createProposal(MACHWATCH);
+    store.decideProposal(id, "approved");
+    return id;
+  }
+
+  it("blocks the follow-up while the original still counts as live work", () => {
+    const id = approvedMachwatch();
+    expect(store.findDuplicateProposal(FOLLOW_UP)?.proposal.id).toBe(id);
+
+    // Mid-build is the one case where a duplicate really would be a duplicate.
+    store.markActStarted(id);
+    expect(store.findDuplicateProposal(FOLLOW_UP)?.proposal.id).toBe(id);
+
+    store.recordActVerdict(id, { complete: true, problems: [] });
+    expect(store.findDuplicateProposal(FOLLOW_UP)?.proposal.id).toBe(id);
+  });
+
+  it("allows the follow-up once the act phase is known not to have finished", () => {
+    const id = approvedMachwatch();
+    store.markActStarted(id);
+    store.recordActVerdict(id, { complete: false, problems: ["outcome_record was never called."] });
+
+    expect(store.findDuplicateProposal(FOLLOW_UP)).toBeNull();
+    expect(store.getProposal(id)!.act_status).toBe("incomplete");
+    expect(JSON.parse(store.getProposal(id)!.act_problems!)).toEqual(["outcome_record was never called."]);
+  });
+
+  it("allows the follow-up after the act phase was interrupted by a restart", () => {
+    const id = approvedMachwatch();
+    store.markActStarted(id);
+
+    // The process dies here; the next one sweeps.
+    expect(store.reapInterruptedActPhases().map((p) => p.id)).toEqual([id]);
+    expect(store.getProposal(id)!.act_status).toBe("interrupted");
+    expect(store.findDuplicateProposal(FOLLOW_UP)).toBeNull();
+  });
+
+  it("reaps nothing on a clean start and is safe to run twice", () => {
+    const id = approvedMachwatch();
+    store.markActStarted(id);
+    store.recordActVerdict(id, { complete: true, problems: [] });
+
+    expect(store.reapInterruptedActPhases()).toEqual([]);
+    expect(store.reapInterruptedActPhases()).toEqual([]);
+    expect(store.getProposal(id)!.act_status).toBe("complete");
+  });
+
+  it("lists unfinished acts for the operator, and clears one on a fresh attempt", () => {
+    const interrupted = approvedMachwatch();
+    store.markActStarted(interrupted);
+    store.reapInterruptedActPhases();
+
+    expect(store.listUnfinishedActs().map((p) => p.id)).toEqual([interrupted]);
+
+    // Re-running act on it clears the marker until the new run reaches its own verdict.
+    store.markActStarted(interrupted);
+    expect(store.listUnfinishedActs()).toEqual([]);
+    expect(store.getProposal(interrupted)!.act_problems).toBeNull();
+  });
+
+  it("leaves a proposal that never acted out of every act-status list", () => {
+    const id = store.createProposal(MACHWATCH);
+    store.decideProposal(id, "approved");
+    expect(store.getProposal(id)!.act_status).toBeNull();
+    expect(store.listUnfinishedActs()).toEqual([]);
+    expect(store.reapInterruptedActPhases()).toEqual([]);
+  });
+});
+
 describe("outcomes and lessons", () => {
   it("records an outcome and derives a lesson from it", async () => {
     const proposalId = store.createProposal({
