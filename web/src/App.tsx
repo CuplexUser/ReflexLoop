@@ -4,6 +4,7 @@ import { App as AntApp, Badge, Button, Layout, Menu, Spin, Tag, Tooltip, Typogra
 import {
   BulbOutlined,
   CodeOutlined,
+  AimOutlined,
   ControlOutlined,
   DashboardOutlined,
   ExperimentOutlined,
@@ -42,6 +43,7 @@ const LessonsPage = lazy(() => import('./pages/LessonsPage').then((m) => ({ defa
 const ResearchPage = lazy(() => import('./pages/ResearchPage').then((m) => ({ default: m.ResearchPage })))
 const EconomicsPage = lazy(() => import('./pages/EconomicsPage').then((m) => ({ default: m.EconomicsPage })))
 const ControlPage = lazy(() => import('./pages/ControlPage').then((m) => ({ default: m.ControlPage })))
+const GoalsPage = lazy(() => import('./pages/GoalsPage').then((m) => ({ default: m.GoalsPage })))
 
 // Only mounts on Cmd-K, so its modal + search plumbing has no business in the initial payload.
 const CommandPalette = lazy(() => import('./components/CommandPalette').then((m) => ({ default: m.CommandPalette })))
@@ -55,6 +57,7 @@ type PageKey =
   | 'economics'
   | 'lessons'
   | 'research'
+  | 'goals'
   | 'control'
 
 /** Nav key -> the path its menu item goes to. Routes below also accept a trailing /:id for deep links. */
@@ -67,6 +70,7 @@ const PAGE_PATHS: Record<PageKey, string> = {
   economics: '/economics',
   lessons: '/lessons',
   research: '/research',
+  goals: '/goals',
   control: '/control',
 }
 
@@ -185,6 +189,7 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
             { key: 'economics', icon: <FundOutlined />, label: 'Economics' },
             { key: 'lessons', icon: <BulbOutlined />, label: 'Lessons' },
             { key: 'research', icon: <ExperimentOutlined />, label: 'Research notes' },
+            { key: 'goals', icon: <AimOutlined />, label: 'Goals' },
             { key: 'control', icon: <ControlOutlined />, label: 'Agent control' },
           ]}
         />
@@ -282,6 +287,8 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
                 <Route path="/lessons/:id" element={<LessonsPage historyVersion={socket.historyVersion} />} />
                 <Route path="/research" element={<ResearchPage historyVersion={socket.historyVersion} />} />
                 <Route path="/research/:id" element={<ResearchPage historyVersion={socket.historyVersion} />} />
+                <Route path="/goals" element={<GoalsPage />} />
+                <Route path="/goals/:id" element={<GoalsPage />} />
                   <Route path="/control" element={<ControlPage historyVersion={socket.historyVersion} />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
               </Routes>

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
   Alert,
   App,
@@ -35,8 +36,8 @@ import { palette } from '../theme'
 export function ControlPage({ historyVersion }: { historyVersion: number }) {
   const { message } = App.useApp()
   const consoleOnly = useConsoleOnly()
+  const navigate = useNavigate()
   const [control, setControl] = useState<ControlState | null>(null)
-  const [domainsText, setDomainsText] = useState('')
   const [directive, setDirective] = useState('')
   const [intervalMinutes, setIntervalMinutes] = useState<number>(60)
   const [busy, setBusy] = useState<string | null>(null)
@@ -46,7 +47,6 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
       .control()
       .then((state) => {
         setControl(state)
-        setDomainsText(state.domains.join('\n'))
         setDirective(state.directive ?? '')
         setIntervalMinutes(Math.round(state.cycleIntervalMs / 60000))
       })
@@ -70,12 +70,6 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
   if (!control) {
     return <Alert type="warning" message="Control state unavailable — is the agent process running?" />
   }
-
-  const domains = domainsText
-    .split('\n')
-    .map((d) => d.trim())
-    .filter(Boolean)
-  const domainsChanged = domains.join('|') !== control.domains.join('|')
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
@@ -180,24 +174,27 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
         </Col>
       </Row>
 
-      <Card size="small" title="Domains">
+      <Card size="small" title="Goals">
         <Space direction="vertical" size={8} style={{ width: '100%' }}>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            One per line. Takes effect on the next research cycle; nothing already approved is affected. Saved
-            to the database — this overrides AGENT_DOMAINS and survives a restart.
+            What the agent researches now lives on its own page. The textarea that used to be here made the
+            lane's name and its research brief the same string — and that string was also the key everything
+            got filed under, so a reworded one silently split the history.
           </Typography.Text>
-          <Input.TextArea
-            value={domainsText}
-            onChange={(e) => setDomainsText(e.target.value)}
-            autoSize={{ minRows: 3, maxRows: 8 }}
-          />
-          <Button
-            type="primary"
-            disabled={!domainsChanged || domains.length === 0}
-            loading={busy === 'domains'}
-            onClick={() => run('domains', () => api.setDomains(domains), 'Domains updated')}
-          >
-            Save domains
+          <Space wrap>
+            {control.goals.filter((g) => g.status === 'active').map((g) => (
+              <Tag key={g.id} color={palette.approved}>
+                {g.title}
+              </Tag>
+            ))}
+            {control.goals.some((g) => g.status === 'suggested') && (
+              <Tag color={palette.pending} style={{ color: palette.bgSunken }}>
+                {control.goals.filter((g) => g.status === 'suggested').length} awaiting your decision
+              </Tag>
+            )}
+          </Space>
+          <Button type="primary" onClick={() => navigate('/goals')}>
+            Manage goals
           </Button>
         </Space>
       </Card>

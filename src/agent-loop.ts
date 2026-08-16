@@ -19,6 +19,7 @@ import { priceUsage } from "./llm/pricing.js";
 import type { ChatMessage, LlmClient } from "./llm/types.js";
 import { getSearchConfig } from "./search/index.js";
 import type { ToolRegistry } from "./tools/registry.js";
+import { toolRisk } from "./tool-catalog.js";
 
 export interface AgentRunOptions {
   client: LlmClient;
@@ -54,6 +55,36 @@ export interface AgentRunResult {
  */
 function wantsNativeSearch(client: LlmClient, allowedTools: string[]): boolean {
   return getSearchConfig().mode === "native" && client.supportsNativeSearch && allowedTools.includes("WebSearch");
+}
+
+/**
+ * Whether a turn's tool calls can all be dispatched at once.
+ *
+ * Research is latency-bound on the network, not on tokens -- a single research run in the ledger
+ * took 39 minutes, almost all of it WebSearch and WebFetch waiting in series. Running a batch of
+ * those concurrently costs nothing extra and is the one free speedup available here.
+ *
+ * The bar is deliberately high: **every** call must be a pure read, or the whole batch runs
+ * sequentially exactly as before.
+ *
+ *   - `write` tools are ordered by nature -- create the repo, then commit to it, then deploy it.
+ *     Act-phase behaviour is therefore completely unchanged.
+ *   - `memory` tools are excluded too, even though they only touch the agent's own DB, because
+ *     several now check for a near-duplicate before inserting. Two similar notes dispatched
+ *     together would both pass that check before either wrote, and the guard would let through
+ *     exactly the duplicate it exists to stop.
+ *   - `unknown` covers proposal_create and goal_suggest, which have the same read-then-write
+ *     race, so the conservative default is already the correct one for them.
+ *
+ * Native search calls are excluded by the registry check: they are answered by the client rather
+ * than dispatched, and `handleNativeToolCall` performs the work rather than merely reporting
+ * whether it would, so it can't be used as a predicate here.
+ */
+function canRunConcurrently(calls: { name: string }[], allowedTools: string[], registry: ToolRegistry): boolean {
+  if (calls.length < 2) return false;
+  return calls.every(
+    (call) => allowedTools.includes(call.name) && registry.has(call.name) && toolRisk(call.name) === "read"
+  );
 }
 
 export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
@@ -96,8 +127,29 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
       providerRaw: response.providerRaw,
     });
 
-    for (const call of response.toolCalls) {
+    // A batch of pure reads is dispatched concurrently; anything else runs exactly as it
+    // always has, one at a time. See canRunConcurrently for where that line is drawn.
+    const precomputed = canRunConcurrently(response.toolCalls, allowedTools, registry)
+      ? await Promise.all(
+          response.toolCalls.map(async (call) => {
+            if (signal?.aborted) throw new Error("Aborted");
+            return registry.invoke(call.name, call.args);
+          })
+        )
+      : null;
+
+    for (const [index, call] of response.toolCalls.entries()) {
       if (signal?.aborted) throw new Error("Aborted");
+
+      // Results are consumed in the model's original call order regardless of which finished
+      // first, so the transcript, the actions table and the console's activity feed read the
+      // same as they always did. Concurrency is a latency change, not an ordering one.
+      const done = precomputed?.[index];
+      if (done) {
+        messages.push({ role: "tool", toolCallId: call.id, name: call.name, content: done.text, isError: done.isError });
+        opts.onToolCall?.(call.name, call.args, done.text, done.isError);
+        continue;
+      }
 
       // A provider whose server-side search surfaces as a call we have to answer
       // (Moonshot) gets answered here; it isn't ours to dispatch or to fence.

@@ -6,6 +6,9 @@ import type {
   Deliverable,
   DuplicateNotePair,
   EconomicsResponse,
+  GoalHealth,
+  GoalRow,
+  GoalStatus,
   LessonRow,
   OutcomeRow,
   PersistedEvent,
@@ -106,6 +109,20 @@ export const api = {
   deleteResearchNote: (id: number) => send(`/api/research-notes/${id}`, 'DELETE'),
   mergeResearchNotes: (keepId: number, mergeIds: number[]) =>
     send('/api/research-notes/merge', 'POST', { keepId, mergeIds }),
+
+  // ---- goals ----
+  // Accepting a suggestion is its own endpoint rather than a status PATCH: it applies the
+  // operator's edits and the activation in one call, so a goal is never briefly active carrying
+  // text they were still correcting.
+  goals: () => getJson<{ goals: GoalRow[]; health: GoalHealth[] }>('/api/goals'),
+  createGoal: (fields: { title: string; brief?: string; weight?: number }) =>
+    send<{ ok: true; id: number; control: ControlState }>('/api/goals', 'POST', fields),
+  updateGoal: (id: number, fields: { title?: string; brief?: string; status?: GoalStatus; weight?: number }) =>
+    send<{ ok: true; control: ControlState }>(`/api/goals/${id}`, 'PATCH', fields),
+  acceptGoal: (id: number, edits?: { title?: string; brief?: string }) =>
+    send<{ ok: true; control: ControlState }>(`/api/goals/${id}/accept`, 'POST', edits ?? {}),
+  dismissGoal: (id: number) => send<{ ok: true; control: ControlState }>(`/api/goals/${id}/dismiss`, 'POST'),
+  deleteGoal: (id: number) => send<{ ok: true; control: ControlState }>(`/api/goals/${id}`, 'DELETE'),
 
   // ---- runtime control ----
   control: () => getJson<ControlState>('/api/control'),

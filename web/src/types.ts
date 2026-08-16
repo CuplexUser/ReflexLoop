@@ -145,11 +145,52 @@ export interface StatusResponse {
 
 export interface ControlState {
   paused: boolean
+  /** Every goal, whatever its status — including suggested ones, which the loop never researches. */
+  goals: GoalSummary[]
+  /** Titles of the active goals only. Derived from `goals` server-side, never set independently. */
   domains: string[]
   cycleIntervalMs: number
   directive: string | null
   runningProposalId: number | null
   queuedProposalIds: number[]
+}
+
+export type GoalStatus = 'active' | 'paused' | 'retired' | 'suggested'
+
+export interface GoalSummary {
+  id: number
+  title: string
+  brief: string
+  status: GoalStatus
+  weight: number
+}
+
+/** Rows are passed through from SQLite as-is, hence snake_case — same as LessonRow and friends. */
+export interface GoalRow extends GoalSummary {
+  /** 'agent' means it arrived via goal_suggest and is inert until a human accepts it. */
+  origin: 'human' | 'agent'
+  parent_id: number | null
+  /** Why the agent suggested it — only set for agent-origin goals. */
+  rationale: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** Per-goal counters derived on read, so they can't disagree with the proposal and run logs. */
+export interface GoalHealth {
+  goal_id: number
+  title: string
+  status: GoalStatus
+  weight: number
+  proposals: number
+  approved: number
+  shipped: number
+  outcomes: number
+  successes: number
+  api_spend: number
+  last_proposal_at: string | null
+  /** Research cycles since this goal last produced a proposal — the "is this lane dead?" number. */
+  empty_cycles: number
 }
 
 /** How much damage a tool can do -- drives the risk badges on a proposal under review. */

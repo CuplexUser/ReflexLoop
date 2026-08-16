@@ -22,27 +22,28 @@ import path from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
-import type { MemoryStore, Priority } from "./memory-server.js";
+import { goalTitleFromDomain, type GoalStatus, type MemoryStore, type Priority } from "./memory-server.js";
 import { emitAgentEvent, onAgentEvent, type AgentEvent } from "./events.js";
 import { submitDecision, hasPendingDecision } from "./review-gateway.js";
 import { fireReactiveTrigger } from "./reactive-triggers.js";
 import { ALL_GRANTABLE_TOOLS, toolRisk } from "./tool-catalog.js";
 import { buildDeliverables, type DeliverableOutcomeRow } from "./deliverables.js";
 import { isConsoleOnlyMode } from "./console-mode.js";
-import { CONSOLE_ONLY_WRITABLE_ROUTES } from "./control-settings-writer.js";
+import { CONSOLE_ONLY_WRITABLE_ROUTES, type ControlSettingsWriter } from "./control-settings-writer.js";
 import {
   getControlState,
   requestAbort,
   requestRunNow,
   setCycleIntervalMs,
   setDirective,
-  setDomains,
+  setGoals,
   setPaused,
 } from "./agent-control.js";
 
 const API_TOKEN = process.env.AGENT_API_TOKEN ?? "";
 const BIND_HOST = process.env.AGENT_BIND_HOST ?? "127.0.0.1";
 const MIN_CYCLE_INTERVAL_MS = 60_000;
+const GOAL_STATUSES: string[] = ["active", "paused", "retired", "suggested"];
 
 /** Constant-time compare so a wrong token can't be recovered by timing the response. */
 function tokenMatches(candidate: string): boolean {
@@ -64,9 +65,31 @@ function presentedToken(req: { headers: Record<string, unknown>; url?: string })
   }
 }
 
-export function startServer(store: MemoryStore, port: number): Server {
+/**
+ * `settingsWriter` is present only in console-only mode, where the store is read-only and every
+ * write that mode still allows has to go through that narrow connection instead. Its absence is
+ * what tells the goal routes below they're in a normal run and may use the store directly.
+ */
+export function startServer(
+  store: MemoryStore,
+  port: number,
+  opts: { settingsWriter?: ControlSettingsWriter } = {}
+): Server {
   const app = express();
   app.use(express.json({ limit: "1mb" }));
+
+  /**
+   * Re-reads goals from the DB into control state after any mutation. A full re-read rather than
+   * patching the in-memory copy: the table is the source of truth, and re-reading it is the one
+   * update that cannot disagree with it.
+   */
+  const refreshGoals = () => setGoals(store.listGoals().map((g) => ({
+    id: g.id,
+    title: g.title,
+    brief: g.brief,
+    status: g.status,
+    weight: g.weight,
+  })));
 
   if (API_TOKEN) {
     app.use("/api", (req: Request, res: Response, next: NextFunction) => {
@@ -89,16 +112,20 @@ export function startServer(store: MemoryStore, port: number): Server {
   // are control endpoints too, and both would answer 200 while doing nothing at all in this
   // mode (no loop is sleeping for run-now to wake, and no act phase is running to abort).
   // A button that reports success and has no effect is worse than one that refuses. The
-  // writer behind these three enforces the same three keys independently -- see
+  // writer behind these routes enforces the same narrow vocabulary independently -- see
   // control-settings-writer.ts.
+  //
+  // PATCH is allowed alongside POST because editing a goal is a PATCH; the allowlist still
+  // decides which paths, so this widens the verbs the list is consulted for, not the list.
   if (isConsoleOnlyMode()) {
     app.use("/api", (req: Request, res: Response, next: NextFunction) => {
       if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
       const path = req.path.replace(/\/+$/, "");
-      if (req.method === "POST" && CONSOLE_ONLY_WRITABLE_ROUTES.includes(path)) return next();
+      const writableMethod = req.method === "POST" || req.method === "PATCH";
+      if (writableMethod && CONSOLE_ONLY_WRITABLE_ROUTES.some((route) => route.test(path))) return next();
       res.status(403).json({
         error:
-          "Read-only console mode (--console-only): only the domains, cycle interval and pause settings can be changed here.",
+          "Read-only console mode (--console-only): only goals and the cycle interval and pause settings can be changed here.",
       });
     });
   }
@@ -352,7 +379,7 @@ export function startServer(store: MemoryStore, port: number): Server {
     });
   });
 
-  app.post("/api/lessons/:id/mute", (req, res) => {
+  app.post("/api/lessons/:id/mute", async (req, res) => {
     const id = Number(req.params.id);
     const { muted } = req.body as { muted?: boolean };
     if (typeof muted !== "boolean") {
@@ -363,7 +390,10 @@ export function startServer(store: MemoryStore, port: number): Server {
       res.status(404).json({ error: "No such lesson." });
       return;
     }
-    store.setLessonMuted(id, muted);
+    // Awaited: muting now also clears the flag on the Qdrant point that lesson_search filters
+    // on, so answering before that lands would report success while the lesson was still
+    // reachable by the agent.
+    await store.setLessonMuted(id, muted);
     res.json({ ok: true });
   });
 
@@ -501,13 +531,123 @@ export function startServer(store: MemoryStore, port: number): Server {
     res.json({ ok: true });
   });
 
+  // ---- goals ---------------------------------------------------------------
+  //
+  // Every write here is the operator's. `goal_suggest` is the only thing the model can do to
+  // this table, and all it can produce is a row with status='suggested' that the loop never
+  // reads -- accepting one is a human clicking accept, below.
+
+  app.get("/api/goals", (_req, res) => {
+    res.json({ goals: store.listGoals(), health: store.goalHealth() });
+  });
+
+  app.post("/api/goals", (req, res) => {
+    const { title, brief, weight } = req.body as { title?: string; brief?: string; weight?: number };
+    if (typeof title !== "string" || !title.trim()) {
+      res.status(400).json({ error: "Body must include a non-blank `title`." });
+      return;
+    }
+    const fields = { title: title.trim(), brief: typeof brief === "string" ? brief : "", weight: weight ?? 1 };
+    const id = opts.settingsWriter ? opts.settingsWriter.createGoal(fields) : store.createGoal(fields);
+    refreshGoals();
+    res.json({ ok: true, id, control: getControlState() });
+  });
+
+  app.patch("/api/goals/:id", (req, res) => {
+    const id = Number(req.params.id);
+    const { title, brief, status, weight, parentId } = req.body as {
+      title?: string;
+      brief?: string;
+      status?: string;
+      weight?: number;
+      parentId?: number | null;
+    };
+    if ((title !== undefined && !title.trim()) || (status !== undefined && !GOAL_STATUSES.includes(status))) {
+      res.status(400).json({ error: `\`title\` must be non-blank and \`status\` one of: ${GOAL_STATUSES.join(", ")}.` });
+      return;
+    }
+
+    const ok = opts.settingsWriter
+      ? opts.settingsWriter.updateGoal(id, { title: title?.trim(), brief, status, weight, parent_id: parentId })
+      : store.updateGoal(id, { title: title?.trim(), brief, status: status as GoalStatus | undefined, weight, parentId });
+    if (!ok) {
+      res.status(404).json({ error: `No goal #${id}, or nothing to change.` });
+      return;
+    }
+    refreshGoals();
+    res.json({ ok: true, control: getControlState() });
+  });
+
+  /** Accept a suggested goal: the one step that turns the agent's pointer into a lane it works on. */
+  app.post("/api/goals/:id/accept", (req, res) => {
+    const id = Number(req.params.id);
+    const { title, brief } = req.body as { title?: string; brief?: string };
+    // Edits are applied in the same call as the status flip, for the same reason approve-with-
+    // edits is one call on proposals: a goal must never be briefly active carrying text the
+    // operator was in the middle of correcting.
+    const patch = { title: title?.trim(), brief, status: "active" as const };
+    const ok = opts.settingsWriter ? opts.settingsWriter.updateGoal(id, patch) : store.updateGoal(id, patch);
+    if (!ok) {
+      res.status(404).json({ error: `No goal #${id}.` });
+      return;
+    }
+    refreshGoals();
+    res.json({ ok: true, control: getControlState() });
+  });
+
+  /** Dismiss: retire rather than delete, so a re-suggestion of the same lane is still refused. */
+  app.post("/api/goals/:id/dismiss", (req, res) => {
+    const id = Number(req.params.id);
+    const patch = { status: "retired" as const };
+    const ok = opts.settingsWriter ? opts.settingsWriter.updateGoal(id, patch) : store.updateGoal(id, patch);
+    if (!ok) {
+      res.status(404).json({ error: `No goal #${id}.` });
+      return;
+    }
+    refreshGoals();
+    res.json({ ok: true, control: getControlState() });
+  });
+
+  app.delete("/api/goals/:id", (req, res) => {
+    if (!store.deleteGoal(Number(req.params.id))) {
+      res.status(404).json({ error: `No goal #${req.params.id}.` });
+      return;
+    }
+    refreshGoals();
+    res.json({ ok: true, control: getControlState() });
+  });
+
+  /**
+   * Kept for back-compat with the old newline-textarea console and anything scripted against it.
+   * Reconciles the active goal set to exactly the titles given: matching titles stay (keeping
+   * their briefs, health and id), missing ones are retired rather than deleted, and new ones are
+   * created. Retiring rather than deleting matters -- deleting would orphan the work filed under
+   * a lane just because it fell out of a list someone retyped.
+   */
   app.post("/api/control/domains", (req, res) => {
     const { domains } = req.body as { domains?: string[] };
     if (!Array.isArray(domains) || domains.length === 0 || domains.some((d) => typeof d !== "string" || !d.trim())) {
       res.status(400).json({ error: "Body must include a non-empty `domains` array of non-blank strings." });
       return;
     }
-    setDomains(domains.map((d) => d.trim()));
+    if (opts.settingsWriter) {
+      res.status(409).json({ error: "Edit goals directly in this mode -- POST /api/goals and PATCH /api/goals/:id." });
+      return;
+    }
+
+    const wanted = domains.map((d) => d.trim());
+    const existing = store.listGoals();
+    for (const goal of existing) {
+      const stillWanted = wanted.some((w) => w.toLowerCase() === goal.title.toLowerCase());
+      if (goal.status === "active" && !stillWanted) store.updateGoal(goal.id, { status: "retired" });
+      if (stillWanted && goal.status !== "active") store.updateGoal(goal.id, { status: "active" });
+    }
+    for (const title of wanted) {
+      if (!existing.some((g) => g.title.toLowerCase() === title.toLowerCase())) {
+        store.createGoal({ title: goalTitleFromDomain(title), brief: title });
+      }
+    }
+    refreshGoals();
     res.json({ ok: true, control: getControlState() });
   });
 

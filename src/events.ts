@@ -26,6 +26,10 @@ export type AgentEvent =
   // carried because zero of them means something different -- the phase never researched
   // anything, which is a failure, not a decision.
   | { type: "no_proposal"; reason: string; toolCalls: number }
+  // The agent pointing at a lane it isn't allowed to enter. Surfaced live because a suggestion
+  // sits inert until a human accepts it -- an operator who never sees it is a suggestion that
+  // silently does nothing, which is the same as not having the tool.
+  | { type: "goal_suggested"; goalId: number; title: string; rationale: string }
   | { type: "cycle_idle"; nextCycleAt: string };
 
 const bus = new EventEmitter();

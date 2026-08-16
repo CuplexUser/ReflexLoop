@@ -16,6 +16,7 @@
 
 ## Backlog
 
+- [ ] Per-goal research fan-out (deferred -- see note below, documented rather than built)
 - [ ] Move large blobs/JSON out of SQLite (deferred -- see note below, not worth doing yet)
 - [ ] Code-split the frontend bundle (1.3MB / 415KB gzipped, one chunk -- Vite warns on every
       build). Not urgent for a localhost console, but it's the only build warning left.
@@ -195,3 +196,43 @@ separate rate-limited embeddings API in the loop anymore. Same fail-soft contrac
 before -- falls back to `LIKE` search if `QDRANT_URL` / `QDRANT_API_KEY` /
 `QDRANT_EMBEDDING_MODEL` / `QDRANT_EMBEDDING_DIM` aren't all set. See `.env.example`
 and the Semantic search section of `README.md`.
+## Per-goal research fan-out
+
+One `researchAndPlanPhase` run per active goal, executing concurrently instead of a
+single run handed the whole goal list, capped by an `AGENT_RESEARCH_CONCURRENCY`
+setting defaulting to 1 so it stays opt-in and the cost stays the operator's call.
+
+**Why it's attractive.** The prompt tells research to "pick whichever look most
+promising -- you don't need to cover all of them evenly", and the model duly collapses
+onto one lane: four goals configured, but recent cycles produced only Swedish-market
+and property-comparison work. A goal with its own run cannot be crowded out by a
+louder one. It would also make research spend attributable per goal -- `runs.goal_id`
+already exists for exactly this and is currently never set, because one research run
+covers every goal, which is also why `goalHealth.empty_cycles` has to count all
+research runs rather than the goal's own. And wall-clock would scale with the number
+of goals instead of summing them.
+
+**Why it's deferred.**
+
+- N× cost per cycle. Cheap at the current flash-model pricing (~$0.03 -> ~$0.12), not
+  cheap on a pro model -- earlier `research_plan` rows in `runs` cost $0.50-$1.34 each.
+- N× search-provider quota against one Tavily key.
+- Duplicate-proposal race. The dedup check in `proposal-similarity.ts` reads open
+  proposals from the DB, so two in-flight `proposal_create` calls can both pass it
+  before either commits. The history already contains this failure twice
+  (NoticeCraft/NoticeReady, and three spellings of the property-comparison site) --
+  and that was with a *sequential* loop.
+- `openProposalDigest()` goes stale mid-cycle: each run gets a snapshot taken before
+  its siblings created anything, so the prompt-level duplicate guard weakens at
+  exactly the moment the DB-level one is also under pressure.
+
+**Revisit when** goal health shows a specific goal being starved rather than genuinely
+empty -- that's the signal fan-out addresses and the prompt digests don't. Do the
+`proposal_create` mutex first; it's worth having on its own merits.
+
+Related and deliberately *not* on this list: parallel act phases. Side effects land on
+shared GitHub/Vercel accounts, `actAbortController` is a single module-level handle
+that would abort the wrong run, and it contradicts the serialization guarantee the
+rest of the design assumes. Concurrent dispatch of read-only tool calls within a turn
+is already implemented (`canRunConcurrently` in `agent-loop.ts`) and is where the
+free latency win actually was.

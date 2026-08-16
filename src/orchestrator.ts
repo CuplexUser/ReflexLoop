@@ -25,12 +25,21 @@ import { isConsoleOnlyMode } from "./console-mode.js";
 import { getSearchConfig } from "./search/index.js";
 import { ToolRegistry } from "./tools/registry.js";
 import { buildWebTools } from "./tools/web.js";
-import { MemoryStore, buildMemoryTools, type Priority, type ProposalRow } from "./memory-server.js";
+import {
+  MemoryStore,
+  buildMemoryTools,
+  goalTitleFromDomain,
+  preview,
+  type GoalRow,
+  type Priority,
+  type ProposalRow,
+} from "./memory-server.js";
 import { buildIntegrationsTools } from "./integrations-server.js";
 import {
   MEMORY_TOOLS,
   READONLY_BUILTIN_TOOLS,
   READONLY_INTEGRATION_TOOLS,
+  RESEARCH_OUTPUT_TOOLS,
   WRITE_INTEGRATION_TOOLS,
 } from "./tool-catalog.js";
 import { emitAgentEvent } from "./events.js";
@@ -115,12 +124,6 @@ const BASE_SYSTEM = [
   "Only the tools listed for the current phase are available. Do not invent tool names or describe a tool call in prose instead of calling it.",
   "Be concrete and honest. Estimates are estimates and must be labelled as such; recorded outcomes must be what actually happened, including failures.",
 ].join("\n");
-
-function preview(value: unknown, max = 150): string {
-  const s = typeof value === "string" ? value : JSON.stringify(value);
-  const oneLine = (s ?? "").replace(/\s+/g, " ").trim();
-  return oneLine.length > max ? oneLine.slice(0, max) + "…" : oneLine;
-}
 
 /**
  * Runs one phase to completion, logging every tool call and the phase's API spend.
@@ -221,7 +224,7 @@ async function runPhase(opts: {
 // or dispatchable by it; see the fence note in agent-loop.ts.
 const RESEARCH_ALLOWED_TOOLS = [
   ...MEMORY_TOOLS,
-  "mcp__memory__proposal_create",
+  ...RESEARCH_OUTPUT_TOOLS,
   ...READONLY_BUILTIN_TOOLS,
   ...READONLY_INTEGRATION_TOOLS,
 ];
@@ -236,6 +239,99 @@ const RESEARCH_MAX_TURNS = 60;
 
 /** How many existing proposals to show research+plan. Newest first -- old ones are the least likely to be re-proposed. */
 const OPEN_PROPOSAL_DIGEST_LIMIT = 30;
+
+/** Per goal, how much already-known material to put in front of research before it starts. */
+const LESSON_DIGEST_PER_GOAL = 4;
+const SATURATION_DIGEST_PER_GOAL = 8;
+
+/**
+ * Empty cycles before a goal is told to look sideways rather than harder.
+ *
+ * The store shows five consecutive cycles producing nothing on the same three lanes before
+ * anyone intervened, so this fires well before that -- but not on the first quiet cycle, which
+ * is a normal result the prompt explicitly allows.
+ */
+const EXPLORE_AFTER_EMPTY_CYCLES = 3;
+
+/**
+ * What research already knows, put in front of it rather than left for it to ask about.
+ *
+ * `openProposalDigest` below makes this argument for proposals -- "a duplicate has to be
+ * prevented on every cycle, and a tool only helps on the cycles the model remembers to call it"
+ * -- and it applies unchanged to lessons and dead ends. The prompt has always *told* research to
+ * call lesson_search and research_note_search first; roughly a third of the notes on file are
+ * "I checked, it's saturated", and cycles kept re-checking them anyway. Being told is weaker
+ * than being shown.
+ *
+ * Both digests are per goal and deliberately terse -- one line each. They're a floor, not a
+ * replacement: the search tools are still granted, and still the way to get the full text.
+ */
+async function lessonDigest(goals: GoalRow[]): Promise<string> {
+  // Deduped across goals. Many lessons are operational rather than lane-specific ("check the
+  // credential exists before proposing work that needs it"), so they match every goal and would
+  // otherwise be repeated once per goal -- the same four paragraphs four times, crowding out the
+  // digests that actually differ.
+  const seen = new Set<number>();
+  const sections: string[] = [];
+  for (const goal of goals) {
+    const lessons = (await store.searchLessons(`${goal.title}\n${goal.brief}`, LESSON_DIGEST_PER_GOAL)).filter(
+      (l) => !seen.has(l.id)
+    );
+    if (lessons.length === 0) continue;
+    for (const l of lessons) seen.add(l.id);
+    const lines = lessons.map((l) => `  - #${l.id} (confidence ${l.confidence.toFixed(1)}): ${preview(l.lesson, 220)}`);
+    sections.push(`${goal.title}:\n${lines.join("\n")}`);
+  }
+  return sections.join("\n");
+}
+
+function saturationDigest(goals: GoalRow[]): string {
+  const seen = new Set<number>();
+  const sections: string[] = [];
+  for (const goal of goals) {
+    const notes = store.listSaturatedNotes(goal.id, SATURATION_DIGEST_PER_GOAL).filter((n) => !seen.has(n.id));
+    if (notes.length === 0) continue;
+    for (const n of notes) seen.add(n.id);
+    const lines = notes.map((n) => `  - ${n.fetched_at.slice(0, 10)} #${n.id}: ${preview(n.topic, 110)}`);
+    sections.push(`${goal.title}:\n${lines.join("\n")}`);
+  }
+  // A goal with no goal_id-matched notes falls back to the unscoped recent set, so a store full
+  // of legacy unassigned notes still contributes something rather than nothing.
+  if (sections.length === 0) {
+    const notes = store.listSaturatedNotes(null, SATURATION_DIGEST_PER_GOAL * 2);
+    if (notes.length === 0) return "";
+    return notes.map((n) => `  - ${n.fetched_at.slice(0, 10)} #${n.id}: ${preview(n.topic, 110)}`).join("\n");
+  }
+  return sections.join("\n");
+}
+
+/**
+ * The goals that have gone quiet, with a vector-derived steer for each.
+ *
+ * This is the anti-lock-in half. A lane that keeps coming up empty doesn't need to be researched
+ * harder, and the honest options are to look adjacent to it or to say so -- which is what
+ * `goal_suggest` is for. The steer comes from findUnexploredDirections: notes close to the goal
+ * but unlike the dead ends already recorded for it, which is a different question from anything
+ * the model can ask with the search tools it has.
+ */
+async function explorationMandate(goals: GoalRow[]): Promise<string> {
+  const health = new Map(store.goalHealth().map((h) => [h.goal_id, h]));
+  const stalled = goals.filter((g) => (health.get(g.id)?.empty_cycles ?? 0) >= EXPLORE_AFTER_EMPTY_CYCLES);
+  if (stalled.length === 0) return "";
+
+  const sections: string[] = [];
+  for (const goal of stalled) {
+    const empty = health.get(goal.id)?.empty_cycles ?? 0;
+    const directions = await store.findUnexploredDirections(goal, 4);
+    const steer =
+      directions.length > 0
+        ? `\n  Findings here that are NOT dead ends, and are the most likely places left to look:\n` +
+          directions.map((d) => `    - #${d.id}: ${preview(d.topic, 110)}`).join("\n")
+        : "";
+    sections.push(`- "${goal.title}": ${empty} research cycles since it last produced a proposal.${steer}`);
+  }
+  return sections.join("\n");
+}
 
 /**
  * The research phase's view of what has already been proposed.
@@ -267,29 +363,49 @@ function openProposalDigest(): string {
 
 async function researchAndPlanPhase(): Promise<ProposalRow[]> {
   const beforeIds = new Set(store.listPendingProposals().map((p) => p.id));
-  const domains = getControlState().domains;
+  const goals = store.activeGoals();
   // A directive steers exactly one cycle, then clears itself -- it's a nudge for this
   // run, not a standing instruction that quietly reshapes every future cycle. It can
   // only redirect what gets researched; the output is still a proposal needing approval.
   const directive = consumeDirective();
   const openProposals = openProposalDigest();
+  const lessons = await lessonDigest(goals);
+  const saturated = saturationDigest(goals);
+  const exploration = await explorationMandate(goals);
 
   const { finalText, toolCalls } = await runPhase({
     phase: "research_plan",
     proposalId: null,
     prompt: [
-      `Domains to research this cycle (pick whichever look most promising -- you don't need to cover all of them evenly): ${domains.join("; ")}.`,
+      // Each goal's brief verbatim, not a joined list of names. The brief is where the operator
+      // put the actual instructions ("research in Swedish, check Fortnox/Bokio first"), which
+      // used to be crammed into the same string that served as the grouping key and so arrived
+      // as a label rather than as direction.
+      `Goals to research this cycle (pick whichever look most promising -- you don't need to cover all of them evenly):`,
+      goals.map((g) => `- ${g.title}${g.brief && g.brief !== g.title ? `\n    ${g.brief}` : ""}`).join("\n"),
+      `When you record anything against a goal -- a proposal's \`domain\`, a lesson's \`domain\`, a note's \`domain\` -- use that goal's title above exactly as written. Inventing a new phrasing each cycle is how the same lane ended up recorded under thirteen different names, none of which could be matched against each other.`,
       ...(directive ? [`The operator left a directive for this cycle -- weight it heavily: ${directive}`] : []),
       ...(openProposals
         ? [
             `Proposals that already exist -- do NOT propose any of these again, or a near-identical variant of one (same product, same audience, reworded):\n${openProposals}\nIf one of them is the right direction, the useful move is a concrete next step on it -- say which #id it builds on in your description -- not a second proposal for the same thing. A pending one hasn't been rejected; it just hasn't been reviewed yet, and re-proposing it only buries the original.`,
           ]
         : []),
-      `Before anything else, call lesson_search and research_note_search for each domain/topic you're about to look into -- don't re-research what's already known. lesson_search does semantic matching now, so it can surface relevant lessons even when your domain's wording doesn't exactly match a past one.`,
-      `Also call action_history_search for each domain -- it shows what's actually been built/deployed/committed on approved proposals so far, so you don't propose duplicate work (e.g. a second repo for something already shipped). Prefer proposing the next step on existing work over starting over.`,
+      ...(lessons ? [`Lessons already learned that apply here. Treat these as settled unless this cycle turns up something that contradicts one -- in which case call lesson_reinforce with direction "contradicted" rather than quietly working around it:\n${lessons}`] : []),
+      ...(saturated
+        ? [
+            `Ground already checked and found saturated or dead. Do NOT spend this cycle re-confirming any of it -- that has happened for several cycles running and produced nothing:\n${saturated}\nIf you believe one of these is worth revisiting, say specifically what changed since that date; "let me check again" is not a reason.`,
+          ]
+        : []),
+      ...(exploration
+        ? [
+            `These goals have gone quiet:\n${exploration}\nFor each, do NOT simply search the same ground harder. Either find a genuinely different angle within the goal -- a different audience, buyer, geography or price point -- or, if the lane really does look played out, call goal_suggest with an adjacent direction that looks live and say what you saw that suggests it. A suggested goal is inert until the operator accepts it, so it costs them nothing to consider and does not change what you work on this cycle.`,
+          ]
+        : []),
+      `The digests above are a floor, not the whole record. Call lesson_search and research_note_search for anything you're about to look into -- both do semantic matching, so they surface relevant history even when your wording doesn't match the original.`,
+      `Also call action_history_search for each goal -- it shows what's actually been built/deployed/committed on approved proposals so far, so you don't propose duplicate work (e.g. a second repo for something already shipped). Prefer proposing the next step on existing work over starting over.`,
       `You can use the read-only tools github_read_repo, github_read_file, github_search_repos, vercel_list_projects, vercel_get_project, netlify_list_sites, netlify_get_site to check the existing landscape (competing projects, your own prior projects) before proposing.`,
-      `Research for concrete, boundable opportunities to earn money. Use WebSearch/WebFetch and the read-only integration tools above. Save distilled findings with research_note_add as you go.`,
-      `When you have specific ideas, call proposal_create for each one worth a human's attention -- typically 1, up to 3 per cycle if multiple domains turned up genuinely strong, distinct opportunities. Don't pad the count with weak ideas just to fill a quota.`,
+      `Research for concrete, boundable opportunities to earn money. Use WebSearch/WebFetch and the read-only integration tools above. Save distilled findings with research_note_add as you go, and set \`kind\` on each one -- 'gap' when you find something underserved, 'saturated' when you check a space and it is already well covered. Marking the dead ends honestly is what stops a future cycle spending itself re-checking them, so they are worth recording even though they feel like nothing.`,
+      `When you have specific ideas, call proposal_create for each one worth a human's attention -- typically 1, up to 3 per cycle if multiple goals turned up genuinely strong, distinct opportunities. Don't pad the count with weak ideas just to fill a quota.`,
       `Each proposal needs a real cost/time/upside estimate and the exact tool names execution would need. Built-in tools are unprefixed (e.g. 'WebSearch'). MCP tools need their full qualified name -- the act-phase write tools available are: ${WRITE_INTEGRATION_TOOLS.join(", ")}. For GitHub work: prefer github_commit_files (one commit, many files) over repeated github_commit_file calls; and either commit straight to the default branch, or if you use github_create_pr, list github_merge_pr in required_tools too and merge it during the act phase -- an approved proposal has no further GitHub-side review to wait for, so an unmerged PR just leaves the default branch empty.`,
       `Then stop -- do not act on any proposal, a human reviews each one next.`,
       `If nothing concrete and boundable comes out of the research, don't force a proposal -- just stop.`,
@@ -669,8 +785,16 @@ function serveConsoleOnly(): void {
   console.log("No model API will be called; the only writable settings are domains, cycle interval and pause.");
   const saved = store.loadControlSettings();
   const settingsWriter = new ControlSettingsWriter(DB_PATH);
+  // Seeding has to go through the writer here: the store is read-only, and an empty `goals`
+  // table would otherwise leave this mode with nothing to retarget -- which is the one job it
+  // has. Same derivation as the real run, just through the narrow connection.
+  if (store.listGoals().length === 0) {
+    for (const domain of saved.domains ?? DOMAINS) {
+      settingsWriter.createGoal({ title: goalTitleFromDomain(domain), brief: domain });
+    }
+  }
   initControl({
-    domains: saved.domains ?? DOMAINS,
+    goals: goalSummaries(),
     cycleIntervalMs: saved.cycleIntervalMs ?? CYCLE_INTERVAL_MS,
     paused: saved.paused,
     // A directive read from the DB is still shown (it's part of control state), but this
@@ -678,7 +802,18 @@ function serveConsoleOnly(): void {
     directive: saved.directive,
     persist: (patch) => settingsWriter.save(patch),
   });
-  startServer(store, SERVER_PORT);
+  startServer(store, SERVER_PORT, { settingsWriter });
+}
+
+/** The goal fields the control layer carries, read fresh from the table it's the projection of. */
+function goalSummaries() {
+  return store.listGoals().map((g) => ({
+    id: g.id,
+    title: g.title,
+    brief: g.brief,
+    status: g.status,
+    weight: g.weight,
+  }));
 }
 
 async function mainLoop() {
@@ -701,14 +836,19 @@ async function mainLoop() {
   // is written back through `persist`, so a console change is no longer lost on restart.
   // From here every read goes through getControlState() rather than the module constants.
   const saved = store.loadControlSettings();
-  if (saved.domains) {
-    console.log(`[control] using ${saved.domains.length} operator-set domains from the DB, not AGENT_DOMAINS.`);
+  // One-time move off the free-text domain list: a DB that has never had goals gets one per
+  // configured domain, title split from brief. No-op on every subsequent start, so AGENT_DOMAINS
+  // keeps its "seeds a fresh DB, loses to what the operator set" semantics -- the goals table is
+  // simply what it now seeds.
+  const seeded = store.seedGoalsFromDomains(saved.domains ?? DOMAINS);
+  if (seeded > 0) {
+    console.log(`[goals] seeded ${seeded} goal(s) from the configured domains -- edit them on the console's Goals page.`);
   }
   if (saved.paused) {
     console.warn("[control] starting PAUSED -- the loop was paused from the console and that persists.");
   }
   initControl({
-    domains: saved.domains ?? DOMAINS,
+    goals: goalSummaries(),
     cycleIntervalMs: saved.cycleIntervalMs ?? CYCLE_INTERVAL_MS,
     paused: saved.paused,
     directive: saved.directive,

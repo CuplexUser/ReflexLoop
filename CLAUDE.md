@@ -40,8 +40,17 @@ A name that isn't in the tool catalog is **allowed but flagged**, not rejected �
 tools by exact name, so an unrecognized entry grants nothing, and rejecting it blocked legitimate cases
 (a console whose catalog predates a newly added tool). The console badges it; the server logs it.
 
-Every other lever the console offers (pause, abort, directives, domains) can only reduce activity or
+Every other lever the console offers (pause, abort, directives, goals) can only reduce activity or
 redirect research; none of them grants the agent anything.
+
+**The same invariant, one level up: no accepted goal, no research.** Goals are what the loop is
+pointed at (see Architecture below). The agent can *suggest* one with `goal_suggest` when a lane it
+was given keeps coming up empty — but a suggested goal is inert: `status='suggested'` is excluded
+from `activeGoals()`, never appears in a prompt, and `resolveGoalId` refuses to file anything under
+it. Only a human clicking Accept makes it real. Don't add anything that auto-accepts a suggestion,
+for the same reason nothing auto-approves a proposal: it would let the agent choose what it works
+on. Retired goals are equally unreachable, so dismissing a suggestion also stops the lane coming
+back — that refusal is deliberate, not a bug.
 
 ## Commands
 
@@ -68,16 +77,21 @@ this mode — that's the trade for touching nothing. The obvious alternative, a 
 the real loop against a scratch DB, was tried and rejected: an empty DB makes the console useless to
 develop against, and a copy of the real one drifts.
 
-**The one exception: domains, cycle interval and pause are writable here.** They're the settings
+**The one exception: goals, cycle interval and pause are writable here.** They're the settings
 the *next* real run reads at startup, and `AGENT_DOMAINS` stops being the source of truth the moment
-the console first sets domains — so without this, retargeting the loop before starting it meant
-hand-editing `control_settings` with a sqlite one-liner. `MemoryStore` stays read-only; those three
-persist through `ControlSettingsWriter`, a **separate connection that can reach three keys of one
-table and nothing else**. Relaxing the store to read/write instead would have put every proposal,
-lesson and action one forgotten `if` away from a mode whose whole promise is that it writes nothing —
-this way the capability added is the small one, and the guarantee over everything else is untouched
-rather than re-defended. Both layers still apply: `CONSOLE_ONLY_WRITABLE_ROUTES` is the server's
-allowlist, and the writer independently ignores any other key.
+the console first sets goals — so without this, retargeting the loop before starting it meant
+hand-editing the DB with a sqlite one-liner. `MemoryStore` stays read-only; these persist through
+`ControlSettingsWriter`, a **separate connection that can reach three keys of `control_settings` and
+the `goals` table, and nothing else**. Relaxing the store to read/write instead would have put every
+proposal, lesson and action one forgotten `if` away from a mode whose whole promise is that it writes
+nothing — this way the capability added is the small one, and the guarantee over everything else is
+untouched rather than re-defended. Both layers still apply: `CONSOLE_ONLY_WRITABLE_ROUTES` is the
+server's allowlist (anchored regexes, since the goal routes carry an id), and the writer
+independently ignores any key or column outside its own two allowlists.
+
+**Deleting a goal is excluded from this mode on purpose.** `MemoryStore.deleteGoal` also clears
+`goal_id` across proposals, lessons, notes and runs, and this writer must not be able to reach those
+tables. Dismissing (status → `retired`) is the reversible equivalent and stays within `goals`.
 
 `directive`, run-now and abort are **excluded on purpose** even though a directive persists like the
 others: all three need a research loop, and this mode has none. Run-now especially would answer 200
@@ -89,8 +103,12 @@ should read that hook**, and new writable routes have to be added to the allowli
 writer's key set, or they'll 403 in this mode.
 
 Vitest covers the parts that can be tested without an API key: `src/memory-server.test.ts`
-(`MemoryStore` against an in-memory SQLite DB, with `qdrant.ts` mocked so semantic-search tests exercise
-the deterministic LIKE-fallback path regardless of ambient `QDRANT_*` env vars), `src/tools/registry.test.ts`
+(`MemoryStore` against an in-memory SQLite DB, with `qdrant.ts` mocked so tests are deterministic
+regardless of ambient `QDRANT_*` env vars — the mock returns `null` by default, so most tests exercise
+the LIKE-fallback path, and a `vectorHits` handle lets individual tests script real scored hits, which
+is what finally covers the semantic path: hydration order, the confidence re-ranking, and `[]` vs
+`null`. Also covers goal seeding/resolution, the suggest-stays-inert invariant, and dedup-on-write),
+`src/tools/registry.test.ts`
 (schema conversion and in-band error handling), `src/tools/web.test.ts` (HTML-to-text, and that WebFetch
 refuses loopback/private addresses), and `src/llm/pricing.test.ts` (the cost table, the OpenRouter
 reported-cost path, and the deliberate $0-for-unknown-model behaviour). The adapters and the loop itself
@@ -135,11 +153,21 @@ Each cycle: **research + plan → human review → act → outcome + reflect**.
 
 - **research + plan** (`researchAndPlanPhase`) — gets its whole tool grant up front with no human in the
   loop, since every tool available to it is read-only or writes only to the agent's own memory DB. Can span multiple
-  `AGENT_DOMAINS` per cycle and create 0-3 proposals; not forced to cover domains evenly. Calls
-  `lesson_search`/`research_note_search` first so it doesn't re-research what's already known, and
-  `action_history_search` to see what's already been built/deployed so it doesn't propose duplicate work.
+  goals per cycle and create 0-3 proposals; not forced to cover them evenly.
+
+  **What it's shown, versus what it can ask for.** Four digests are injected into the prompt before it
+  starts: the open proposal queue, the lessons that apply, the ground already found saturated, and — for
+  any goal that's gone quiet — an exploration mandate. `openProposalDigest`'s own rationale is why
+  ("a duplicate has to be prevented on every cycle, and a tool only helps on the cycles the model
+  remembers to call it"), and it applies unchanged to lessons and dead ends: the prompt had always
+  *told* research to call `lesson_search` and `research_note_search` first, roughly a third of the notes
+  on file were "I checked, it's saturated", and cycles kept re-checking them anyway. The tools are still
+  granted — the digests are a floor, not a replacement. Each goal's **brief is passed verbatim**, which
+  is where operator instructions ("research in Swedish, check Fortnox/Bokio first") belong; the title is
+  only the key, and the prompt tells the model to echo it back exactly when filing anything.
+
   Proposing **zero** is a legitimate result — the prompt tells it not to force a weak proposal, and a
-  domain whose ideas keep getting rejected will eventually stop producing any. That state used to be
+  goal whose ideas keep getting rejected will eventually stop producing any. That state used to be
   invisible (stdout only), which is indistinguishable from a broken loop, so a cycle that creates
   nothing now emits a `no_proposal` event carrying the model's own stated reason. It also carries the
   phase's tool-call count, because **zero tool calls is a different thing entirely** — the phase never
@@ -183,12 +211,18 @@ present with a zero, would understate what the loop cost. `runs` also records th
 produced each row, since phases can be pointed at different models.
 
 **Runtime control** (`agent-control.ts`) holds state the operator drives from the console: paused,
-domains, cycle interval, a one-shot research directive, and a live view of what's executing. `mainLoop`
+goals, cycle interval, a one-shot research directive, and a live view of what's executing. `mainLoop`
 re-reads it each pass instead of closing over the env constants, so changes take effect without a
 restart. The operator-set half **persists** to `control_settings` (key/JSON-value) via a `persist`
 callback `initControl` is handed — `agent-control.ts` never imports `MemoryStore`, so it stays
-dependency-free and can't read anything back out of the DB. At startup the orchestrator merges: env
-seeds a fresh DB, saved settings win. That makes `AGENT_DOMAINS`/`AGENT_CYCLE_INTERVAL_MS` **seed
+dependency-free and can't read anything back out of the DB.
+
+`ControlState.domains` is now a **projection**, not a field: `setGoals` derives it as the titles of the
+active goals, so there's no way for "what the loop is pointed at" and "what the goals table says" to
+disagree. `control_settings.domains` is still written with those titles — nothing in the loop reads it
+any more, but it stays the record a fresh DB seeds goals from. At startup the orchestrator merges: env
+seeds a fresh DB, saved settings win, and `seedGoalsFromDomains` turns that list into goals exactly
+once. That makes `AGENT_DOMAINS`/`AGENT_CYCLE_INTERVAL_MS` **seed
 values, not the source of truth** — editing `.env` after the console has set them does nothing, which
 is the opposite of the old behaviour where a console change looked permanent and silently reverted on
 restart. Consuming a directive persists the clear too, or a one-shot steer that survived a restart
@@ -216,6 +250,16 @@ on). A directive is consumed — injected into one research prompt, then cleared
 - `agent-loop.ts` — the replacement for the SDK's `query()`: ask the model, run the tools it asked for,
   feed results back, repeat to `maxTurns`. Provider-agnostic (it only touches an `LlmClient`), and the
   place the tool fence is enforced.
+
+  **Tool calls run concurrently only when the whole batch is pure reads** (`canRunConcurrently`, gated
+  on `toolRisk`). Research is latency-bound on the network — one run in the ledger took 39 minutes,
+  almost all of it WebSearch/WebFetch in series — so this is free wall-clock. The bar is deliberately
+  high and `memory` is excluded along with `write`, even though it only touches the agent's own DB:
+  several memory tools now check for a near-duplicate before inserting, and two similar calls dispatched
+  together would both pass that check before either wrote, letting through exactly the duplicate the
+  guard exists to stop. Results are consumed in the model's original call order regardless of which
+  finished first, so the transcript, the `actions` table and the activity feed are unchanged —
+  concurrency is a latency change, not an ordering one. Act-phase behaviour is untouched.
 - `tools/registry.ts` — what replaced the MCP servers. A tool is a name, description, zod schema and
   handler; the registry converts schemas to JSON Schema (`z.toJSONSchema`, `io: "input"`) and dispatches.
   Every failure — unknown tool, invalid args, throwing handler — comes back as `isError` tool text rather
@@ -235,9 +279,37 @@ on). A directive is consumed — injected into one research prompt, then cleared
   Anthropic's `web_search_*` server tool). **The point of the seam: "WebSearch" means the same thing to
   the operator in all modes** — one grantable tool name, one badge in the console, one entry in
   `required_tools`. Keep it that way.
+- **Goals** (`goals` table, in `memory-server.ts`) — what the loop is pointed at, and what replaced the
+  free-text `domain` string as the thing the operator curates. That string was doing two incompatible
+  jobs at once: a stable grouping key *and* a research brief. It could not do both. The model invents
+  the domain on every `proposal_create` and nothing validated it, so 20 proposals arrived under **13
+  distinct spellings** — "comparison site / affiliate", "affiliate comparison site" and "comparison
+  directory affiliate site" are one idea under three keys — which silently broke every exact-match
+  lookup built on it: `action_history_search` returned nothing for any configured domain, the scoreboard
+  fragmented, and the `searchLessons` LIKE fallback reached zero rows. Meanwhile one configured domain
+  was a 400-character paragraph of research instructions, because a newline-delimited textarea was the
+  only place to put a brief.
+
+  A goal has `title` (short, stable, the key) and `brief` (the long instructions, kept out of the key),
+  plus `status` / `weight` / `origin` / `parent_id` for branches. **Two mechanisms, deliberately
+  separate**: `goal_id` is for *attribution* (scoreboard, per-goal health, filters) and is exact;
+  *recall* (`lesson_search`, `research_note_search`, `action_history_search`) matches semantically on
+  `title + brief`, so it reaches history written under any of the old spellings. That split is why
+  nothing had to be backfilled — pre-goals rows keep `goal_id = NULL` and their `domain` text, and are
+  still findable. `resolveGoalId` maps the model's free-text `domain` onto a goal at write time, which
+  is what makes the wording stop mattering; it is deliberately **strict and title-only** (measured:
+  including the long brief made the Swedish goal a magnet that swallowed unrelated labels at 0.75),
+  because a misfiled row puts a number on the scoreboard that isn't true, while an unassigned one is
+  merely where every legacy row already sits. `action_history_search` matches on `goal_id` **OR** text
+  and falls back to unfiltered recent history when a filter comes up empty — answering "[]" while 140
+  act-phase actions sit in the table is the most expensive thing that tool can say wrongly.
+
 - `memory-server.ts` — SQLite-backed memory (`data/agent.db`) plus the tools the model can call:
   `research_note_add`, `research_note_search`, `lesson_search`, `lesson_add`, `lesson_reinforce`,
-  `proposal_create`, `proposal_status`, `outcome_record`, `action_history_search`. Approving proposals,
+  `proposal_create`, `proposal_status`, `outcome_record`, `action_history_search`, `goal_suggest`.
+  `proposal_create` and `goal_suggest` are **not** in `MEMORY_TOOLS` — they're `RESEARCH_OUTPUT_TOOLS`,
+  granted only to research, because both write a row a *human* then acts on and neither is something
+  act or reflect has business doing. Approving proposals,
   logging actions, marking a run successful, and **curating memory** (editing, muting, or deleting a
   lesson; deleting or merging research notes) are deliberately *not* model-callable tools — those stay
   with the orchestrator and the human. `buildMemoryTools(store)` returns them; `MemoryStore` itself is a
@@ -247,9 +319,32 @@ on). A directive is consumed — injected into one research prompt, then cleared
   everywhere at once while keeping the record of what was believed and when. `searchLessonsByText` is a
   deliberate sibling of `searchLessons` for the console's operator — the agent looks lessons up *by
   domain* (its LIKE fallback matches domain equality), which finds nothing for a human typing a phrase
-  from a lesson body. Same semantic path, same muted filter, different fallback. Notes/lessons are ranked by Qdrant vector similarity when Qdrant
+  from a lesson body. Same semantic path, same muted filter, different fallback. Notes/lessons are ranked by Qdrant hybrid search when Qdrant
   is configured, falling back to `LIKE` text matching otherwise; `syncToQdrant()` (called once at
-  startup in `orchestrator.ts`) backfills any rows that predate Qdrant being configured. Also owns the
+  startup in `orchestrator.ts`) brings the cluster in step with SQLite.
+
+  **Lessons are re-ranked by confidence** (`rankLessons`), because the LIKE fallback had always ordered
+  by `confidence DESC` and the moment Qdrant was configured that stopped applying at all — results came
+  back in pure similarity order, so a lesson the agent had been contradicted on could outrank one
+  reinforced to 0.9. Reinforcement was being recorded and then ignored. Relevance still dominates
+  (confidence scales it 0.5x–1.0x rather than replacing it).
+
+  **Notes and lessons are deduplicated on write**, the same in-band-refusal pattern `proposal_create`
+  uses: the model gets a tool result naming the existing row and telling it to `lesson_reinforce` or add
+  only what's new. The thresholds are measured against the real store and the measurements are in the
+  code — `LESSON_DUPLICATE_THRESHOLD` 0.70 sits in a wide gap (the two ~95%-identical credential
+  lessons written 50 seconds apart score 0.783; the next-closest genuine pair 0.577), while
+  `NOTE_DUPLICATE_THRESHOLD` 0.85 sits in a **narrow** one (0.863 for a real duplicate, 0.842 for a pair
+  that only looks like one) and errs high on purpose. **Re-measure against the real DB rather than
+  nudging either constant.** Both fall back to the lexical measure in `proposal-similarity.ts` when
+  Qdrant is unavailable, on its own scale.
+
+  **Research notes carry a `kind`** (`gap` / `saturated` / `competitor` / …). Roughly a third of the
+  existing notes are saturation findings, which are useful as a *negative* filter ("don't re-check
+  these"), not as positive context — a distinction the store previously could not express.
+  `listSaturatedNotes` bridges legacy rows with a `kind IS NULL AND topic LIKE '%saturat%'` clause,
+  reading a label the model already wrote in its own topic; without it the saturation digest and the
+  exploration query return nothing until months of new notes accumulate. Also owns the
   `events` table (persisted activity feed, capped at `EVENTS_KEEP`) and `action_history_search`'s
   backing query, which joins `actions` to `proposals` to answer "what's already been done" for
   research/plan — restricted to `phase = 'act'` on `status = 'approved'` proposals to stay low-noise,
@@ -261,6 +356,29 @@ on). A directive is consumed — injected into one research prompt, then cleared
   search instead of throwing. Model + dimension aren't hardcoded (Qdrant Cloud's free model lineup and
   each model's vector size are only listed per-cluster, in the Cloud Console's Inference tab), so both
   are required env config.
+
+  **Collections are versioned** (`COLLECTION_VERSION`, currently 2 → `research_notes_v2` / `lessons_v2`;
+  v1 is the unsuffixed original). v1 stored one unnamed dense vector and an empty payload, which made
+  this a rank-only sidecar — nothing to filter on, and dense embeddings alone miss the rare exact terms
+  this corpus is full of. v2 stores a named dense vector, a **sparse BM25 vector** queried alongside it
+  and fused with RRF, a real payload (`goal_id`, `kind`, `confidence`, `muted`, `created_at`), and the
+  payload indexes Qdrant *requires* before it will filter — filtering an unindexed field is a 400, not
+  a slow query. Rolling back is one constant; SQLite is the source of truth for every point and
+  `syncToQdrant` rebuilds from it (incrementally, off a `qdrantSync` watermark, with a full pass when
+  the version changes).
+
+  **Three things about scores are easy to get wrong.** (1) Fused RRF scores are *rank*-derived — the top
+  hit is 1.0 whether it's a near-identical duplicate or the least-irrelevant row in the collection — so
+  anything asking "how similar is this really?" (the dedup guards) must pass `denseOnly` and get raw
+  cosine. (2) `score_threshold` therefore goes on the dense prefetch leg, never the fused output.
+  (3) `searchByText` returning `null` means "the search did not happen" and is the LIKE-fallback signal;
+  `[]` means "it ran and matched nothing". Conflating them made a genuinely empty semantic result
+  silently re-run as a substring match.
+
+  **Payload writes are load-bearing, not metadata.** Muting a lesson filters server-side now, so
+  `setLessonMuted` also has to `setPayload` — a mute written only to SQLite would leave the lesson being
+  handed to the model forever, which is the exact failure muting exists to prevent. Same for anything
+  else that changes a filtered field.
 - `tool-output.ts` — reading a field back out of `actions.tool_output`, which has carried **two**
   storage shapes: MCP content blocks (`[{type,text}]`) under the old Agent SDK, and a plain
   double-encoded string since `agent-loop.ts` replaced it. Both are still in the DB, so anything
@@ -330,7 +448,17 @@ Actions (every tool call
 on an *approved* proposal — action type, an input-derived description, and a browsable result URL when
 the tool returned one; phase-filterable, click a row for full input/output JSON via `ActionDialog`),
 Economics (spend over time, spend by phase, spend by provider/model, per-domain scoreboard with
-forecast accuracy), Lessons, Research notes, Agent control.
+forecast accuracy), Lessons, Research notes, **Goals**, Agent control.
+
+**Goals is where the agent gets pointed**, and it replaced the newline-delimited textarea that used to
+live on Agent control (that card is now a link). Title and brief are separate fields, since the old one
+was both a lane's name and its research brief. The page carries three things the textarea couldn't: a
+**Suggested** section for `goal_suggest` rows with Accept / Edit-and-accept / Dismiss; **goal health**
+per lane (proposals, approved, shipped, spend, and empty cycles), which was previously invisible — a
+goal that had gone quiet looked exactly like one nobody had gotten to yet; and a **Retired** section,
+kept rather than deleted so the work stays attributed and the agent is refused if it re-suggests the
+lane. Deep-linked at `/goals/:id` like every other detail view, and lazy-loaded like every route
+except the Dashboard.
 
 **Deliverables vs Actions — two different questions.** Actions answers "what did it do, call by call",
 and that's what it should keep doing. Deliverables answers "what exists now, and where do I click to

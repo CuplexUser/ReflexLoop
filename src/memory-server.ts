@@ -16,12 +16,27 @@ import { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import { defineTool, namespaceTools, type ToolDefinition } from "./tools/registry.js";
 import { emitAgentEvent } from "./events.js";
-import { deletePoint, qdrantAvailable, searchByText, upsertText } from "./qdrant.js";
+import {
+  andFilters,
+  deletePoint,
+  goalFilter,
+  kindFilter,
+  notMutedFilter,
+  qdrantAvailable,
+  recommendByText,
+  searchByText,
+  setPayload,
+  upsertMany,
+  upsertText,
+  type CollectionName,
+  type QdrantPoint,
+  type SearchOptions,
+} from "./qdrant.js";
 // tool_output has carried two storage shapes across this project's life and both are
 // still in the DB; tool-output.ts is the single place that knows how to read either.
 import { extractResultUrl } from "./tool-output.js";
 import { DELIVERABLE_TOOLS, type DeliverableActionRow } from "./deliverables.js";
-import { findNearDuplicate } from "./proposal-similarity.js";
+import { findNearDuplicate, similarity, terms } from "./proposal-similarity.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS research_notes (
@@ -104,12 +119,122 @@ CREATE TABLE IF NOT EXISTS control_settings (
   value TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- What the agent is pointed at. Replaces the free-text "domain" string as the thing the
+-- operator curates, because that string was doing two incompatible jobs at once: a stable
+-- grouping key AND a research brief. It could not do both. The model invents the domain on
+-- every proposal_create and nothing validated it, so 20 proposals arrived under 13 distinct
+-- spellings ("comparison site / affiliate", "affiliate comparison site", "comparison
+-- directory affiliate site" -- one idea, three keys), which silently broke every exact-match
+-- lookup built on it: action_history_search returned nothing, the scoreboard fragmented, and
+-- the lesson fallback reached zero rows.
+--
+-- Splitting title from brief is the fix for the second job: the brief is where "research in
+-- Swedish, check Fortnox/Bokio first" belongs, instead of being crammed into the key.
+--
+-- status='suggested' is how the agent proposes a new direction (goal_suggest). A suggested
+-- goal is inert -- never in getControlState().domains, never in a prompt, never researched --
+-- until a human accepts it. Same invariant as proposals, one level up: the agent may point at
+-- a direction, only the operator makes it real.
+CREATE TABLE IF NOT EXISTS goals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,                       -- short, stable, operator-facing; the grouping key
+  brief TEXT NOT NULL DEFAULT '',            -- the long instructions, kept out of the key
+  status TEXT NOT NULL DEFAULT 'active',     -- active | paused | retired | suggested
+  weight REAL NOT NULL DEFAULT 1,
+  origin TEXT NOT NULL DEFAULT 'human',      -- human | agent
+  parent_id INTEGER REFERENCES goals(id),    -- set when this goal is a branch off another
+  rationale TEXT,                            -- why the agent suggested it
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `;
 
 // How many recent activity-feed events to keep around -- this is a live
 // narration log for the dashboard, not an audit trail (that's actions/runs),
 // so it's fine to trim it rather than grow it forever.
 const EVENTS_KEEP = 500;
+
+/**
+ * How close a free-text label has to be to a goal's title before a row is filed under it.
+ *
+ * Asymmetric costs drive the value: a miss leaves the row unassigned, which is exactly where
+ * every pre-goals row already sits and still reachable by text search, while a false match files
+ * work under the wrong lane and puts a number on the scoreboard that isn't true. So this errs
+ * high. At 0.6, "free web-based tool or calculator people search for and use directly
+ * in-browser" still resolves to the goal seeded from it (0.9), while "micro-SaaS tool for
+ * developers" -- which has no honest answer among the current goals -- resolves to none.
+ */
+const GOAL_MATCH_THRESHOLD = 0.6;
+
+/**
+ * Bumped whenever what gets *stored* in Qdrant changes -- the collection shape, the payload
+ * fields, or the text that gets embedded. A mismatch against the recorded marker forces a full
+ * re-sync instead of an incremental one, which is the only way points written under an older
+ * scheme get brought up to date.
+ */
+const QDRANT_SYNC_VERSION = 2;
+
+/** How many points go in one upsert request. Large enough to matter, small enough to stay well under any body limit. */
+const QDRANT_BATCH = 64;
+
+/**
+ * How many dead ends steer one exploration query. Small on purpose: `best_score` scores a
+ * candidate as its best positive similarity minus its best negative one, so every extra negative
+ * can only push scores down. Feed it the whole saturation history and the negative term wins
+ * outright -- measured, that returned the same four notes for all four goals.
+ */
+const EXPLORE_NEGATIVES = 5;
+
+/**
+ * Where "this is the thing we already wrote" starts, as raw cosine similarity.
+ *
+ * Measured over the real store rather than picked round -- and measured *dense-only*, because
+ * under hybrid fusion the top hit scores 1.0 by virtue of ranking first, whatever it actually
+ * resembles. What the numbers say:
+ *
+ *   lessons   0.783  #1 credential-check lesson   x #2 credential-check lesson   <- duplicates,
+ *                                                    written 50 seconds apart into two domains
+ *             ---- 0.70 ----
+ *             0.577  #2 credentials               x #4 name the deployment gap
+ *             0.352  #3 SSO wall                  x #4 name the deployment gap
+ *
+ *   notes     0.863  #47 Swedish skatteplanering  x #49 Swedish skatteplanering  <- duplicates
+ *             ---- 0.85 ----
+ *             0.842  #3  VS Code monetization     x #12 VS Code monetization constraint
+ *             0.832  #15 Actions cost landscape   x #18 Actions cost competitive check
+ *
+ * Lessons get the lower bar: they're injected into prompts, a duplicate there costs context on
+ * every cycle, and `lesson_reinforce` is a first-class alternative the model is told to use. The
+ * gap under them is wide (0.783 vs 0.577), so 0.70 is not a close call.
+ *
+ * Notes get the higher bar and it *is* a close call -- 0.021 between the true duplicate and a
+ * pair that only looks like one. Erring high is the right side to err on: notes are cheap to
+ * hold, there's already a human-driven merge flow for them, and the refusal is recoverable
+ * either way. If you retune these, re-measure against the real DB rather than nudging them.
+ */
+const LESSON_DUPLICATE_THRESHOLD = 0.7;
+const NOTE_DUPLICATE_THRESHOLD = 0.85;
+
+/**
+ * The same question asked lexically, for when Qdrant is unavailable. A different scale entirely
+ * (Jaccard over stems, not cosine over embeddings), so it gets its own number rather than
+ * borrowing one of the two above.
+ */
+const LEXICAL_DUPLICATE_THRESHOLD = 0.5;
+
+// The exact text each row is embedded as. Kept in one place per type because every write path
+// (insert, edit, merge, full re-sync) has to agree: if two of them format differently, a row's
+// vector stops matching its own text the first time it's edited.
+const noteEmbeddingText = (topic: string, finding: string) => `${topic}: ${finding}`;
+const lessonEmbeddingText = (domain: string, lesson: string) => `${domain}: ${lesson}`;
+
+/** Sequential batches, not Promise.all over all of them: a full rebuild shouldn't burst the cluster. */
+async function upsertInBatches(collection: CollectionName, points: QdrantPoint[]): Promise<void> {
+  for (let i = 0; i < points.length; i += QDRANT_BATCH) {
+    await upsertMany(collection, points.slice(i, i + QDRANT_BATCH));
+  }
+}
 
 const now = () => new Date().toISOString();
 
@@ -124,9 +249,29 @@ export class MemoryStore {
    * migrations check `PRAGMA table_info` before altering anything. A DB that genuinely
    * needs a migration will throw here, which is correct -- migrating is a write, so it
    * has to happen in a normal run first.
+   *
+   * That throw is caught and re-labelled rather than left raw. It had never actually fired
+   * (no migration had been added since console-only mode existed), and what it produces
+   * unhandled is `Error: attempt to write a readonly database` over a stack trace, which
+   * tells an operator nothing about what to do. The answer is always the same one line.
    */
   constructor(path: string, { readOnly = false }: { readOnly?: boolean } = {}) {
     this.db = new DatabaseSync(path, { readOnly });
+    try {
+      this.migrate();
+    } catch (err) {
+      if (readOnly) {
+        throw new Error(
+          `${path} needs a schema migration, which read-only console mode can't perform. ` +
+            `Run \`npm start\` once to migrate it, then \`npm run start:console\` again. (${String(err)})`
+        );
+      }
+      throw err;
+    }
+  }
+
+  /** Schema + every additive migration. Idempotent: re-running it on a current DB does nothing. */
+  private migrate() {
     this.db.exec(SCHEMA);
     // Vector search moved to Qdrant Cloud (qdrant.ts) -- vectors live there now,
     // keyed by the same row id, instead of inline as a JSON column here. Drops
@@ -177,6 +322,25 @@ export class MemoryStore {
           AND NOT EXISTS (SELECT 1 FROM actions WHERE actions.proposal_id = proposals.id AND actions.phase = 'act')
       `);
     }
+
+    // Which goal a row belongs to. Nullable and deliberately not backfilled: rows written
+    // before goals existed carry one of 13 free-text domain spellings, and mapping those onto
+    // goals would be guessing. They stay NULL and group as "unassigned".
+    //
+    // This is why goal_id is for *attribution* only (scoreboard, per-goal health, filters) and
+    // recall is semantic instead: searching on the goal's title+brief reaches history written
+    // under any of the old spellings, so nothing has to be migrated for the agent to remember
+    // what it already learned. The two mechanisms answer different questions on purpose.
+    this.ensureColumn("proposals", "goal_id", "INTEGER REFERENCES goals(id)");
+    this.ensureColumn("lessons", "goal_id", "INTEGER REFERENCES goals(id)");
+    this.ensureColumn("research_notes", "goal_id", "INTEGER REFERENCES goals(id)");
+    this.ensureColumn("runs", "goal_id", "INTEGER REFERENCES goals(id)");
+
+    // What kind of finding a note is. ~17 of the first 46 notes were "I checked, it's
+    // saturated" -- knowledge that is useful as a *negative* filter ("don't re-check these"),
+    // not as positive context, a distinction the store previously could not express. NULL
+    // means unclassified (every pre-existing row) and is simply excluded from the negatives.
+    this.ensureColumn("research_notes", "kind", "TEXT");
   }
 
   /** Returns true if the column didn't already exist and was just added. */
@@ -197,27 +361,355 @@ export class MemoryStore {
     this.db.close();
   }
 
+  // ---- goals ---------------------------------------------------------------
+  //
+  // Curating goals is the operator's job, exactly like approving proposals: the only
+  // model-callable entry point is goal_suggest (see buildMemoryTools), which can create a row
+  // with status='suggested' and nothing else. Accepting, editing, pausing, retiring and
+  // deleting are all plain methods here that the server calls on a human's click. The agent
+  // cannot widen what it works on, only point at where it might be worth widening.
+
+  listGoals(status?: GoalStatus) {
+    return (
+      status
+        ? this.db.prepare(`SELECT * FROM goals WHERE status = ? ORDER BY weight DESC, id ASC`).all(status)
+        : this.db.prepare(`SELECT * FROM goals ORDER BY status ASC, weight DESC, id ASC`).all()
+    ) as unknown as GoalRow[];
+  }
+
+  /** The goals a research cycle actually works on. 'suggested' is deliberately not among them. */
+  activeGoals() {
+    return this.listGoals("active");
+  }
+
+  getGoal(id: number) {
+    return this.db.prepare(`SELECT * FROM goals WHERE id = ?`).get(id) as GoalRow | undefined;
+  }
+
+  createGoal(g: {
+    title: string;
+    brief?: string;
+    status?: GoalStatus;
+    weight?: number;
+    origin?: GoalOrigin;
+    parentId?: number | null;
+    rationale?: string | null;
+  }): number {
+    const t = now();
+    const result = this.db
+      .prepare(
+        `INSERT INTO goals (title, brief, status, weight, origin, parent_id, rationale, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        g.title,
+        g.brief ?? "",
+        g.status ?? "active",
+        g.weight ?? 1,
+        g.origin ?? "human",
+        g.parentId ?? null,
+        g.rationale ?? null,
+        t,
+        t
+      );
+    return Number(result.lastInsertRowid);
+  }
+
+  updateGoal(
+    id: number,
+    fields: { title?: string; brief?: string; status?: GoalStatus; weight?: number; parentId?: number | null }
+  ): boolean {
+    const existing = this.getGoal(id);
+    if (!existing) return false;
+    this.db
+      .prepare(`UPDATE goals SET title = ?, brief = ?, status = ?, weight = ?, parent_id = ?, updated_at = ? WHERE id = ?`)
+      .run(
+        fields.title ?? existing.title,
+        fields.brief ?? existing.brief,
+        fields.status ?? existing.status,
+        fields.weight ?? existing.weight,
+        fields.parentId === undefined ? existing.parent_id : fields.parentId,
+        now(),
+        id
+      );
+    return true;
+  }
+
+  /**
+   * Deleting a goal must not delete the work done under it. `goal_id` is set to NULL on every
+   * row that referenced it -- those proposals/lessons/notes keep their `domain` text snapshot,
+   * so they fall back to exactly the state history rows are already in rather than vanishing
+   * from the scoreboard.
+   */
+  deleteGoal(id: number): boolean {
+    if (!this.getGoal(id)) return false;
+    for (const table of ["proposals", "lessons", "research_notes", "runs"]) {
+      this.db.prepare(`UPDATE ${table} SET goal_id = NULL WHERE goal_id = ?`).run(id);
+    }
+    this.db.prepare(`UPDATE goals SET parent_id = NULL WHERE parent_id = ?`).run(id);
+    this.db.prepare(`DELETE FROM goals WHERE id = ?`).run(id);
+    return true;
+  }
+
+  /**
+   * First-run migration off the free-text domain list. Only fires when `goals` is empty, so it
+   * can be called unconditionally at startup.
+   *
+   * The split matters: one of the live domains was a 400-character paragraph of research
+   * instructions being used as a grouping key. `title` takes the part before the first comma or
+   * dash (capped at a readable length) and `brief` keeps the whole original, so no wording is
+   * lost and the key becomes something a human can actually read off a scoreboard.
+   */
+  seedGoalsFromDomains(domains: readonly string[]): number {
+    const existing = this.db.prepare(`SELECT COUNT(*) AS n FROM goals`).get() as { n: number };
+    if (existing.n > 0) return 0;
+
+    let created = 0;
+    for (const domain of domains) {
+      const trimmed = domain.trim();
+      if (!trimmed) continue;
+      this.createGoal({ title: goalTitleFromDomain(trimmed), brief: trimmed, origin: "human" });
+      created++;
+    }
+    return created;
+  }
+
+  /**
+   * The closest existing goal to a candidate, if it's close enough to be the same lane
+   * reworded. Reuses the proposal duplicate check verbatim -- a goal's title+brief is the same
+   * shape of problem as a proposal's domain+description, and the tokenizer already splits
+   * CamelCase and stems, which is what catches a rename rather than a genuinely new direction.
+   *
+   * Checked against goals of *every* status, including retired ones: re-suggesting a lane the
+   * operator has already dismissed is precisely the loop this is here to stop.
+   */
+  findNearDuplicateGoal(candidate: { title: string; brief: string }) {
+    const existing = this.listGoals().map((g) => ({ id: g.id, domain: g.title, description: g.brief, goal: g }));
+    const match = findNearDuplicate({ domain: candidate.title, description: candidate.brief }, existing);
+    return match ? { goal: match.proposal.goal, score: match.score, shared: match.shared } : null;
+  }
+
+  /**
+   * Which goal a free-text label is talking about, or null.
+   *
+   * This is what makes the model's wording stop mattering. It still passes a `domain` string to
+   * proposal_create/lesson_add/research_note_add and that string is still stored verbatim as the
+   * snapshot -- but the row is *filed* under the goal this resolves it to, so a reworded domain
+   * lands on the right lane instead of minting a fourteenth key. Resolution happens here rather
+   * than as a tool parameter because the model has no reliable way to know a goal's id, and
+   * asking it to track one is how drift got in.
+   *
+   * Deliberately strict, and matched against the **title only**. Two findings from running this
+   * over the 13 real historical domain strings:
+   *
+   *   - Including the brief makes a long goal a magnet. The Swedish goal's 400-character brief
+   *     mentions micro-SaaS and tools, so "micro-SaaS tool for developers" scored 0.75 against
+   *     it and 0.50 against the micro-SaaS goal it actually belongs near -- confidently wrong.
+   *   - A containment measure (overlap coefficient) has the same bias: the more a goal says, the
+   *     more of any short label it can absorb.
+   *
+   * So: symmetric Jaccard against the title, which requires the label to be *about the same
+   * thing* rather than merely mentioned by it. Strings with no good answer -- and most of the
+   * historical ones genuinely have none -- resolve to null and stay unassigned, which is where
+   * every pre-goals row already sits and is still findable by text. The research prompt tells
+   * the model to use a goal's exact title as the domain, so the common path is the exact match
+   * below and this fuzzy tier is only a safety net for light rewording.
+   */
+  resolveGoalId(text: string | null | undefined): number | null {
+    if (!text?.trim()) return null;
+    const label = terms(text);
+    if (label.size === 0) return null;
+
+    let best: { id: number; score: number } | null = null;
+    for (const goal of this.listGoals()) {
+      // A suggested goal is inert, and a retired one was closed on purpose -- filing new work
+      // under either would quietly resurrect a lane the operator hasn't opened.
+      if (goal.status === "suggested" || goal.status === "retired") continue;
+      if (goal.title.trim().toLowerCase() === text.trim().toLowerCase()) return goal.id;
+
+      const { score } = similarity(goal.title, text);
+      if (score >= GOAL_MATCH_THRESHOLD && (best === null || score > best.score)) {
+        best = { id: goal.id, score };
+      }
+    }
+    return best?.id ?? null;
+  }
+
+  /**
+   * Per-goal health: enough to answer "is this lane still worth researching?", which was
+   * previously invisible -- a goal that had gone quiet looked exactly like a goal nobody had
+   * gotten to yet.
+   *
+   * `empty_cycles` counts research runs since this goal last produced a proposal -- all of them,
+   * not just ones charged to this goal, because one research run covers every active goal. (When
+   * `runs.goal_id` starts being set, per-goal fan-out would make that filter meaningful; it isn't
+   * yet, and filtering on it now would make this permanently zero.)
+   *
+   * Floored at the goal's own creation time, so a goal can't be blamed for cycles that ran before
+   * it existed. Without that, seeding goals against an established database reports every lane as
+   * having failed 25 times on its first day and trips the exploration mandate for all of them at
+   * once -- a judgement about history the goal had no part in.
+   */
+  goalHealth() {
+    return this.db
+      .prepare(
+        `SELECT g.id AS goal_id, g.title, g.status, g.weight,
+                COUNT(DISTINCT p.id) AS proposals,
+                COUNT(DISTINCT CASE WHEN p.status = 'approved' THEN p.id END) AS approved,
+                COUNT(DISTINCT CASE WHEN EXISTS (
+                  SELECT 1 FROM actions a WHERE a.proposal_id = p.id AND a.phase = 'act'
+                ) THEN p.id END) AS shipped,
+                COUNT(DISTINCT o.id) AS outcomes,
+                COALESCE(SUM(CASE WHEN o.success = 1 THEN 1 ELSE 0 END), 0) AS successes,
+                (SELECT COALESCE(SUM(r.cost_usd), 0) FROM runs r
+                  WHERE r.goal_id = g.id
+                     OR r.proposal_id IN (SELECT p2.id FROM proposals p2 WHERE p2.goal_id = g.id)) AS api_spend,
+                (SELECT MAX(p3.created_at) FROM proposals p3 WHERE p3.goal_id = g.id) AS last_proposal_at,
+                (SELECT COUNT(*) FROM runs r2
+                  WHERE r2.phase = 'research_plan'
+                    AND r2.started_at > MAX(
+                      g.created_at,
+                      COALESCE((SELECT MAX(p4.created_at) FROM proposals p4 WHERE p4.goal_id = g.id), ''))) AS empty_cycles
+         FROM goals g
+         LEFT JOIN proposals p ON p.goal_id = g.id
+         LEFT JOIN outcomes o ON o.proposal_id = p.id
+         GROUP BY g.id
+         ORDER BY g.weight DESC, g.id ASC`
+      )
+      .all() as unknown as GoalHealthRow[];
+  }
+
   // ---- research ---------------------------------------------------------
 
-  async addResearchNote(topic: string, finding: string, source?: string, confidence?: number) {
+  async addResearchNote(
+    topic: string,
+    finding: string,
+    source?: string,
+    confidence?: number,
+    opts: { goalId?: number | null; kind?: string | null } = {}
+  ) {
     const stmt = this.db.prepare(
-      `INSERT INTO research_notes (topic, finding, source, confidence, fetched_at) VALUES (?, ?, ?, ?, ?)`
+      `INSERT INTO research_notes (topic, finding, source, confidence, fetched_at, goal_id, kind)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
     );
-    const result = stmt.run(topic, finding, source ?? null, confidence ?? null, now());
+    const result = stmt.run(
+      topic,
+      finding,
+      source ?? null,
+      confidence ?? null,
+      now(),
+      opts.goalId ?? null,
+      opts.kind ?? null
+    );
     const id = Number(result.lastInsertRowid);
-    await upsertText("research_notes", id, `${topic}: ${finding}`);
+    await upsertText("research_notes", id, noteEmbeddingText(topic, finding), {
+      goal_id: opts.goalId ?? null,
+      kind: opts.kind ?? null,
+      confidence: confidence ?? null,
+      created_at: now(),
+    });
     return id;
   }
 
   /** Semantic search via Qdrant when configured, falling back to LIKE otherwise. */
-  async searchResearchNotes(topic: string, limit = 10) {
-    const semantic = await this.semanticSearch<ResearchNoteRow>("research_notes", topic, limit);
+  async searchResearchNotes(topic: string, limit = 10, opts: { goalId?: number | null; kind?: string } = {}) {
+    const semantic = await this.semanticSearch<ResearchNoteRow>("research_notes", topic, limit, {
+      filter: andFilters(goalFilter(opts.goalId), opts.kind ? kindFilter(opts.kind) : undefined),
+    });
     if (semantic) return semantic;
 
-    const stmt = this.db.prepare(
-      `SELECT * FROM research_notes WHERE topic LIKE ? OR finding LIKE ? ORDER BY fetched_at DESC LIMIT ?`
-    );
-    return stmt.all(`%${topic}%`, `%${topic}%`, limit) as unknown as ResearchNoteRow[];
+    // The fallback can honour the same filters, so a filtered search doesn't silently widen
+    // into an unfiltered one just because Qdrant is unavailable.
+    const clauses = ["(topic LIKE ? OR finding LIKE ?)"];
+    const params: (string | number)[] = [`%${topic}%`, `%${topic}%`];
+    if (opts.goalId != null) {
+      clauses.push("goal_id = ?");
+      params.push(opts.goalId);
+    }
+    if (opts.kind) {
+      clauses.push("kind = ?");
+      params.push(opts.kind);
+    }
+    return this.db
+      .prepare(`SELECT * FROM research_notes WHERE ${clauses.join(" AND ")} ORDER BY fetched_at DESC LIMIT ?`)
+      .all(...params, limit) as unknown as ResearchNoteRow[];
+  }
+
+  /**
+   * Notes recording a dead end for one goal -- the negative half of the exploration query, and
+   * the digest that stops research re-checking what it already ruled out. Plain SQL: this is an
+   * exact attribute lookup, not a similarity question.
+   */
+  listSaturatedNotes(goalId: number | null, limit = 40) {
+    // The LIKE clause is a bridge for rows written before `kind` existed, and only applies to
+    // them (`kind IS NULL`). Without it this returns nothing at all until enough new notes
+    // accumulate -- and the existing store is roughly a third saturation findings, which is
+    // precisely the knowledge the exploration query and the digest need to be useful on day one.
+    // These notes say so in their own topic ("... -- saturated Aug 2026", "saturation check"),
+    // so this reads a label the model already wrote rather than inferring one. It costs nothing
+    // once kinds are being written, and never overrides an explicit kind.
+    const base = `SELECT * FROM research_notes
+                   WHERE (kind = 'saturated' OR (kind IS NULL AND topic LIKE '%saturat%'))`;
+    return (
+      goalId == null
+        ? this.db.prepare(`${base} ORDER BY fetched_at DESC LIMIT ?`).all(limit)
+        : this.db.prepare(`${base} AND goal_id = ? ORDER BY fetched_at DESC LIMIT ?`).all(goalId, limit)
+    ) as unknown as ResearchNoteRow[];
+  }
+
+  /**
+   * "What's worth looking at here that isn't one of the dead ends?"
+   *
+   * Asks Qdrant for notes close to the goal's own text but far from the notes already marked
+   * saturated for it. Returns [] rather than null when there's nothing to go on (no Qdrant, no
+   * saturation history yet) -- the caller treats it as "no steer available", not as an error.
+   */
+  async findUnexploredDirections(goal: GoalRow, limit = 8): Promise<Scored<ResearchNoteRow>[]> {
+    const goalText = `${goal.title}\n${goal.brief}`;
+    const saturated = this.listSaturatedNotes(goal.id).length > 0
+      ? this.listSaturatedNotes(goal.id)
+      : this.listSaturatedNotes(null);
+    if (saturated.length === 0) return [];
+
+    // Negatives have to be the dead ends *near this goal*, not every dead end on record.
+    // Handing `recommend` all of them makes the negative term dominate the score: with the
+    // corpus blanketed, every goal came back with the same four notes at negative scores --
+    // ranked purely by distance from any dead end, with the goal itself making no difference.
+    // Narrowing to the closest few restores the thing being asked for: on topic for this lane,
+    // and unlike what this lane has already ruled out.
+    const relevant = await this.semanticSearch<ResearchNoteRow>("research_notes", goalText, EXPLORE_NEGATIVES, {
+      filter: andFilters(kindFilter("saturated"), goalFilter(goal.id)),
+    });
+    const negatives = (relevant && relevant.length > 0 ? relevant : saturated.slice(0, EXPLORE_NEGATIVES)).map((n) => n.id);
+    if (negatives.length === 0) return [];
+
+    // The dead ends themselves are excluded from the result -- returning one as a "direction"
+    // would be recommending exactly what it says not to do.
+    const raw = await recommendByText("research_notes", goalText, negatives, limit, {
+      filter: { must_not: [{ key: "kind", match: { value: "saturated" } }] },
+    });
+    if (!raw || raw.length === 0) return [];
+
+    // `best_score` is "similarity to the goal minus similarity to the nearest dead end", so a
+    // negative score means the note is closer to something already ruled out than to the goal --
+    // by definition not a direction worth suggesting. Dropping those is what makes an empty
+    // result honest: for a lane the corpus knows nothing positive about, the right answer is "no
+    // steer available", not the four least-bad notes on file. Measured without this, two of four
+    // goals returned an identical list of operational notes at negative scores.
+    const hits = raw.filter((h) => h.score > 0);
+    if (hits.length === 0) return [];
+
+    const placeholders = hits.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(`SELECT * FROM research_notes WHERE id IN (${placeholders})`)
+      .all(...hits.map((h) => h.id)) as unknown as ResearchNoteRow[];
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    return hits
+      .map((h) => {
+        const row = byId.get(h.id);
+        return row ? { ...row, score: h.score } : undefined;
+      })
+      .filter((r): r is Scored<ResearchNoteRow> => r !== undefined);
   }
 
   listAllResearchNotes(limit = 200) {
@@ -263,7 +755,12 @@ export class MemoryStore {
       .run(finding, confidence, keepId);
     this.db.prepare(`DELETE FROM research_notes WHERE id IN (${placeholders})`).run(...ids);
 
-    await upsertText("research_notes", keepId, `${keeper.topic}: ${finding}`);
+    await upsertText("research_notes", keepId, noteEmbeddingText(keeper.topic, finding), {
+      goal_id: keeper.goal_id,
+      kind: keeper.kind,
+      confidence,
+      created_at: keeper.fetched_at,
+    });
     await Promise.all(others.map((o) => deletePoint("research_notes", o.id)));
     return true;
   }
@@ -291,41 +788,166 @@ export class MemoryStore {
   }
 
   /**
-   * One-time backfill so rows inserted before Qdrant was configured (or under the old
-   * inline-Voyage-embedding scheme) become semantically searchable too. Upserting an id
-   * that's already present just overwrites the point, so this is safe to call on every
-   * startup rather than tracking which rows still need it.
+   * Brings Qdrant in step with SQLite, which is the source of truth for every point.
+   *
+   * Two jobs: backfilling rows written while Qdrant was unconfigured, and rebuilding after a
+   * COLLECTION_VERSION bump (the v2 shape has payloads and a sparse vector that v1 points don't).
+   * A version change forces a full pass; otherwise only rows newer than the last sync are sent,
+   * because the old behaviour re-upserted every row at every startup, one `?wait=true` request
+   * each. That is invisible at 50 rows and won't stay invisible.
+   *
+   * Payloads are written here too, not just on insert -- they're what every filtered search
+   * depends on, so a row that predates them has to get them from somewhere.
    */
   async syncToQdrant() {
     if (!qdrantAvailable) return;
-    const notes = this.db.prepare(`SELECT id, topic, finding FROM research_notes`).all() as {
-      id: number;
-      topic: string;
-      finding: string;
-    }[];
-    await Promise.all(notes.map((n) => upsertText("research_notes", n.id, `${n.topic}: ${n.finding}`)));
 
-    const lessons = this.db.prepare(`SELECT id, domain, lesson FROM lessons`).all() as {
-      id: number;
-      domain: string;
-      lesson: string;
-    }[];
-    await Promise.all(lessons.map((l) => upsertText("lessons", l.id, `${l.domain}: ${l.lesson}`)));
+    const marker = this.db.prepare(`SELECT value FROM control_settings WHERE key = 'qdrantSync'`).get() as
+      | { value: string }
+      | undefined;
+    let since: string | null = null;
+    if (marker) {
+      try {
+        const parsed = JSON.parse(marker.value) as { version?: number; at?: string };
+        if (parsed.version === QDRANT_SYNC_VERSION) since = parsed.at ?? null;
+      } catch {
+        // Unreadable marker means a full pass, which is always correct -- just slower.
+      }
+    }
+    const startedAt = now();
+
+    const notes = (
+      since
+        ? this.db.prepare(`SELECT * FROM research_notes WHERE fetched_at > ? ORDER BY id`).all(since)
+        : this.db.prepare(`SELECT * FROM research_notes ORDER BY id`).all()
+    ) as unknown as ResearchNoteRow[];
+    const lessons = (
+      since
+        ? this.db.prepare(`SELECT * FROM lessons WHERE updated_at > ? ORDER BY id`).all(since)
+        : this.db.prepare(`SELECT * FROM lessons ORDER BY id`).all()
+    ) as unknown as LessonRow[];
+
+    if (notes.length > 0) {
+      await upsertInBatches(
+        "research_notes",
+        notes.map((n) => ({
+          id: n.id,
+          text: noteEmbeddingText(n.topic, n.finding),
+          payload: { goal_id: n.goal_id, kind: n.kind, confidence: n.confidence, created_at: n.fetched_at },
+        }))
+      );
+    }
+    if (lessons.length > 0) {
+      await upsertInBatches(
+        "lessons",
+        lessons.map((l) => ({
+          id: l.id,
+          text: lessonEmbeddingText(l.domain, l.lesson),
+          payload: { goal_id: l.goal_id, confidence: l.confidence, muted: l.muted, created_at: l.created_at },
+        }))
+      );
+    }
+    if (notes.length > 0 || lessons.length > 0) {
+      console.log(`[qdrant] synced ${notes.length} note(s) and ${lessons.length} lesson(s)${since ? "" : " (full rebuild)"}`);
+    }
+
+    // Written through its own statement rather than saveControlSettings: this is bookkeeping
+    // about a sync, not an operator setting, and it has no business appearing in the shape the
+    // console-only writer and the control loader both speak.
+    this.db
+      .prepare(
+        `INSERT INTO control_settings (key, value, updated_at) VALUES ('qdrantSync', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+      )
+      .run(JSON.stringify({ version: QDRANT_SYNC_VERSION, at: startedAt }), startedAt);
   }
 
-  /** Ranks `table`'s rows by Qdrant vector similarity to `query`; null if Qdrant isn't configured or found nothing. */
+  /**
+   * Ranks `table`'s rows by Qdrant hybrid similarity to `query`, hydrating each hit from SQLite
+   * and carrying its relevance score through.
+   *
+   * Returns null only when the search did not happen (Qdrant unconfigured, or the request
+   * failed) -- that's the fallback signal. An empty array is a real answer: the search ran and
+   * matched nothing. Conflating the two is what made a genuinely empty result silently re-run as
+   * a LIKE substring match and come back with unrelated rows.
+   *
+   * The score is returned rather than used and discarded: it's what lets lessons be re-ranked by
+   * confidence below, and what lets a caller tell a 0.9 match from a 0.3 one instead of trusting
+   * position alone.
+   */
   private async semanticSearch<T extends { id: number }>(
-    table: "research_notes" | "lessons",
+    table: CollectionName,
     query: string,
-    limit: number
-  ): Promise<T[] | null> {
-    const hits = await searchByText(table, query, limit);
-    if (!hits || hits.length === 0) return null;
+    limit: number,
+    opts: SearchOptions = {}
+  ): Promise<Scored<T>[] | null> {
+    const hits = await searchByText(table, query, limit, opts);
+    if (!hits) return null;
+    if (hits.length === 0) return [];
 
     const placeholders = hits.map(() => "?").join(",");
     const rows = this.db.prepare(`SELECT * FROM ${table} WHERE id IN (${placeholders})`).all(...hits.map((h) => h.id)) as T[];
     const byId = new Map(rows.map((row) => [row.id, row]));
-    return hits.map((h) => byId.get(h.id)).filter((row): row is T => row !== undefined);
+    // A hit whose row is gone (deleted without its point being cleaned up) is dropped rather
+    // than erroring -- it shrinks the result set instead of failing the search.
+    return hits
+      .map((h) => {
+        const row = byId.get(h.id);
+        return row ? { ...row, score: h.score } : undefined;
+      })
+      .filter((row): row is Scored<T> => row !== undefined);
+  }
+
+  /**
+   * "Have we already written this down?" -- the shared machinery behind note and lesson dedup.
+   *
+   * Dense-only on purpose (see SearchOptions.denseOnly): this is a question about how *similar*
+   * two texts are, and fused RRF scores answer a different question. Falls back to the lexical
+   * measure when Qdrant is unavailable, so the guard still works offline -- with a threshold on
+   * its own scale, since the two aren't comparable.
+   */
+  private async findDuplicateByText<T extends { id: number }>(
+    collection: CollectionName,
+    text: string,
+    threshold: number,
+    lexicalCandidates: () => { row: T; text: string }[]
+  ): Promise<{ row: T; score: number } | null> {
+    const hits = await searchByText(collection, text, 1, { denseOnly: true, scoreThreshold: threshold });
+    if (hits) {
+      const top = hits[0];
+      if (!top) return null;
+      const row = this.db.prepare(`SELECT * FROM ${collection} WHERE id = ?`).get(top.id) as T | undefined;
+      return row ? { row, score: top.score } : null;
+    }
+
+    let best: { row: T; score: number } | null = null;
+    for (const candidate of lexicalCandidates()) {
+      const { score } = similarity(text, candidate.text);
+      if (score >= LEXICAL_DUPLICATE_THRESHOLD && (best === null || score > best.score)) {
+        best = { row: candidate.row, score };
+      }
+    }
+    return best;
+  }
+
+  /** The existing note this one would duplicate, if any. See the threshold note for the measurements. */
+  async findDuplicateNote(topic: string, finding: string) {
+    return this.findDuplicateByText<ResearchNoteRow>(
+      "research_notes",
+      noteEmbeddingText(topic, finding),
+      NOTE_DUPLICATE_THRESHOLD,
+      () => this.listAllResearchNotes(500).map((row) => ({ row, text: noteEmbeddingText(row.topic, row.finding) }))
+    );
+  }
+
+  /** The existing lesson this one would duplicate, if any -- the model should reinforce that one instead. */
+  async findDuplicateLesson(domain: string, lesson: string) {
+    return this.findDuplicateByText<LessonRow>(
+      "lessons",
+      lessonEmbeddingText(domain, lesson),
+      LESSON_DUPLICATE_THRESHOLD,
+      () => this.listAllLessons(500).map((row) => ({ row, text: lessonEmbeddingText(row.domain, row.lesson) }))
+    );
   }
 
   // ---- proposals ----------------------------------------------------------
@@ -337,10 +959,11 @@ export class MemoryStore {
     expectedTimeHours: number;
     expectedUpside: number;
     requiredTools: string[];
+    goalId?: number | null;
   }) {
     const stmt = this.db.prepare(
-      `INSERT INTO proposals (domain, description, expected_cost, expected_time_hours, expected_upside, required_tools, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO proposals (domain, description, expected_cost, expected_time_hours, expected_upside, required_tools, created_at, goal_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const result = stmt.run(
       p.domain,
@@ -349,7 +972,8 @@ export class MemoryStore {
       p.expectedTimeHours,
       p.expectedUpside,
       p.requiredTools.join(","),
-      now()
+      now(),
+      p.goalId ?? null
     );
     return Number(result.lastInsertRowid);
   }
@@ -542,16 +1166,33 @@ export class MemoryStore {
    * proposals -- what the agent itself calls via action_history_search so research/plan
    * can check for existing work before proposing something that duplicates it.
    */
-  listActionHistory(domain?: string, limit = 20) {
+  listActionHistory(filter: { goalId?: number; text?: string } = {}, limit = 20) {
     const base = `SELECT a.tool_name, a.tool_input, a.tool_output, a.occurred_at, a.proposal_id,
                           p.domain, p.description AS proposal_description
                    FROM actions a JOIN proposals p ON p.id = a.proposal_id
                    WHERE p.status = 'approved' AND a.phase = 'act'`;
-    const rows = (
-      domain
-        ? this.db.prepare(`${base} AND p.domain = ? ORDER BY a.occurred_at DESC LIMIT ?`).all(domain, limit)
-        : this.db.prepare(`${base} ORDER BY a.occurred_at DESC LIMIT ?`).all(limit)
-    ) as unknown as ActionHistoryRow[];
+
+    // Matching is goal_id OR text, never goal_id alone. Every proposal predating goals has
+    // goal_id = NULL under one of 13 free-text domain spellings, so an id-only filter would
+    // report "nothing has been built here" for work that plainly has been -- which is exactly
+    // how the old exact `p.domain = ?` filter failed, and the guard the research prompt leans
+    // on to avoid re-building shipped work.
+    const clauses: string[] = [];
+    const params: (string | number)[] = [];
+    if (filter.goalId !== undefined) {
+      clauses.push("p.goal_id = ?");
+      params.push(filter.goalId);
+    }
+    if (filter.text?.trim()) {
+      const like = `%${filter.text.trim()}%`;
+      clauses.push("p.domain LIKE ?", "p.description LIKE ?");
+      params.push(like, like);
+    }
+
+    const where = clauses.length > 0 ? ` AND (${clauses.join(" OR ")})` : "";
+    const rows = this.db
+      .prepare(`${base}${where} ORDER BY a.occurred_at DESC LIMIT ?`)
+      .all(...params, limit) as unknown as ActionHistoryRow[];
 
     return rows.map((r) => ({
       proposalId: r.proposal_id,
@@ -613,13 +1254,16 @@ export class MemoryStore {
    * it. Falls back to exact domain equality (the original behavior) when Qdrant isn't
    * configured or the search failed.
    */
-  async searchLessons(domain: string, limit = 10) {
-    // Muted lessons are filtered out of both paths -- this is the single chokepoint every
-    // lesson_search call goes through, so muting one here takes it out of the agent's
-    // reasoning everywhere at once.
-    // Over-fetch so muting a few of the top hits doesn't quietly shrink the result set.
-    const semantic = await this.semanticSearch<LessonRow>("lessons", domain, limit * 2);
-    if (semantic) return semantic.filter((l) => !l.muted).slice(0, limit);
+  async searchLessons(domain: string, limit = 10, opts: { goalId?: number | null } = {}) {
+    // Muting is enforced in Qdrant's own filter now, not in JS afterwards. The old post-filter
+    // over-fetched `limit * 2` to compensate and still shrank the result set when enough top
+    // hits were muted; a server-side must_not returns `limit` unmuted rows, full stop. This is
+    // still the single chokepoint every lesson_search goes through, so muting one lesson takes
+    // it out of the agent's reasoning everywhere at once.
+    const semantic = await this.semanticSearch<LessonRow>("lessons", domain, limit, {
+      filter: andFilters(notMutedFilter(), goalFilter(opts.goalId)),
+    });
+    if (semantic) return this.rankLessons(semantic, limit);
 
     return this.db
       .prepare(
@@ -629,14 +1273,32 @@ export class MemoryStore {
   }
 
   /**
+   * Blends relevance with track record.
+   *
+   * The LIKE fallback has always ordered by `confidence DESC, updated_at DESC`, but the moment
+   * Qdrant was configured that ordering stopped applying at all -- results came back in pure
+   * similarity order, so a 0.1-confidence lesson the agent had already been contradicted on
+   * could outrank one reinforced to 0.9. Reinforcement was being recorded and then ignored,
+   * which is worse than not recording it.
+   *
+   * Relevance still dominates (confidence scales it by 0.5x-1.0x rather than replacing it): a
+   * highly-confident lesson about something else is still the wrong answer.
+   */
+  private rankLessons(rows: Scored<LessonRow>[], limit: number) {
+    return [...rows]
+      .sort((a, b) => b.score * (0.5 + 0.5 * b.confidence) - a.score * (0.5 + 0.5 * a.confidence))
+      .slice(0, limit);
+  }
+
+  /**
    * Free-text lesson search for the console's operator, as distinct from searchLessons above:
    * that one's LIKE fallback matches `domain` exactly, which is right for the agent (it looks
    * lessons up by the domain it's working in) but useless for a human typing a phrase from the
    * lesson body. Same semantic path, same muted filter -- only the fallback differs.
    */
   async searchLessonsByText(query: string, limit = 10) {
-    const semantic = await this.semanticSearch<LessonRow>("lessons", query, limit * 2);
-    if (semantic) return semantic.filter((l) => !l.muted).slice(0, limit);
+    const semantic = await this.semanticSearch<LessonRow>("lessons", query, limit, { filter: notMutedFilter() });
+    if (semantic) return this.rankLessons(semantic, limit);
 
     const like = `%${query}%`;
     return this.db
@@ -647,14 +1309,25 @@ export class MemoryStore {
       .all(like, like, limit) as unknown as LessonRow[];
   }
 
-  async addLesson(domain: string, lessonText: string, derivedFromOutcomeId?: number) {
+  async addLesson(
+    domain: string,
+    lessonText: string,
+    derivedFromOutcomeId?: number,
+    opts: { goalId?: number | null } = {}
+  ) {
     const stmt = this.db.prepare(
-      `INSERT INTO lessons (domain, lesson, derived_from_outcome_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`
+      `INSERT INTO lessons (domain, lesson, derived_from_outcome_id, created_at, updated_at, goal_id)
+       VALUES (?, ?, ?, ?, ?, ?)`
     );
     const t = now();
-    const result = stmt.run(domain, lessonText, derivedFromOutcomeId ?? null, t, t);
+    const result = stmt.run(domain, lessonText, derivedFromOutcomeId ?? null, t, t, opts.goalId ?? null);
     const id = Number(result.lastInsertRowid);
-    await upsertText("lessons", id, `${domain}: ${lessonText}`);
+    await upsertText("lessons", id, lessonEmbeddingText(domain, lessonText), {
+      goal_id: opts.goalId ?? null,
+      confidence: 0.5,
+      muted: 0,
+      created_at: t,
+    });
     return id;
   }
 
@@ -670,11 +1343,20 @@ export class MemoryStore {
     if (!existing) return false;
     const domain = fields.domain ?? existing.domain;
     const lessonText = fields.lesson ?? existing.lesson;
+    // An operator retitling a lesson's domain is also the moment to re-file it, since the
+    // rewording is usually the point of the edit.
+    const goalId = fields.domain !== undefined ? this.resolveGoalId(domain) : existing.goal_id;
     this.db
-      .prepare(`UPDATE lessons SET domain = ?, lesson = ?, updated_at = ?, edited_at = ? WHERE id = ?`)
-      .run(domain, lessonText, now(), now(), id);
-    // Keep the vector in step with the text, or semantic search would keep matching the old wording.
-    await upsertText("lessons", id, `${domain}: ${lessonText}`);
+      .prepare(`UPDATE lessons SET domain = ?, lesson = ?, goal_id = ?, updated_at = ?, edited_at = ? WHERE id = ?`)
+      .run(domain, lessonText, goalId, now(), now(), id);
+    // Keep the vector and payload in step with the row, or semantic search would keep matching
+    // the old wording and filtering on the old goal.
+    await upsertText("lessons", id, lessonEmbeddingText(domain, lessonText), {
+      goal_id: goalId,
+      confidence: existing.confidence,
+      muted: existing.muted,
+      created_at: existing.created_at,
+    });
     return true;
   }
 
@@ -682,8 +1364,12 @@ export class MemoryStore {
    * Excludes a lesson from lesson_search without deleting it -- the row stays as a record of
    * what was believed and when, but it stops steering future cycles.
    */
-  setLessonMuted(id: number, muted: boolean) {
+  async setLessonMuted(id: number, muted: boolean) {
     this.db.prepare(`UPDATE lessons SET muted = ?, updated_at = ? WHERE id = ?`).run(muted ? 1 : 0, now(), id);
+    // The mute filter runs inside Qdrant now, so the flag has to exist on the point as well --
+    // a mute written only to SQLite would leave the lesson being handed to the model forever,
+    // which is the exact failure muting exists to prevent.
+    await setPayload("lessons", id, { muted: muted ? 1 : 0 });
   }
 
   async deleteLesson(id: number) {
@@ -691,7 +1377,7 @@ export class MemoryStore {
     await deletePoint("lessons", id);
   }
 
-  reinforceLesson(id: number, direction: "confirmed" | "contradicted") {
+  async reinforceLesson(id: number, direction: "confirmed" | "contradicted") {
     if (direction === "confirmed") {
       this.db
         .prepare(
@@ -707,6 +1393,11 @@ export class MemoryStore {
         )
         .run(now(), id);
     }
+    // Ranking reads confidence off the hydrated SQLite row, so this isn't load-bearing today --
+    // it keeps the payload from going stale against the column it mirrors, which is what would
+    // make a later filter on confidence quietly wrong.
+    const updated = this.getLesson(id);
+    if (updated) await setPayload("lessons", id, { confidence: updated.confidence });
   }
 
   // ---- runs (model API cost per phase, so spend counts against profit) --
@@ -721,14 +1412,18 @@ export class MemoryStore {
     // (AGENT_ACT_MODEL and friends) -- without this a cost difference between two
     // phases is unattributable on the Economics page.
     provider?: string,
-    model?: string
+    model?: string,
+    // Set when a run is attributable to one goal -- research/plan runs carry no proposal_id, so
+    // without this their spend can only ever land in the unattributed bucket on the Economics
+    // page, and per-goal health has nothing to count cycles with.
+    goalId?: number | null
   ) {
     this.db
       .prepare(
-        `INSERT INTO runs (proposal_id, phase, cost_usd, duration_ms, started_at, provider, model)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO runs (proposal_id, phase, cost_usd, duration_ms, started_at, provider, model, goal_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       )
-      .run(proposalId, phase, costUsd, durationMs ?? null, startedAt, provider ?? null, model ?? null);
+      .run(proposalId, phase, costUsd, durationMs ?? null, startedAt, provider ?? null, model ?? null, goalId ?? null);
   }
 
   listRuns(limit = 200) {
@@ -866,11 +1561,18 @@ export class MemoryStore {
    * Per-domain scoreboard: how often work in a domain succeeded, what it really cost, and how
    * far the model's own upside estimate landed from reported revenue (forecast accuracy --
    * both numbers were already stored, just never compared).
+   *
+   * Grouped by the goal's title where a proposal has one, and by its stored `domain` text where
+   * it doesn't. That keeps the pre-goals rows visible under the (many) spellings they were
+   * actually written with -- honest about the fragmentation rather than hiding it -- while
+   * everything written since consolidates onto one row per goal no matter what the model called
+   * it that cycle. Both halves of the api_spend subquery match the same way, or spend would
+   * stop following the work it paid for.
    */
   domainScoreboard() {
     return this.db
       .prepare(
-        `SELECT p.domain,
+        `SELECT COALESCE(g.title, p.domain) AS domain,
                 COUNT(DISTINCT p.id) AS proposals,
                 COUNT(DISTINCT CASE WHEN p.status = 'approved' THEN p.id END) AS approved,
                 COUNT(DISTINCT o.id) AS outcomes,
@@ -879,10 +1581,13 @@ export class MemoryStore {
                 COALESCE(SUM(o.actual_cost), 0) AS reported_cost,
                 COALESCE(SUM(CASE WHEN o.id IS NOT NULL THEN p.expected_upside ELSE 0 END), 0) AS forecast_upside,
                 (SELECT COALESCE(SUM(r.cost_usd), 0) FROM runs r
-                  JOIN proposals rp ON rp.id = r.proposal_id WHERE rp.domain = p.domain) AS api_spend
+                   JOIN proposals rp ON rp.id = r.proposal_id
+                   LEFT JOIN goals rg ON rg.id = rp.goal_id
+                  WHERE COALESCE(rg.title, rp.domain) = COALESCE(g.title, p.domain)) AS api_spend
          FROM proposals p
+         LEFT JOIN goals g ON g.id = p.goal_id
          LEFT JOIN outcomes o ON o.proposal_id = p.id
-         GROUP BY p.domain
+         GROUP BY COALESCE(g.title, p.domain)
          ORDER BY revenue DESC`
       )
       .all() as unknown as DomainScoreRow[];
@@ -976,6 +1681,51 @@ interface ResearchNoteRow {
   source: string | null;
   confidence: number | null;
   fetched_at: string;
+  goal_id: number | null;
+  /** null on every row written before kinds existed -- see the migration note. */
+  kind: string | null;
+}
+
+/**
+ * A row plus how well it matched. Carried through search results so relevance is available to
+ * rank on and to show, rather than being thrown away the moment Qdrant returns it.
+ */
+export type Scored<T> = T & { score: number };
+
+/** What a research note is telling you. Drives filtering, not just display. */
+export const NOTE_KINDS = ["gap", "saturated", "competitor", "pricing", "spec", "inventory", "meta"] as const;
+export type NoteKind = (typeof NOTE_KINDS)[number];
+
+export type GoalStatus = "active" | "paused" | "retired" | "suggested";
+export type GoalOrigin = "human" | "agent";
+
+export interface GoalRow {
+  id: number;
+  title: string;
+  brief: string;
+  status: GoalStatus;
+  weight: number;
+  origin: GoalOrigin;
+  parent_id: number | null;
+  rationale: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GoalHealthRow {
+  goal_id: number;
+  title: string;
+  status: GoalStatus;
+  weight: number;
+  proposals: number;
+  approved: number;
+  shipped: number;
+  outcomes: number;
+  successes: number;
+  api_spend: number;
+  last_proposal_at: string | null;
+  /** Research runs charged to this goal since its last proposal -- the "is this lane dead?" number. */
+  empty_cycles: number;
 }
 
 export interface SearchHit {
@@ -1042,6 +1792,7 @@ interface RunRow {
 
 interface LessonRow {
   id: number;
+  goal_id: number | null;
   domain: string;
   lesson: string;
   derived_from_outcome_id: number | null;
@@ -1080,12 +1831,45 @@ export interface ProposalRow {
   original_description: string | null;
 }
 
+/**
+ * One-line, length-capped rendering of arbitrary text -- used wherever a stored row has to be
+ * quoted back into a prompt, a tool result or a log line without dragging its full body along.
+ * Lives here rather than in orchestrator.ts because tool results need it too, and the dependency
+ * only runs one way (orchestrator imports this module, never the reverse).
+ */
+export function preview(value: unknown, max = 150): string {
+  const s = typeof value === "string" ? value : JSON.stringify(value);
+  const oneLine = (s ?? "").replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? oneLine.slice(0, max) + "…" : oneLine;
+}
+
 function safeJson(v: unknown) {
   try {
     return JSON.stringify(v);
   } catch {
     return String(v);
   }
+}
+
+/** Longest a derived goal title may be -- past this it stops working as a column heading. */
+const GOAL_TITLE_MAX = 70;
+
+/**
+ * Reduces a legacy domain string to something usable as a key.
+ *
+ * These strings were written to be read by a model, not grouped by, so they run long and
+ * frequently carry their qualifiers after a dash or comma ("micro-SaaS for the Swedish market
+ * -- research in Swedish (svenska sokord...)"). Cutting at the first separator keeps the part
+ * that names the lane and drops the part that instructs it; the full text is preserved verbatim
+ * as the goal's brief, so this only ever shortens the *label*.
+ */
+export function goalTitleFromDomain(domain: string): string {
+  const head = domain.split(/\s+--+\s+|\s+[–—]\s+|,/)[0].trim() || domain.trim();
+  if (head.length <= GOAL_TITLE_MAX) return head;
+  // Cut on a word boundary rather than mid-word; fall back to a hard slice for text with no spaces.
+  const clipped = head.slice(0, GOAL_TITLE_MAX);
+  const lastSpace = clipped.lastIndexOf(" ");
+  return (lastSpace > GOAL_TITLE_MAX / 2 ? clipped.slice(0, lastSpace) : clipped).trim();
 }
 
 /** Lowercased word set, minus very short filler tokens -- the unit of comparison for near-duplicate notes. */
@@ -1161,9 +1945,36 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
         ),
       source: z.string().optional().describe("URL or reference"),
       confidence: z.number().min(0).max(1).optional(),
+      kind: z
+        .enum(NOTE_KINDS)
+        .optional()
+        .describe(
+          "What kind of finding this is. 'saturated' means you checked and the space is already well covered -- " +
+            "mark those honestly, they are how you avoid re-checking the same dead ends next cycle. 'gap' means " +
+            "you found something underserved."
+        ),
+      domain: z
+        .string()
+        .optional()
+        .describe("Which of the goals you're researching this belongs to; omit if it spans several or none"),
     },
-    async ({ topic, finding, source, confidence }) => {
-      const id = await store.addResearchNote(topic, finding, source, confidence);
+    async ({ topic, finding, source, confidence, kind, domain }) => {
+      const duplicate = await store.findDuplicateNote(topic, finding);
+      if (duplicate) {
+        const { row, score } = duplicate;
+        console.log(`[research_note_add] refused a near-duplicate of note #${row.id} (${score.toFixed(2)})`);
+        return [
+          `Not saved -- this is nearly identical to research note #${row.id} (${(score * 100).toFixed(0)}% similar), recorded ${row.fetched_at.slice(0, 10)}.`,
+          `#${row.id} [${row.topic}]: ${preview(row.finding, 240)}`,
+          `Writing the same finding twice makes the store harder to search, not more informative.`,
+          `If you have genuinely learned something that note doesn't already say, save that -- the new part, stated as its own finding -- rather than the whole thing again.`,
+        ].join("\n");
+      }
+
+      const id = await store.addResearchNote(topic, finding, source, confidence, {
+        goalId: store.resolveGoalId(domain ?? topic),
+        kind: kind ?? null,
+      });
       return `Saved research note #${id}`;
     }
   );
@@ -1197,7 +2008,25 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
       derivedFromOutcomeId: z.number().int().optional(),
     },
     async ({ domain, lesson, derivedFromOutcomeId }) => {
-      const id = await store.addLesson(domain, lesson, derivedFromOutcomeId);
+      // The reflect prompt already says to reinforce rather than duplicate, and the store still
+      // ended up with two ~95%-identical credential lessons written 50 seconds apart into two
+      // different domains. Advice loses; this doesn't. Refused in-band so the model reads it and
+      // gets a turn to do the right thing instead, with the id it needs to do it.
+      const duplicate = await store.findDuplicateLesson(domain, lesson);
+      if (duplicate) {
+        const { row, score } = duplicate;
+        console.log(`[lesson_add] refused a near-duplicate of lesson #${row.id} (${score.toFixed(2)})`);
+        return [
+          `Not saved -- lesson #${row.id} already says this (${(score * 100).toFixed(0)}% similar).`,
+          `#${row.id} [${row.domain}] confidence ${row.confidence}, reinforced ${row.times_reinforced}x: ${preview(row.lesson, 240)}`,
+          `Call lesson_reinforce with id ${row.id} and direction "confirmed" if this outcome backs it up, or "contradicted" if it cuts against it.`,
+          `That is strictly better than a second copy: it raises the confidence of the lesson that already exists, where a duplicate splits the evidence across two rows and buries both.`,
+        ].join("\n");
+      }
+
+      const id = await store.addLesson(domain, lesson, derivedFromOutcomeId, {
+        goalId: store.resolveGoalId(domain),
+      });
       emitAgentEvent({ type: "lesson_saved", domain });
       return `Saved lesson #${id}`;
     }
@@ -1259,6 +2088,7 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
         expectedTimeHours,
         expectedUpside,
         requiredTools,
+        goalId: store.resolveGoalId(domain),
       });
       return `Created proposal #${id}, status: pending. Stop here and wait for review -- do not act on it.`;
     }
@@ -1272,8 +2102,80 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
       limit: z.number().int().positive().max(50).optional(),
     },
     async ({ domain, limit }) => {
-      const rows = store.listActionHistory(domain, limit ?? 20);
-      return JSON.stringify(rows, null, 2);
+      // Both filters, not either: goal_id reaches work filed under this goal, the text match
+      // reaches work built before goals existed (and under whatever the model called the domain
+      // that cycle). Filtering by id alone would report "nothing built here" for a lane that has
+      // shipped, which is the exact failure this tool exists to prevent.
+      const n = limit ?? 20;
+      const rows = store.listActionHistory({ goalId: store.resolveGoalId(domain) ?? undefined, text: domain }, n);
+      if (rows.length > 0 || !domain) return JSON.stringify(rows, null, 2);
+
+      // A filtered miss is not evidence that nothing has been built. The old exact-domain filter
+      // answered "[]" for every configured domain while 140 act-phase actions sat in the table,
+      // and "[]" reads as "this space is clear" -- the most expensive thing this tool can say
+      // wrongly. Widen to recent history across all goals and label it, so the model gets the
+      // real picture and knows the filter, not the record, is what came up empty.
+      const recent = store.listActionHistory({}, n);
+      if (recent.length === 0) return "[]";
+      return [
+        `No act-phase actions matched "${domain}" specifically. Showing recent history across all goals instead --`,
+        `the domain wording may differ from what past cycles used, so check these before assuming nothing exists here.`,
+        JSON.stringify(recent, null, 2),
+      ].join("\n");
+    }
+  );
+
+  const goalSuggest = defineTool(
+    "goal_suggest",
+    "Suggest a new research direction (a 'goal') for the operator to consider -- an adjacent lane that looks live, " +
+      "not another idea inside an existing one. A suggestion is inert: it is never researched, and never affects " +
+      "what you work on, unless a human accepts it. Use this when a goal you were given keeps coming up empty and " +
+      "the interesting signal is next door, rather than forcing a weak proposal inside a lane that's played out.",
+    {
+      title: z.string().describe("Short, stable name for the lane -- how it would read as a column heading"),
+      brief: z
+        .string()
+        .describe(
+          "What researching this lane should mean, concretely: what to look for, what to avoid, which markets or " +
+            "audiences, any incumbents to check first. This is the instruction a future cycle reads, so write it " +
+            "for someone with no memory of this conversation."
+        ),
+      rationale: z.string().describe("Why you think this has potential, and what you saw that suggests it"),
+      parentGoalTitle: z.string().optional().describe("The existing goal this branches off, if it is a branch"),
+    },
+    async ({ title, brief, rationale, parentGoalTitle }) => {
+      // Same shape of guard as proposal_create, for the same reason: a lane that keeps coming
+      // up empty is exactly the situation that produces the same "new" direction over and over.
+      // Checked against retired goals too -- re-suggesting something the operator already
+      // dismissed is the loop this is here to break, not an edge case.
+      const duplicate = store.findNearDuplicateGoal({ title, brief });
+      if (duplicate) {
+        const { goal, score, shared } = duplicate;
+        console.log(`[goal_suggest] refused a near-duplicate of goal #${goal.id} (${score.toFixed(2)} overlap)`);
+        return [
+          `Not suggested -- this is too close to the existing goal #${goal.id} "${goal.title}" (status: ${goal.status}).`,
+          `Overlap: ${(score * 100).toFixed(0)}% of the distinctive terms are shared (${shared.slice(0, 12).join(", ")}).`,
+          goal.status === "retired" || goal.status === "paused"
+            ? `That lane is ${goal.status} -- the operator has already decided about it, and re-suggesting it doesn't reopen the question.`
+            : `That lane already exists, so research it rather than proposing it again.`,
+          `If you genuinely mean something narrower or adjacent, say what it excludes that #${goal.id} covers.`,
+        ].join("\n");
+      }
+
+      const parentId = parentGoalTitle ? store.resolveGoalId(parentGoalTitle) : null;
+      const id = store.createGoal({
+        title,
+        brief,
+        rationale,
+        parentId,
+        status: "suggested",
+        origin: "agent",
+      });
+      emitAgentEvent({ type: "goal_suggested", goalId: id, title, rationale });
+      return (
+        `Suggested goal #${id} "${title}" -- it is waiting for the operator and is NOT active. ` +
+        `Nothing about this cycle changes: keep working within the goals you were actually given.`
+      );
     }
   );
 
@@ -1316,5 +2218,6 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
     proposalStatus,
     outcomeRecord,
     actionHistorySearch,
+    goalSuggest,
   ]);
 }

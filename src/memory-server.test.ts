@@ -1,15 +1,35 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryStore } from "./memory-server.js";
 
-// Qdrant is mocked out entirely so these tests exercise the LIKE-fallback
-// search path deterministically, independent of any QDRANT_* env vars set
-// in the ambient shell.
+/**
+ * Qdrant is mocked so these tests are deterministic and need no cluster, independent of any
+ * QDRANT_* env vars set in the ambient shell.
+ *
+ * `searchByText` returns null by default, which is the "search did not happen" signal -- so most
+ * tests below exercise the LIKE-fallback path exactly as before. The `vectorHits` handle lets an
+ * individual test script real scored hits instead, which is what gives the semantic path its
+ * first coverage: previously it was mocked to null everywhere and nothing verified the
+ * hydration, the ranking, or the empty-vs-failed distinction.
+ */
+const vectorHits: { next: { id: number; score: number }[] | null } = { next: null };
+
 vi.mock("./qdrant.js", () => ({
   qdrantAvailable: false,
-  searchByText: vi.fn(async () => null),
+  searchByText: vi.fn(async () => vectorHits.next),
+  recommendByText: vi.fn(async () => vectorHits.next),
   upsertText: vi.fn(async () => false),
+  upsertMany: vi.fn(async () => false),
+  setPayload: vi.fn(async () => false),
   deletePoint: vi.fn(async () => false),
+  goalFilter: vi.fn(() => undefined),
+  kindFilter: vi.fn(() => undefined),
+  notMutedFilter: vi.fn(() => undefined),
+  andFilters: vi.fn(() => undefined),
 }));
+
+beforeEach(() => {
+  vectorHits.next = null;
+});
 
 let store: MemoryStore;
 
@@ -318,6 +338,238 @@ describe("operator control settings", () => {
     // for that key instead of seeding the control state with a string where a list belongs.
     store.saveControlSettings({ domains: "not-a-list" as unknown as string[], paused: true });
     expect(store.loadControlSettings()).toEqual({ paused: true });
+  });
+});
+
+describe("goals", () => {
+  it("seeds one goal per configured domain, splitting the brief out of the title", () => {
+    // The live domain that motivated this: a 400-character paragraph of research instructions
+    // being used as a grouping key. The title has to become something readable without losing
+    // a word of the original.
+    const long =
+      "micro-SaaS or web tool for the Swedish market -- research in Swedish (svenska sökord) " +
+      "and target local pain points such as fakturering for enskild firma, priced in SEK";
+    expect(store.seedGoalsFromDomains(["Chrome extensions", long])).toBe(2);
+
+    const [chrome, swedish] = store.listGoals();
+    expect(chrome).toMatchObject({ title: "Chrome extensions", brief: "Chrome extensions", status: "active" });
+    expect(swedish.title).toBe("micro-SaaS or web tool for the Swedish market");
+    expect(swedish.brief).toBe(long);
+  });
+
+  it("only seeds once, so AGENT_DOMAINS can't overwrite what the operator has since set", () => {
+    store.seedGoalsFromDomains(["first"]);
+    expect(store.seedGoalsFromDomains(["second", "third"])).toBe(0);
+    expect(store.listGoals().map((g) => g.title)).toEqual(["first"]);
+  });
+
+  it("resolves a reworded domain onto the right goal, and an unrelated one onto none", () => {
+    store.seedGoalsFromDomains(["micro-SaaS or web tool for the Swedish market"]);
+    const [goal] = store.listGoals();
+
+    expect(store.resolveGoalId("micro-SaaS or web tool for the Swedish market")).toBe(goal.id);
+    expect(store.resolveGoalId("MICRO-SAAS OR WEB TOOL FOR THE SWEDISH MARKET")).toBe(goal.id);
+    expect(store.resolveGoalId("web tool or micro-SaaS for the Swedish market")).toBe(goal.id);
+    // No honest answer among the configured goals -- unassigned beats confidently wrong, because
+    // a misfiled row puts a number on the scoreboard that isn't true.
+    expect(store.resolveGoalId("VS Code extension for developers")).toBeNull();
+    expect(store.resolveGoalId("")).toBeNull();
+  });
+
+  it("never resolves onto a suggested or retired goal", () => {
+    const suggested = store.createGoal({ title: "affiliate comparison sites", status: "suggested", origin: "agent" });
+    expect(store.resolveGoalId("affiliate comparison sites")).toBeNull();
+
+    // Accepting it is what makes it real -- that's the whole invariant.
+    store.updateGoal(suggested, { status: "active" });
+    expect(store.resolveGoalId("affiliate comparison sites")).toBe(suggested);
+
+    store.updateGoal(suggested, { status: "retired" });
+    expect(store.resolveGoalId("affiliate comparison sites")).toBeNull();
+  });
+
+  it("refuses a suggestion that restates an existing goal, including a retired one", () => {
+    store.createGoal({ title: "property management software comparison site", status: "retired" });
+    // Re-suggesting a lane the operator already dismissed is the loop the guard exists to break.
+    const match = store.findNearDuplicateGoal({
+      title: "PropertyManagerCompare",
+      brief: "a comparison site for property management software",
+    });
+    expect(match?.goal.status).toBe("retired");
+    expect(store.findNearDuplicateGoal({ title: "Swedish tax calculators", brief: "skatt for enskild firma" })).toBeNull();
+  });
+
+  it("keeps the work when a goal is deleted, unassigning it rather than cascading", async () => {
+    const goalId = store.createGoal({ title: "saas" });
+    const proposalId = store.createProposal({
+      domain: "saas",
+      description: "something",
+      expectedCost: 1,
+      expectedTimeHours: 1,
+      expectedUpside: 1,
+      requiredTools: ["WebSearch"],
+      goalId,
+    });
+    const lessonId = await store.addLesson("saas", "a lesson", undefined, { goalId });
+
+    expect(store.deleteGoal(goalId)).toBe(true);
+    expect(store.getProposal(proposalId)).toMatchObject({ id: proposalId, goal_id: null, domain: "saas" });
+    expect(store.getLesson(lessonId)).toMatchObject({ id: lessonId, goal_id: null });
+  });
+
+  it("groups the scoreboard by goal title, leaving pre-goals rows under their own domain text", () => {
+    const goalId = store.createGoal({ title: "Comparison sites" });
+    // Two proposals, two different domain spellings, one goal -- the drift this fixes.
+    for (const domain of ["affiliate comparison site", "comparison directory affiliate site"]) {
+      store.createProposal({
+        domain,
+        description: `a site (${domain})`,
+        expectedCost: 1,
+        expectedTimeHours: 1,
+        expectedUpside: 1,
+        requiredTools: ["WebSearch"],
+        goalId,
+      });
+    }
+    // And one from before goals existed, which must stay visible rather than vanish.
+    store.createProposal({
+      domain: "legacy lane",
+      description: "old work",
+      expectedCost: 1,
+      expectedTimeHours: 1,
+      expectedUpside: 1,
+      requiredTools: ["WebSearch"],
+    });
+
+    const byDomain = new Map(store.domainScoreboard().map((r) => [r.domain, r]));
+    expect(byDomain.get("Comparison sites")?.proposals).toBe(2);
+    expect(byDomain.get("legacy lane")?.proposals).toBe(1);
+  });
+
+  it("doesn't blame a goal for cycles that ran before it existed", () => {
+    store.logRun(null, "research_plan", 0.1, 100, new Date(Date.now() - 60_000).toISOString());
+    const goalId = store.createGoal({ title: "brand new lane" });
+    // Seeding goals against an established DB otherwise reports every lane as long-failed and
+    // trips the exploration mandate for all of them on day one.
+    expect(store.goalHealth().find((h) => h.goal_id === goalId)?.empty_cycles).toBe(0);
+  });
+});
+
+describe("memory dedup on write", () => {
+  it("refuses a lesson that restates an existing one, via the lexical fallback", async () => {
+    const text =
+      "Before proposing a plan whose required tools include an integration's write actions, verify " +
+      "that integration's credential is actually configured in this environment.";
+    await store.addLesson("tooling", text);
+
+    // The real store held two ~95%-identical credential lessons written 50 seconds apart into
+    // two different domains -- the prompt already said to reinforce instead, and didn't hold.
+    const match = await store.findDuplicateLesson(
+      "VS Code extensions",
+      "Before proposing a plan whose required tools include an integration's write actions, check " +
+        "that the integration's credential is actually configured in this environment."
+    );
+    expect(match).not.toBeNull();
+    expect(await store.findDuplicateLesson("saas", "Ship a landing page before writing any code")).toBeNull();
+  });
+
+  it("refuses a note that restates an existing one", async () => {
+    await store.addResearchNote("pricing", "Developer tools convert best at a $9 to $19 monthly price point");
+    const match = await store.findDuplicateNote(
+      "pricing",
+      "Developer tools convert best at a $9 to $19 per month price point"
+    );
+    expect(match?.row.topic).toBe("pricing");
+    expect(await store.findDuplicateNote("hosting", "Static sites deploy free under a bandwidth cap")).toBeNull();
+  });
+});
+
+describe("semantic search path", () => {
+  // Everything above runs on the LIKE fallback. These script real vector hits, which had no
+  // coverage at all before -- qdrant.js was mocked to null everywhere, so nothing verified the
+  // hydration, the ranking, or that an empty result is distinguishable from a failed one.
+  it("hydrates rows in the order Qdrant ranked them and carries the score through", async () => {
+    const a = await store.addResearchNote("alpha", "first finding");
+    const b = await store.addResearchNote("beta", "second finding");
+
+    vectorHits.next = [
+      { id: b, score: 0.91 },
+      { id: a, score: 0.42 },
+    ];
+    const results = await store.searchResearchNotes("anything");
+    expect(results.map((r) => r.id)).toEqual([b, a]);
+    expect(results[0]).toMatchObject({ topic: "beta", score: 0.91 });
+  });
+
+  it("treats an empty vector result as a real answer, not as a reason to fall back", async () => {
+    await store.addResearchNote("pricing", "Developer tools convert best at $9-19/mo");
+
+    // null means "the search did not happen" -> LIKE fallback, which finds the row.
+    vectorHits.next = null;
+    expect(await store.searchResearchNotes("pricing")).toHaveLength(1);
+
+    // [] means "the search ran and matched nothing". Conflating the two made a genuinely empty
+    // semantic result quietly re-run as a substring match and return unrelated rows.
+    vectorHits.next = [];
+    expect(await store.searchResearchNotes("pricing")).toHaveLength(0);
+  });
+
+  it("re-ranks lessons by confidence, which pure similarity order ignores", async () => {
+    const weak = await store.addLesson("saas", "a lesson nobody has confirmed");
+    const strong = await store.addLesson("saas", "a lesson confirmed repeatedly");
+    await store.reinforceLesson(strong, "confirmed");
+    await store.reinforceLesson(strong, "confirmed");
+    await store.reinforceLesson(strong, "confirmed");
+
+    // Qdrant ranks the weak one first, but only just. Before blending, reinforcement was
+    // recorded and then ignored the moment Qdrant was configured.
+    vectorHits.next = [
+      { id: weak, score: 0.62 },
+      { id: strong, score: 0.6 },
+    ];
+    expect((await store.searchLessons("saas")).map((l) => l.id)).toEqual([strong, weak]);
+
+    // Relevance still dominates: a big enough similarity gap isn't overturned by confidence.
+    vectorHits.next = [
+      { id: weak, score: 0.95 },
+      { id: strong, score: 0.3 },
+    ];
+    expect((await store.searchLessons("saas")).map((l) => l.id)).toEqual([weak, strong]);
+  });
+});
+
+describe("action history reach", () => {
+  it("matches on goal id OR text, so work predating goals is still found", () => {
+    const goalId = store.createGoal({ title: "Comparison sites" });
+    const filed = store.createProposal({
+      domain: "Comparison sites",
+      description: "new work",
+      expectedCost: 1,
+      expectedTimeHours: 1,
+      expectedUpside: 1,
+      requiredTools: ["WebSearch"],
+      goalId,
+    });
+    const legacy = store.createProposal({
+      domain: "affiliate comparison site",
+      description: "old work",
+      expectedCost: 1,
+      expectedTimeHours: 1,
+      expectedUpside: 1,
+      requiredTools: ["WebSearch"],
+    });
+    for (const id of [filed, legacy]) {
+      store.decideProposal(id, "approved");
+      store.logAction(id, "act", "mcp__integrations__github_create_repo", { name: "r" }, { url: "u" });
+    }
+
+    // goal_id alone reaches only the new one; that was the old exact-domain filter's failure,
+    // which reported "nothing built here" for a lane that had shipped.
+    expect(store.listActionHistory({ goalId }).map((r) => r.proposalId)).toEqual([filed]);
+    expect(store.listActionHistory({ goalId, text: "affiliate comparison" }).map((r) => r.proposalId).sort()).toEqual(
+      [filed, legacy].sort()
+    );
+    expect(store.listActionHistory({})).toHaveLength(2);
   });
 });
 

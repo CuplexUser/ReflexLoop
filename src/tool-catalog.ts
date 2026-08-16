@@ -50,6 +50,18 @@ export const MEMORY_TOOLS = [
   "mcp__memory__action_history_search",
 ];
 
+/**
+ * Research-phase outputs, as opposed to memory utilities: both write a row a *human* then acts
+ * on, and neither belongs in the grant every phase gets. `proposal_create` was already handled
+ * this way; `goal_suggest` is the same shape one level up -- a proposed direction rather than a
+ * proposed action -- so it's granted in the same place and withheld from act/reflect, which have
+ * no business opening new lanes mid-execution.
+ *
+ * Neither is in ALL_GRANTABLE_TOOLS: a proposal can't name them, because they aren't things the
+ * act phase does.
+ */
+export const RESEARCH_OUTPUT_TOOLS = ["mcp__memory__proposal_create", "mcp__memory__goal_suggest"];
+
 /** Every tool a proposal may legitimately name. Anything outside this is rejected, not merely denied later. */
 export const ALL_GRANTABLE_TOOLS = [
   ...WRITE_INTEGRATION_TOOLS,

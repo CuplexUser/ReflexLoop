@@ -17,9 +17,33 @@
 
 import { EventEmitter } from "node:events";
 
+/**
+ * The parts of a goal the control layer needs. A structural copy rather than a re-export of
+ * `GoalRow`, so this module keeps its promise of not importing MemoryStore -- and so the state
+ * the console reads stays a summary rather than growing whatever columns the table grows.
+ */
+export interface GoalSummary {
+  id: number;
+  title: string;
+  brief: string;
+  status: "active" | "paused" | "retired" | "suggested";
+  weight: number;
+}
+
 export interface ControlState {
   /** When true, the research+plan cycle skips its turn. Approved work already queued still runs. */
   paused: boolean;
+  /**
+   * Every goal, whatever its status -- including `suggested` ones, which the console needs to
+   * show and which the loop must never research. Filter before use; `domains` below is the
+   * pre-filtered form the research cycle actually wants.
+   */
+  goals: GoalSummary[];
+  /**
+   * Titles of the active goals. Derived from `goals`, not set independently: it used to be the
+   * source of truth and is now a projection, so there is no way for the two to disagree about
+   * what the loop is pointed at.
+   */
   domains: string[];
   cycleIntervalMs: number;
   /** One-shot steer for the next research+plan prompt; cleared once consumed. */
@@ -42,12 +66,16 @@ bus.setMaxListeners(20);
 
 const state: ControlState = {
   paused: false,
+  goals: [],
   domains: [],
   cycleIntervalMs: 0,
   directive: null,
   runningProposalId: null,
   queuedProposalIds: [],
 };
+
+/** A goal is only researched while it's active -- `paused`, `retired` and `suggested` are all out. */
+const activeTitles = (goals: readonly GoalSummary[]) => goals.filter((g) => g.status === "active").map((g) => g.title);
 
 // Set once at startup. Kept as an injected callback rather than importing MemoryStore so
 // this module stays dependency-free and testable in isolation -- and so it can't grow the
@@ -61,13 +89,14 @@ let persist: ControlPersister = () => {};
  * silently reverting to the env value the next time the process starts.
  */
 export function initControl(opts: {
-  domains: string[];
+  goals: GoalSummary[];
   cycleIntervalMs: number;
   paused?: boolean;
   directive?: string | null;
   persist?: ControlPersister;
 }): void {
-  state.domains = opts.domains;
+  state.goals = opts.goals;
+  state.domains = activeTitles(opts.goals);
   state.cycleIntervalMs = opts.cycleIntervalMs;
   state.paused = opts.paused ?? false;
   state.directive = opts.directive ?? null;
@@ -76,7 +105,12 @@ export function initControl(opts: {
 }
 
 export function getControlState(): ControlState {
-  return { ...state, domains: [...state.domains], queuedProposalIds: [...state.queuedProposalIds] };
+  return {
+    ...state,
+    goals: state.goals.map((g) => ({ ...g })),
+    domains: [...state.domains],
+    queuedProposalIds: [...state.queuedProposalIds],
+  };
 }
 
 export function setPaused(paused: boolean): void {
@@ -85,9 +119,20 @@ export function setPaused(paused: boolean): void {
   bus.emit("changed");
 }
 
-export function setDomains(domains: string[]): void {
-  state.domains = domains;
-  persist({ domains });
+/**
+ * Replaces the whole goal set. Called by server.ts after any goal mutation with a fresh read
+ * from the DB, rather than being patched incrementally -- the table is the source of truth and
+ * a re-read cannot drift from it.
+ *
+ * `control_settings.domains` is still written, with the active titles. Nothing in the loop reads
+ * it any more, but it remains the record a fresh DB seeds goals from, and keeping it current
+ * means the seed after a `DELETE FROM goals` reflects what the operator last had rather than
+ * whatever AGENT_DOMAINS said months ago.
+ */
+export function setGoals(goals: GoalSummary[]): void {
+  state.goals = goals;
+  state.domains = activeTitles(goals);
+  persist({ domains: state.domains });
   bus.emit("changed");
 }
 
