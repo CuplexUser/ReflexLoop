@@ -286,7 +286,13 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
                 />
                 <Route
                   path="/economics"
-                  element={<EconomicsPage historyVersion={socket.historyVersion} outcomes={outcomes} />}
+                  element={
+                    <EconomicsPage
+                      historyVersion={socket.historyVersion}
+                      proposals={proposals}
+                      outcomes={outcomes}
+                    />
+                  }
                 />
                 <Route path="/lessons" element={<LessonsPage historyVersion={socket.historyVersion} />} />
                 <Route path="/lessons/:id" element={<LessonsPage historyVersion={socket.historyVersion} />} />
