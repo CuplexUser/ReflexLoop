@@ -32,6 +32,20 @@ const REVIEW_OPTIONS = [
   { value: 'needs_refinement', label: '⚠ Needs refinement' },
 ]
 
+/**
+ * Act-phase states that mean the artifacts on a card are not the finished thing, keyed for a
+ * plain lookup so a null status and a completed one both fall through to nothing.
+ *
+ * A card exists as soon as one write tool succeeded — `github_create_repo` alone builds one —
+ * so "there is a card" has never meant "the build finished". Proposal #27 sat here looking
+ * shipped while its repo was empty and no deploy existed.
+ */
+const UNFINISHED_ACT: Record<string, string> = {
+  running: 'This build is executing right now — what you see is partial.',
+  interrupted: 'The process stopped mid-build. Whatever had already landed is here; the rest never ran.',
+  incomplete: 'The act phase ended without finishing the approved plan. Check the proposal for which steps never ran.',
+}
+
 function artifactIcon(artifact: DeliverableArtifact) {
   if (artifact.kind === 'payment_link') return <CreditCardOutlined />
   if (artifact.kind === 'pull_request') return <PullRequestOutlined />
@@ -124,7 +138,15 @@ function DeliverableCard({
       style={{
         background: palette.bgRaised,
         // The one thing the operator wants at a glance: did this end up somewhere reachable?
-        borderLeft: `3px solid ${deliverable.siteUrl ? palette.approved : palette.border}`,
+        // An unfinished build outranks that -- a card that looks shipped and isn't is the
+        // failure this page had with proposal #27, whose repo was empty the whole time.
+        borderLeft: `3px solid ${
+          UNFINISHED_ACT[deliverable.actStatus ?? '']
+            ? palette.rejected
+            : deliverable.siteUrl
+              ? palette.approved
+              : palette.border
+        }`,
       }}
       styles={{ body: { padding: 18, display: 'flex', flexDirection: 'column', gap: 12, height: '100%' } }}
     >
@@ -138,6 +160,15 @@ function DeliverableCard({
           </Text>
         </div>
         <Space size={4}>
+          {/* Ahead of the outcome tag on purpose: "the build didn't finish" changes how you
+              read every other number on the card, including a self-reported success. */}
+          {UNFINISHED_ACT[deliverable.actStatus ?? ''] && (
+            <Tooltip title={UNFINISHED_ACT[deliverable.actStatus ?? '']}>
+              <Tag color="error" style={{ marginInlineEnd: 0 }}>
+                {deliverable.actStatus}
+              </Tag>
+            </Tooltip>
+          )}
           {outcome && <Tag color={outcome.success ? 'success' : 'error'}>{outcome.success ? 'ok' : 'failed'}</Tag>}
           {/* The proposal this came from, rendered in full by ProposalDialog -- which is where
               long model prose belongs, rather than expanded inside a card in a grid. */}

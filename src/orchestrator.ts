@@ -59,6 +59,7 @@ import {
   reportExecutionState,
 } from "./agent-control.js";
 import { startServer } from "./server.js";
+import { createShutdown, SHUTDOWN_SIGNALS } from "./shutdown.js";
 import { ControlSettingsWriter } from "./control-settings-writer.js";
 import { getSetting, initSettings, onSettingsChanged } from "./settings.js";
 
@@ -220,6 +221,10 @@ async function runPhase(opts: {
 
   emitAgentEvent({ type: "phase_start", phase: opts.phase, proposalId: opts.proposalId });
 
+  // Counted so a shutdown can wait for the unwinding below rather than closing the database
+  // out from under a phase that is still writing its ledger row.
+  phasesInFlight++;
+
   try {
     const result = await runAgent({
       client: llmByPhase[opts.phase],
@@ -258,9 +263,12 @@ async function runPhase(opts: {
       );
     }
   } finally {
+    phasesInFlight--;
     // In the finally so an aborted or failed phase is still accounted for: the spend
     // and the tool calls that already happened are real either way, and a phase that
     // vanished from the ledger because it crashed would understate what the loop cost.
+    // This is also what a graceful shutdown exists to reach -- an unhandled Ctrl-C skips
+    // every finally in the process, so the whole cycle's spend simply disappeared.
     console.log(`[${opts.phase}] done in ${((Date.now() - t0) / 1000).toFixed(1)}s, cost $${costUsd.toFixed(4)}`);
     const client = llmByPhase[opts.phase];
     store.logRun(opts.proposalId, opts.phase, costUsd, Date.now() - t0, startedAt, client.provider, client.model);
@@ -510,6 +518,7 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
     system: RESEARCH_SYSTEM,
     allowedTools: researchAllowedTools(),
     maxTurns: RESEARCH_MAX_TURNS,
+    signal: shutdownController.signal,
   });
 
   const created = store.listPendingProposals().filter((p) => !beforeIds.has(p.id));
@@ -572,6 +581,7 @@ async function handleReactiveTrigger(proposalId: number): Promise<void> {
       system: RESEARCH_SYSTEM,
       allowedTools: researchAllowedTools(),
       maxTurns: RESEARCH_MAX_TURNS,
+      signal: shutdownController.signal,
     });
 
     const created = store.listPendingProposals().filter((p) => !beforeIds.has(p.id));
@@ -619,6 +629,7 @@ async function reflectOnRejectionPhase(proposal: ProposalRow): Promise<void> {
     system: REFLECT_SYSTEM,
     allowedTools: [...MEMORY_TOOLS],
     maxTurns: REFLECT_MAX_TURNS,
+    signal: shutdownController.signal,
   });
 }
 
@@ -878,6 +889,7 @@ async function reflectPhase(proposal: ProposalRow, verdict?: ActVerdict): Promis
     system: REFLECT_SYSTEM,
     allowedTools: [...MEMORY_TOOLS],
     maxTurns: REFLECT_MAX_TURNS,
+    signal: shutdownController.signal,
   });
 }
 
@@ -925,7 +937,10 @@ function pickNext(): QueuedRun | undefined {
 
 /** The single worker: runs the best-ranked queued proposal, then recurses to drain anything else already due. */
 async function drainQueue(): Promise<void> {
-  if (workerBusy) return;
+  // Nothing new starts once a shutdown is under way. An act phase is the one thing here that
+  // touches the real world, and starting one we're about to abort would create side effects
+  // with no chance of the follow-through that makes them safe.
+  if (workerBusy || shuttingDown) return;
   const next = pickNext();
   if (!next) return;
 
@@ -1022,7 +1037,12 @@ function serveConsoleOnly(): void {
   // real run reads at startup. They go through the same narrow writer, which has its own
   // key allowlist -- the store stays read-only.
   persistSettings = (patch) => settingsWriter.saveSettings(patch);
-  startServer(store, SERVER_PORT, { settingsWriter });
+  const server = startServer(store, SERVER_PORT, { settingsWriter });
+  // Nothing here can be mid-write to the record -- that's the whole mode -- so this only has
+  // to stop listening and close both connections. Registered all the same: an operator who
+  // learns Ctrl-C is clean in one mode should not find it isn't in the other.
+  extraClosers.push(() => settingsWriter.close());
+  installSignalHandlers(server);
 }
 
 /** The goal fields the control layer carries, read fresh from the table it's the projection of. */
@@ -1075,7 +1095,7 @@ async function mainLoop() {
     persist: (patch) => store.saveControlSettings(patch),
   });
   persistSettings = (patch) => store.saveSettings(patch);
-  startServer(store, SERVER_PORT);
+  const server = startServer(store, SERVER_PORT);
   onReactiveTrigger((t) => void handleReactiveTrigger(t.proposalId));
   onRunNow(() => wakeCycle());
   onAbort((proposalId) => {
@@ -1097,24 +1117,12 @@ async function mainLoop() {
     enqueueForReview(leftover);
   }
 
-  // An act phase can only run in this process, so anything still marked `running` when this
-  // process is only now starting belongs to one that died. Reaped here rather than left as-is
-  // because `running` means "in flight, don't duplicate it" to the duplicate check, and a
-  // corpse holding that marker would suppress the follow-up proposal forever.
-  //
-  // NOTE: this marks the state, it does not decide what happens next -- and what happens next
-  // is that `schedulerTick()` below re-queues the proposal and act runs again from the top.
-  // `next_run_at` is the resume marker and it is only cleared in `drainQueue`'s `finally`,
-  // which a killed process never reaches, so an interrupted (or even a fully completed) act
-  // phase still looks due. The act prompt does tell the model to read back real state first,
-  // so a re-run often reconciles, but nothing guarantees it: a second `github_commit_files`
-  // makes a second commit, and a connector operation that sends an email or creates a payment
-  // link is not idempotent at all. Clearing `next_run_at` here would stop the re-run; it is
-  // left alone for now because "resume the build" and "never repeat a side effect" are both
-  // defensible defaults and the choice is the operator's, not this comment's.
-  for (const stranded of store.reapInterruptedActPhases()) {
+  // Repair whatever the previous process left mid-flight, before the scheduler below gets a
+  // look at it. Both halves matter and they do different things -- see reapAfterUncleanShutdown.
+  const reaped = store.reapAfterUncleanShutdown();
+  for (const stranded of reaped.interrupted) {
     console.warn(
-      `[act] proposal #${stranded.id} was mid-act when the previous process stopped; marked interrupted. Whatever it already committed or deployed stands, and the scheduler is about to run its act phase again from the top.`
+      `[act] proposal #${stranded.id} was mid-act when the previous process stopped; marked interrupted. Whatever it already committed or deployed stands.`
     );
     emitAgentEvent({
       type: "act_incomplete",
@@ -1124,13 +1132,24 @@ async function mainLoop() {
       stopReason: "interrupted",
     });
   }
+  if (reaped.descheduled.length > 0) {
+    // Said out loud because it is the difference between "the agent quietly re-committed
+    // everything on restart" and "nothing happened until you asked" -- an operator who doesn't
+    // know which of those they're in can't reason about what the repo contains.
+    console.warn(
+      `[act] descheduled ${reaped.descheduled.length} proposal(s) whose act phase had already started (#${reaped.descheduled
+        .map((p) => p.id)
+        .join(", #")}) so they don't silently re-run and repeat side effects. Check what landed, then POST /api/proposals/:id/rerun to resume one.`
+    );
+  }
 
   // Catch up on anything already due (scheduled/recurring proposals whose time
   // arrived while the process was down), then keep checking on an interval.
   schedulerTick();
-  setInterval(schedulerTick, SCHEDULER_TICK_MS);
+  schedulerTimer = setInterval(schedulerTick, SCHEDULER_TICK_MS);
+  installSignalHandlers(server);
 
-  while (true) {
+  while (!shuttingDown) {
     const control = getControlState();
     const pendingCount = store.listPendingProposals().length;
 
@@ -1173,8 +1192,64 @@ function sleepUntilNextCycle(ms: number): Promise<void> {
   });
 }
 
+// ---- graceful shutdown ------------------------------------------------------
+//
+// The sequence itself lives in shutdown.ts, against injected dependencies, so it can be tested
+// without a signal -- see the note there on why firing one isn't an option on Windows. This is
+// only the wiring.
+
+const SHUTDOWN_GRACE_MS = 15_000;
+
+/**
+ * The signal research and reflect run under. They had none at all before this, which is why
+ * killing the process during a research cycle silently lost that cycle's spend: nothing could
+ * interrupt the in-flight HTTP request, so the `finally` that records the cost never ran.
+ */
+const shutdownController = new AbortController();
+let shuttingDown = false;
+/** In-flight `runPhase` calls -- what a shutdown waits on before closing the database. */
+let phasesInFlight = 0;
+let schedulerTimer: NodeJS.Timeout | null = null;
+/** Anything else holding a database handle -- console-only mode's second, narrow connection. */
+const extraClosers: (() => void)[] = [];
+
+function installSignalHandlers(server?: { close(): unknown }): void {
+  const shutdown = createShutdown({
+    stopScheduler: () => {
+      if (schedulerTimer) clearInterval(schedulerTimer);
+    },
+    closeServer: () => void server?.close(),
+    // Both controllers: the shared one research and reflect listen on, and act's own -- which
+    // is the same one the console's abort button fires, so an act phase can only ever be
+    // interrupted through a path that already knows how to leave the record consistent.
+    abortPhases: () => {
+      shutdownController.abort();
+      actAbortController?.abort();
+    },
+    wakeLoop: () => wakeCycle(),
+    inFlight: () => phasesInFlight > 0 || workerBusy,
+    closeHandles: () => {
+      store.close();
+      for (const close of extraClosers) close();
+    },
+    log: (message) => console.log(message),
+    warn: (message) => console.warn(message),
+    exit: (code) => process.exit(code),
+    delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    now: () => Date.now(),
+    graceMs: SHUTDOWN_GRACE_MS,
+  });
+
+  for (const signal of SHUTDOWN_SIGNALS) {
+    process.on(signal, () => {
+      shuttingDown = true; // read by mainLoop's while and by drainQueue, synchronously
+      void shutdown(signal);
+    });
+  }
+}
+
 mainLoop().catch((err) => {
   console.error(err);
-  store.close();
+  if (!shuttingDown) store.close();
   process.exit(1);
 });

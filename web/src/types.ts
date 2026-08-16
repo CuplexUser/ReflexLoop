@@ -153,6 +153,8 @@ export interface Deliverable {
   description: string
   name: string | null
   reviewStatus: 'mvp_done' | 'needs_refinement' | null
+  /** Whether the act phase that produced these artifacts actually finished. */
+  actStatus: 'running' | 'interrupted' | 'complete' | 'incomplete' | null
   priority: Priority
   artifacts: DeliverableArtifact[]
   siteUrl: string | null

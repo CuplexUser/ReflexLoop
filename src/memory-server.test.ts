@@ -161,25 +161,15 @@ describe("act status and the duplicate carve-out", () => {
     store.markActStarted(id);
 
     // The process dies here; the next one sweeps.
-    expect(store.reapInterruptedActPhases().map((p) => p.id)).toEqual([id]);
+    expect(store.reapAfterUncleanShutdown().interrupted.map((p) => p.id)).toEqual([id]);
     expect(store.getProposal(id)!.act_status).toBe("interrupted");
     expect(store.findDuplicateProposal(FOLLOW_UP)).toBeNull();
-  });
-
-  it("reaps nothing on a clean start and is safe to run twice", () => {
-    const id = approvedMachwatch();
-    store.markActStarted(id);
-    store.recordActVerdict(id, { complete: true, problems: [] });
-
-    expect(store.reapInterruptedActPhases()).toEqual([]);
-    expect(store.reapInterruptedActPhases()).toEqual([]);
-    expect(store.getProposal(id)!.act_status).toBe("complete");
   });
 
   it("lists unfinished acts for the operator, and clears one on a fresh attempt", () => {
     const interrupted = approvedMachwatch();
     store.markActStarted(interrupted);
-    store.reapInterruptedActPhases();
+    store.reapAfterUncleanShutdown();
 
     expect(store.listUnfinishedActs().map((p) => p.id)).toEqual([interrupted]);
 
@@ -194,7 +184,103 @@ describe("act status and the duplicate carve-out", () => {
     store.decideProposal(id, "approved");
     expect(store.getProposal(id)!.act_status).toBeNull();
     expect(store.listUnfinishedActs()).toEqual([]);
-    expect(store.reapInterruptedActPhases()).toEqual([]);
+    expect(store.reapAfterUncleanShutdown()).toEqual({ interrupted: [], descheduled: [] });
+  });
+});
+
+describe("recovering from an unclean shutdown", () => {
+  function approved(over: { recurrenceMs?: number | null } = {}) {
+    const id = store.createProposal({
+      domain: "IoT condition-monitoring prototype",
+      description: "Build and deploy the MachWatch prototype",
+      expectedCost: 0,
+      expectedTimeHours: 5,
+      expectedUpside: 1200,
+      requiredTools: ["mcp__integrations__github_commit_files"],
+    });
+    store.decideProposal(id, "approved");
+    store.scheduleApprovedProposal(id, {
+      priority: "normal",
+      scheduledAt: null,
+      recurrenceMs: over.recurrenceMs ?? null,
+    });
+    return id;
+  }
+
+  it("descheduled an act phase that died, so it does not silently re-run", () => {
+    const id = approved();
+    // Approval always sets next_run_at; drainQueue's finally is what clears it, and a killed
+    // process never gets there.
+    expect(store.getProposal(id)!.next_run_at).not.toBeNull();
+    store.markActStarted(id);
+
+    const reaped = store.reapAfterUncleanShutdown();
+    expect(reaped.interrupted.map((p) => p.id)).toEqual([id]);
+    expect(reaped.descheduled.map((p) => p.id)).toEqual([id]);
+    expect(store.getProposal(id)!.next_run_at).toBeNull();
+    expect(store.listDueProposals(new Date().toISOString()).map((p) => p.id)).not.toContain(id);
+  });
+
+  it("also descheduled an act phase that finished but whose reflect was cut short", () => {
+    const id = approved();
+    store.markActStarted(id);
+    store.recordActVerdict(id, { complete: true, problems: [] });
+    // Process dies between act and reflect: act_status is 'complete' but next_run_at survives.
+
+    const reaped = store.reapAfterUncleanShutdown();
+    expect(reaped.interrupted).toEqual([]);
+    expect(reaped.descheduled.map((p) => p.id)).toEqual([id]);
+    expect(store.getProposal(id)!.next_run_at).toBeNull();
+  });
+
+  it("leaves a recurring proposal's schedule alone -- skipping real scheduled work is worse", () => {
+    const id = approved({ recurrenceMs: 3_600_000 });
+    store.markActStarted(id);
+
+    const reaped = store.reapAfterUncleanShutdown();
+    expect(reaped.interrupted.map((p) => p.id)).toEqual([id]);
+    expect(reaped.descheduled).toEqual([]);
+    expect(store.getProposal(id)!.next_run_at).not.toBeNull();
+  });
+
+  it("does not touch an approved proposal that has not acted yet", () => {
+    const id = approved();
+    const reaped = store.reapAfterUncleanShutdown();
+
+    expect(reaped).toEqual({ interrupted: [], descheduled: [] });
+    expect(store.getProposal(id)!.next_run_at).not.toBeNull();
+    expect(store.listDueProposals(new Date().toISOString()).map((p) => p.id)).toContain(id);
+  });
+
+  it("is idempotent -- a clean second start finds nothing to repair", () => {
+    const id = approved();
+    store.markActStarted(id);
+    store.reapAfterUncleanShutdown();
+
+    expect(store.reapAfterUncleanShutdown()).toEqual({ interrupted: [], descheduled: [] });
+    expect(store.getProposal(id)!.act_status).toBe("interrupted");
+  });
+
+  it("re-runs only on an explicit request, and only for approved work", () => {
+    const id = approved();
+    store.markActStarted(id);
+    store.reapAfterUncleanShutdown();
+    expect(store.getProposal(id)!.next_run_at).toBeNull();
+
+    expect(store.requeueApprovedProposal(id)).toBe(true);
+    expect(store.listDueProposals(new Date().toISOString()).map((p) => p.id)).toContain(id);
+
+    const rejected = store.createProposal({
+      domain: "d",
+      description: "never approved",
+      expectedCost: 0,
+      expectedTimeHours: 1,
+      expectedUpside: 0,
+      requiredTools: [],
+    });
+    store.decideProposal(rejected, "rejected");
+    expect(store.requeueApprovedProposal(rejected)).toBe(false);
+    expect(store.requeueApprovedProposal(9999)).toBe(false);
   });
 });
 

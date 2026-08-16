@@ -15,6 +15,7 @@
 // the model's account of what it did; an artifact here is the API's.
 
 import { CONNECTOR_OPERATIONS, connectorOperation } from "./connectors/load.js";
+import type { ActStatus } from "./memory-server.js";
 import { isErrorResult, parseToolResult } from "./tool-output.js";
 
 const P = "mcp__integrations__";
@@ -76,6 +77,18 @@ export interface Deliverable {
   /** The thing's own name (repo / project / site), not the proposal's prose. */
   name: string | null;
   reviewStatus: "mvp_done" | "needs_refinement" | null;
+  /**
+   * Whether the act phase that produced these artifacts actually finished.
+   *
+   * A card is built from whatever write tools succeeded, and `github_create_repo` alone is
+   * enough to make one -- which is how proposal #27 came to sit here looking shipped while
+   * `CuplexUser/machwatch` was an empty repo with nothing committed and no deploy. The artifact
+   * is real; the claim that it is *finished* was never checked. Carried rather than filtered:
+   * an interrupted build's repo is still a real thing the operator may need to open (usually
+   * to clean it up), and hiding the card would recreate the original problem from the other
+   * side -- work that exists in the world and nowhere in the console.
+   */
+  actStatus: ActStatus | null;
   priority: string;
   artifacts: DeliverableArtifact[];
   /** The artifact a human most likely wants to click: the production deployment if there is one. */
@@ -107,6 +120,7 @@ export interface DeliverableProposalRow {
   status: string;
   priority: string;
   review_status: "mvp_done" | "needs_refinement" | null;
+  act_status?: ActStatus | null;
 }
 
 export interface DeliverableOutcomeRow {
@@ -371,6 +385,7 @@ export function buildDeliverables(
       description: acc.proposal.description,
       name: acc.name,
       reviewStatus: acc.proposal.review_status,
+      actStatus: acc.proposal.act_status ?? null,
       priority: acc.proposal.priority,
       artifacts,
       siteUrl: primarySite?.url ?? null,

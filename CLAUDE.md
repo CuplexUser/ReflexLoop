@@ -125,7 +125,8 @@ aren't unit-tested — they're thin over HTTP, and a mock of a provider's wire f
 own history — the pairs it must catch and the follow-up pair it must not).
 `src/act-verification.test.ts` (whether an act phase finished the approved plan, run against
 proposal #27's real step list and real tool calls — the case that motivated the module) and
-`src/llm/types.test.ts` (the truncation-vocabulary list, which a new provider can quietly break).
+`src/llm/types.test.ts` (the truncation-vocabulary list, which a new provider can quietly break),
+and `src/shutdown.test.ts` (the teardown order, the grace period, and the forced second signal).
 `smoke-test.ts` runs end-to-end against a throwaway `./data/smoke-test.db`, and also builds the real tool
 registry and serializes every schema — which is the cheap way to catch a zod shape that can't be converted,
 since otherwise it surfaces as a provider 400 on the first live cycle.
@@ -510,6 +511,13 @@ on). A directive is consumed — injected into one research prompt, then cleared
   Connectors don't get a switch case: an operation declaring `deliverable` in its manifest is handled
   by one generic branch, since `result` has already shaped its response into a top-level `url`.
   Unit-tested (`deliverables.test.ts`) — it's pure functions over rows, no API key needed.
+
+  **A card is built from whatever write tool succeeded, which is not the same as a finished
+  build** — `github_create_repo` alone makes one, which is how #27 sat here looking shipped with
+  an empty repo. Each record now carries `actStatus`, and the page badges `running` /
+  `interrupted` / `incomplete` in the error colour ahead of the outcome tag. Carried rather than
+  filtered: an abandoned build's repo is still a real thing the operator needs to open, usually
+  to clean it up, and hiding the card recreates the original problem from the other side.
 - `act-verification.ts` — `verifyAct`: did the act phase do what the human approved? Pure functions
   over the phase's tool calls plus the proposal's `steps_json`, in the same style as
   `deliverables.ts`, so no store and no API key.
@@ -536,14 +544,22 @@ on). A directive is consumed — injected into one research prompt, then cleared
   `interrupted` at the next startup, which is sound because act phases only ever run in the
   orchestrator process.
 
-  **The reap marks state; it does not decide what runs next.** `next_run_at` is the resume
-  marker, and it is cleared only in `drainQueue`'s `finally` — which a killed process never
-  reaches. So an interrupted act phase (and a *completed* one whose reflect was cut short) still
-  reads as due, and `schedulerTick()` re-runs act from the top on the next start. The act prompt
-  tells the model to read back real state first, so a re-run often reconciles, but nothing
-  guarantees it: a second `github_commit_files` is a second commit, and a connector that sends
-  an email or creates a payment link is not idempotent at all. Anything touching this has to
-  choose between "resume the build" and "never repeat a side effect" deliberately.
+  **`next_run_at` is the resume marker, and it is only cleared in `drainQueue`'s `finally`** —
+  which a killed process never reaches. So an interrupted act phase (and a *completed* one whose
+  reflect was cut short) used to still read as due, and `schedulerTick()` would re-run act from
+  the top on the next start, repeating real side effects: a second `github_commit_files` is a
+  second commit, and a connector that sends an email or creates a payment link is not idempotent
+  at all. `reapAfterUncleanShutdown` therefore also **deschedules** anything whose act phase had
+  already started, and the operator resumes it deliberately via `POST /api/proposals/:id/rerun`
+  (→ `store.requeueApprovedProposal`, picked up by the next `schedulerTick`; approved-only, so it
+  re-triggers authorized work and grants nothing).
+
+  The condition is exact rather than a heuristic: a **non-recurring** proposal gets `next_run_at`
+  from `scheduleApprovedProposal` and has it nulled by `advanceOrClearSchedule`, so
+  `act_status IS NOT NULL AND next_run_at IS NOT NULL` has no legitimate state. **Recurring
+  proposals are deliberately left alone** — for them a past-due `next_run_at` after a completed
+  act is equally the crash case and an occurrence that came due while the process was down, and
+  skipping real scheduled work is the worse error.
 - `integrations/{github,vercel,netlify}.ts` + `integrations-server.ts` — thin API wrappers and the tools
   that expose them (`buildIntegrationsTools()`). Read-only tools (`github_read_repo`, `vercel_list_projects`, etc.) are free for the research
   phase to call. Write tools (`github_create_repo`, `vercel_deploy`, `netlify_deploy`, etc.) only work in
@@ -623,6 +639,20 @@ on). A directive is consumed — injected into one research prompt, then cleared
   the bind host and `AGENT_API_TOKEN` can't move at all — you need the database before you can read
   settings out of it, and the token gates the console that would edit it. Adding a setting is one entry
   in `SETTINGS`; the API, the source reporting and the page are all driven off it.
+- `shutdown.ts` — `createShutdown`, the Ctrl-C path. Without it Ctrl-C was indistinguishable from
+  `kill -9`, and **every `finally` in this process is load-bearing**: `runPhase` writes the run's
+  cost to the ledger in one (so a killed research cycle's spend simply vanished), `drainQueue`
+  clears `next_run_at` in one, and `actPhase` records its verdict only after the run returns.
+  The goal is not to let the work finish — an act phase can run half an hour — but to interrupt
+  it so the unwinding code executes. Research and reflect now run under a shared
+  `AbortController` for that reason; they had no signal at all before. Order matters and is
+  asserted in the tests: stop the scheduler and the server *before* aborting, or the scheduler
+  can start an act phase into the gap. A second signal exits 130 immediately.
+
+  **Built against injected dependencies** rather than reaching into the orchestrator's module
+  state, because the signal itself is untestable here: Node on Windows emulates `SIGINT` as
+  unconditional termination, so only a real console Ctrl-C is catchable and no test can fire one.
+  `shutdown.test.ts` covers the sequence; the wiring in `orchestrator.ts` is the one line left over.
 - `events.ts` / `review-gateway.ts` / `server.ts` — the live layer under the web UI. `events.ts` is an
   in-process bus the orchestrator emits to; `server.ts` persists each event via `store.logEvent()` *then*
   rebroadcasts it over WebSocket with the same `{id, occurredAt}` the DB assigned, and serves the REST API

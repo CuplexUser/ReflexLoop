@@ -370,25 +370,72 @@ export class MemoryStore {
   }
 
   /**
-   * Clears the `running` act marker left behind by a process that died mid-phase.
+   * Repairs the state a process that died mid-flight leaves behind. Called once at startup.
    *
-   * Safe as an unconditional startup sweep because act phases only ever run in the
-   * orchestrator process, one at a time: if this process is only starting now, nothing
-   * is running, so every `running` row is a corpse. Distinguishing the two matters --
-   * `running` means "in flight, don't touch", `interrupted` means "nobody is coming
-   * back for this", and they get opposite treatment in the duplicate check.
+   * Safe as an unconditional sweep because act phases only ever run in the orchestrator
+   * process, one at a time: if this process is only starting now, nothing is running, so every
+   * `running` row is a corpse.
    *
-   * Returns the proposals it reset, so startup can say so out loud instead of silently
-   * repairing state.
+   * **Two separate repairs, and the second is the one with teeth.**
+   *
+   * `running` → `interrupted` records what happened. On its own it changes nothing about what
+   * runs next, because the thing that decides that is `next_run_at` — set on every approval and
+   * cleared only in `drainQueue`'s `finally`, which a killed process never reaches. So a
+   * proposal whose act phase died, *and* one whose act phase finished but whose reflect was cut
+   * short, both still read as due and get their act phase re-run from the top on the next
+   * start. That re-runs real side effects: a second `github_commit_files` is a second commit,
+   * and a connector that sends an email or creates a payment link is not idempotent at all.
+   *
+   * So anything whose act phase has already started is descheduled here, and the operator
+   * re-triggers it deliberately (`POST /api/proposals/:id/rerun`) once they have looked at what
+   * actually landed. The condition is exact rather than a guess: a **non-recurring** proposal
+   * has `next_run_at` set by `scheduleApprovedProposal` and nulled by `advanceOrClearSchedule`,
+   * so `act_status IS NOT NULL AND next_run_at IS NOT NULL` has no legitimate state — it can
+   * only mean the `finally` didn't run.
+   *
+   * **Recurring proposals are left alone**, deliberately. For them a past-due `next_run_at`
+   * after a completed act is ambiguous: it is equally the crash case and a legitimate
+   * occurrence that came due while the process was down, and skipping real scheduled work is
+   * the worse error. Recurrence already means "run this again".
    */
-  reapInterruptedActPhases(): ProposalRow[] {
-    const stranded = this.db
+  reapAfterUncleanShutdown(): { interrupted: ProposalRow[]; descheduled: ProposalRow[] } {
+    const interrupted = this.db
       .prepare(`SELECT * FROM proposals WHERE act_status = 'running'`)
       .all() as unknown as ProposalRow[];
-    if (stranded.length > 0) {
+    if (interrupted.length > 0) {
       this.db.exec(`UPDATE proposals SET act_status = 'interrupted' WHERE act_status = 'running'`);
     }
-    return stranded;
+
+    const descheduled = this.db
+      .prepare(
+        `SELECT * FROM proposals
+          WHERE act_status IS NOT NULL AND next_run_at IS NOT NULL AND recurrence_ms IS NULL`
+      )
+      .all() as unknown as ProposalRow[];
+    if (descheduled.length > 0) {
+      this.db.exec(
+        `UPDATE proposals SET next_run_at = NULL
+          WHERE act_status IS NOT NULL AND next_run_at IS NOT NULL AND recurrence_ms IS NULL`
+      );
+    }
+
+    return { interrupted, descheduled };
+  }
+
+  /**
+   * Puts an approved proposal back in the run queue by hand, after a human has looked at what a
+   * previous attempt actually left behind.
+   *
+   * The counterpart to the deschedule above: the automatic path is gone precisely so this one is
+   * a decision. `schedulerTick` picks it up within its poll interval, so this needs no bus of its
+   * own. Returns false for anything not approved -- re-running is resuming authorized work, never
+   * a way to act on something that was never approved.
+   */
+  requeueApprovedProposal(id: number): boolean {
+    const proposal = this.getProposal(id);
+    if (!proposal || proposal.status !== "approved") return false;
+    this.db.prepare(`UPDATE proposals SET next_run_at = ? WHERE id = ?`).run(now(), id);
+    return true;
   }
 
   /** Returns true if the column didn't already exist and was just added. */

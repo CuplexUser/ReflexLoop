@@ -416,6 +416,32 @@ export function startServer(
     res.json({ ok: true });
   });
 
+  /**
+   * Put an approved proposal back in the run queue.
+   *
+   * The manual half of `reapAfterUncleanShutdown`: a proposal whose act phase was interrupted
+   * or didn't finish is descheduled at startup rather than silently re-run, because re-running
+   * repeats real side effects. This is how it resumes, once a human has looked at what the
+   * previous attempt actually left behind. It only re-triggers already-approved work -- the
+   * approval itself is untouched, so this grants nothing.
+   *
+   * Not in CONSOLE_ONLY_WRITABLE_ROUTES on purpose, same reason as run-now: it needs a running
+   * loop, and answering 200 while nothing is listening is worse than refusing.
+   */
+  app.post("/api/proposals/:id/rerun", (req, res) => {
+    const id = Number(req.params.id);
+    const proposal = store.getProposal(id);
+    if (!proposal) {
+      res.status(404).json({ error: "No such proposal." });
+      return;
+    }
+    if (!store.requeueApprovedProposal(id)) {
+      res.status(409).json({ error: `Proposal #${id} is ${proposal.status}, not approved -- only approved work can be re-run.` });
+      return;
+    }
+    res.json({ ok: true, proposal: store.getProposal(id) });
+  });
+
   app.post("/api/proposals/:id/review", (req, res) => {
     const id = Number(req.params.id);
     const { reviewStatus } = req.body as { reviewStatus?: "mvp_done" | "needs_refinement" | null };
