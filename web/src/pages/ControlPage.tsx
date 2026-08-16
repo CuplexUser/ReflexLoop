@@ -6,6 +6,7 @@ import {
   Button,
   Card,
   Col,
+  Collapse,
   Input,
   InputNumber,
   Popconfirm,
@@ -20,6 +21,7 @@ import { PauseCircleOutlined, PlayCircleOutlined, StopOutlined, ThunderboltOutli
 import type { ConnectorStatus, ControlState } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
+import { ToolTag } from '../components/ToolFence'
 import { recurrenceLabel } from '../format'
 
 /**
@@ -33,9 +35,15 @@ import { recurrenceLabel } from '../format'
  * to fail — run-now especially, which would otherwise report success and wake nothing.
  */
 /**
- * Which declarative connectors exist and which are still missing a key. Read-only, and
- * safe in console-only mode: it reports what the process can see, and changing it means
- * editing .env, which is not something the console does.
+ * Which declarative connectors exist, what each one actually lets the agent do, and which
+ * are still missing a key. Read-only, and safe in console-only mode: it reports what the
+ * process can see, and changing it means editing .env, which is not something the console does.
+ *
+ * The operation list is the point. The endpoint has always returned each tool's name, risk
+ * and description — the card used to render that as a count in a tooltip, which says a
+ * connector *exists* without ever saying what it does, and left the manifests as the only
+ * real answer. Descriptions are written for the model but read fine to a person, so they're
+ * shown verbatim rather than re-worded into a second thing to keep in sync.
  *
  * It earns a place here because "why did the act phase say STRIPE_API_KEY is not set" is
  * otherwise only answerable by reading the source. Tools stay catalogued when unconfigured
@@ -63,27 +71,67 @@ function ConnectorsCard() {
     >
       <Space direction="vertical" size={8} style={{ width: '100%' }}>
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          REST connectors declared as manifests in <code>src/connectors/defs/</code>. One without a key is
-          still catalogued and still nameable in a proposal's fence — it just answers "not set" if called,
-          and research isn't told about it. Setting a key takes effect on the next cycle, with no restart.
+          External services the agent can call — payments, email, analytics, DNS — each declared as a
+          manifest in <code>src/connectors/defs/</code>. Expand one to see the tools it grants. Read-only
+          tools the research phase may call freely; side-effecting ones still run only inside an act phase,
+          and only when a proposal <em>you approved</em> named that exact tool.
         </Typography.Text>
-        <Space wrap size={8}>
-          {connectors.map((c) => (
-            <Tooltip
-              key={c.id}
-              title={
-                c.configured
-                  ? `${c.operations.length} tools · ${c.operations.filter((o) => o.risk === 'write').length} side-effecting`
-                  : `Set ${c.envVar} in .env to enable ${c.operations.length} tools`
-              }
-            >
-              <Tag color={c.configured ? 'success' : 'default'}>
-                {c.label}
-                {c.configured ? '' : ` · ${c.envVar} unset`}
-              </Tag>
-            </Tooltip>
-          ))}
-        </Space>
+        <Collapse
+          ghost
+          size="small"
+          items={connectors.map((c) => {
+            const writes = c.operations.filter((o) => o.risk === 'write').length
+            return {
+              key: c.id,
+              label: (
+                <Space size={8} wrap>
+                  <Typography.Text strong>{c.label}</Typography.Text>
+                  {c.configured ? (
+                    <Tag color="success">key set</Tag>
+                  ) : (
+                    <Tag className="mono">{c.envVar ? `${c.envVar} unset` : 'no key set'}</Tag>
+                  )}
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    {c.operations.length} tool{c.operations.length === 1 ? '' : 's'}
+                    {writes > 0 ? ` · ${writes} side-effecting` : ''}
+                  </Typography.Text>
+                </Space>
+              ),
+              extra: c.docsUrl ? (
+                // Inside a Collapse header, so the click must not also toggle the panel.
+                <Typography.Link
+                  href={c.docsUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{ fontSize: 12 }}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  API docs ↗
+                </Typography.Link>
+              ) : undefined,
+              children: (
+                <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                  {!c.configured && (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      Set <code>{c.envVar}</code> in <code>.env</code> to enable these. Connector credentials are
+                      read per call, so a key filled in while the loop runs takes effect on the next cycle with no
+                      restart. Until then each tool answers "not set" when called, and the research phase isn't
+                      told it exists — though a proposal can still name it in its fence.
+                    </Typography.Text>
+                  )}
+                  {c.operations.map((op) => (
+                    <div key={op.toolName}>
+                      <ToolTag name={op.toolName} risk={op.risk} />
+                      <Typography.Paragraph type="secondary" style={{ fontSize: 12, margin: '2px 0 0' }}>
+                        {op.description}
+                      </Typography.Paragraph>
+                    </div>
+                  ))}
+                </Space>
+              ),
+            }
+          })}
+        />
       </Space>
     </Card>
   )
