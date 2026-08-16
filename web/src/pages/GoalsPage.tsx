@@ -1,8 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
 import {
   Alert,
   App,
-  Badge,
   Button,
   Card,
   Col,
@@ -13,17 +12,25 @@ import {
   Popconfirm,
   Row,
   Space,
-  Statistic,
   Tag,
   Tooltip,
   Typography,
 } from 'antd'
-import { CheckOutlined, CloseOutlined, DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons'
+import {
+  CheckOutlined,
+  CloseOutlined,
+  DeleteOutlined,
+  EditOutlined,
+  PauseOutlined,
+  PlayCircleOutlined,
+  PlusOutlined,
+} from '@ant-design/icons'
 import { useNavigate, useParams } from 'react-router-dom'
 import type { GoalHealth, GoalRow, GoalStatus } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { palette } from '../theme'
+import { money, timeAgo } from '../format'
 import { MarkdownLite } from '../components/MarkdownLite'
 
 /**
@@ -39,7 +46,28 @@ import { MarkdownLite } from '../components/MarkdownLite'
  * lane when one it was given keeps coming up empty, but a suggested goal is inert — never
  * researched, never in a prompt — until someone accepts it here. Same shape as proposal
  * approval, one level up: the agent proposes a direction, the operator decides.
+ *
+ * Layout notes, since they encode decisions that looked like taste and weren't:
+ *  - Tags take AntD *preset* names, never `palette.*`. The palette resolves to `var(--rl-*)`,
+ *    and AntD derives a tag's background and text from the color with color math that a
+ *    `var()` string breaks — which rendered as a near-white chip with unreadable text.
+ *  - Cards in a row are stretched to equal height and the metrics are pinned to the bottom
+ *    (`marginTop: auto`), so the numbers line up across a row instead of floating wherever
+ *    each brief happens to end.
+ *  - A long brief is clamped with a fade and a Show more toggle rather than an inner
+ *    scrollbar, which truncated mid-word and hid the rest behind a scroll nobody would find.
  */
+
+/** Goals a cycle can actually pick up, ordered the way the research prompt sees them. */
+function orderLive(goals: GoalRow[]): GoalRow[] {
+  return [...goals].sort(
+    (a, b) =>
+      Number(b.status === 'active') - Number(a.status === 'active') ||
+      b.weight - a.weight ||
+      a.title.localeCompare(b.title),
+  )
+}
+
 export function GoalsPage() {
   const { message } = App.useApp()
   const consoleOnly = useConsoleOnly()
@@ -70,8 +98,9 @@ export function GoalsPage() {
 
   const healthById = useMemo(() => new Map(health.map((h) => [h.goal_id, h])), [health])
   const suggested = goals.filter((g) => g.status === 'suggested')
-  const live = goals.filter((g) => g.status === 'active' || g.status === 'paused')
+  const live = useMemo(() => orderLive(goals.filter((g) => g.status === 'active' || g.status === 'paused')), [goals])
   const retired = goals.filter((g) => g.status === 'retired')
+  const activeCount = live.filter((g) => g.status === 'active').length
 
   // The deep-linked goal, so /goals/:id opens its editor and Back closes it — same convention
   // as every other detail view in the console.
@@ -92,20 +121,15 @@ export function GoalsPage() {
 
   return (
     <Space direction="vertical" size={16} style={{ width: '100%' }}>
-      <Alert
-        type="info"
-        showIcon
-        message="Goals are what each research cycle works from."
-        description="The brief is passed to the research prompt word for word — put the specifics there (markets, audiences, incumbents to check first, what to avoid), and keep the title short, since it's also how work gets grouped on the Economics scoreboard. Changes take effect on the next cycle; nothing already approved is affected."
-      />
-
       {suggested.length > 0 && (
         <Card
           size="small"
           title={
-            <Space>
-              <Badge count={suggested.length} color={palette.pending} />
+            <Space size={8}>
               <span>Suggested by the agent</span>
+              <Tag color="warning" style={{ marginInlineEnd: 0 }}>
+                {suggested.length}
+              </Tag>
             </Space>
           }
         >
@@ -116,18 +140,24 @@ export function GoalsPage() {
             </Typography.Text>
             {suggested.map((goal) => (
               <Card key={goal.id} size="small" type="inner" title={goal.title}>
-                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                <Space direction="vertical" size={10} style={{ width: '100%' }}>
                   {goal.rationale && (
-                    <Typography.Paragraph type="secondary" style={{ marginBottom: 0, fontSize: 13 }}>
-                      <strong>Why:</strong> {goal.rationale}
-                    </Typography.Paragraph>
+                    <Alert
+                      type="info"
+                      message={
+                        <span style={{ fontSize: 13 }}>
+                          <strong>Why the agent asked:</strong> {goal.rationale}
+                        </span>
+                      }
+                    />
                   )}
-                  <MarkdownLite text={goal.brief} />
+                  <MarkdownLite text={goal.brief} style={{ fontSize: 13 }} />
                   <Space wrap>
-                    <Tooltip title={consoleOnly ? undefined : 'Makes this a lane the next cycle researches'}>
+                    <Tooltip title={consoleOnly ? READ_ONLY_HINT : 'Makes this a lane the next cycle researches'}>
                       <Button
                         type="primary"
                         icon={<CheckOutlined />}
+                        disabled={consoleOnly}
                         loading={busy === goal.id}
                         onClick={() => act(goal.id, () => api.acceptGoal(goal.id), `Accepted "${goal.title}"`)}
                       >
@@ -137,13 +167,16 @@ export function GoalsPage() {
                     <Button icon={<EditOutlined />} onClick={() => navigate(`/goals/${goal.id}`)}>
                       Edit first
                     </Button>
-                    <Button
-                      icon={<CloseOutlined />}
-                      loading={busy === goal.id}
-                      onClick={() => act(goal.id, () => api.dismissGoal(goal.id), 'Dismissed')}
-                    >
-                      Dismiss
-                    </Button>
+                    <Tooltip title={consoleOnly ? READ_ONLY_HINT : 'Retires the lane, and refuses it if re-suggested'}>
+                      <Button
+                        icon={<CloseOutlined />}
+                        disabled={consoleOnly}
+                        loading={busy === goal.id}
+                        onClick={() => act(goal.id, () => api.dismissGoal(goal.id), 'Dismissed')}
+                      >
+                        Dismiss
+                      </Button>
+                    </Tooltip>
                   </Space>
                 </Space>
               </Card>
@@ -154,7 +187,17 @@ export function GoalsPage() {
 
       <Card
         size="small"
-        title="Goals"
+        title={
+          <Space size={8}>
+            <span>Goals</span>
+            {live.length > 0 && (
+              <Typography.Text type="secondary" style={{ fontSize: 12, fontWeight: 400 }}>
+                {activeCount} active
+                {live.length > activeCount ? `, ${live.length - activeCount} paused` : ''}
+              </Typography.Text>
+            )}
+          </Space>
+        }
         extra={
           <Tooltip title={consoleOnly ? READ_ONLY_HINT : undefined}>
             <Button
@@ -168,57 +211,38 @@ export function GoalsPage() {
           </Tooltip>
         }
       >
-        {live.length === 0 && !loading ? (
-          <Empty description="No goals yet — the agent has nothing to research." />
-        ) : (
-          <Row gutter={[16, 16]}>
-            {live.map((goal) => {
-              const h = healthById.get(goal.id)
-              return (
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            Each research cycle works from these. The brief reaches the research prompt word for word; the title is
+            the grouping key on the Economics scoreboard. Changes take effect next cycle — nothing already approved
+            is affected.
+          </Typography.Text>
+
+          {live.length === 0 && !loading ? (
+            <Empty description="No goals yet — the agent has nothing to research." />
+          ) : (
+            <Row gutter={[16, 16]} align="stretch">
+              {live.map((goal) => (
                 <Col xs={24} xl={12} key={goal.id}>
-                  <Card
-                    size="small"
-                    title={
-                      <Space size={8} wrap>
-                        <span>{goal.title}</span>
-                        <StatusTag status={goal.status} />
-                        {goal.origin === 'agent' && <Tag>agent-suggested</Tag>}
-                      </Space>
+                  <GoalCard
+                    goal={goal}
+                    health={healthById.get(goal.id)}
+                    consoleOnly={consoleOnly}
+                    busy={busy === goal.id}
+                    onEdit={() => navigate(`/goals/${goal.id}`)}
+                    onToggleStatus={() =>
+                      act(
+                        goal.id,
+                        () => api.updateGoal(goal.id, { status: goal.status === 'active' ? 'paused' : 'active' }),
+                        goal.status === 'active' ? 'Paused' : 'Resumed',
+                      )
                     }
-                    extra={
-                      <Space size={4}>
-                        <Button size="small" icon={<EditOutlined />} onClick={() => navigate(`/goals/${goal.id}`)} />
-                        <Tooltip title={consoleOnly ? READ_ONLY_HINT : 'Stop researching this without deleting its history'}>
-                          <Button
-                            size="small"
-                            disabled={consoleOnly}
-                            loading={busy === goal.id}
-                            onClick={() =>
-                              act(
-                                goal.id,
-                                () => api.updateGoal(goal.id, { status: goal.status === 'active' ? 'paused' : 'active' }),
-                                goal.status === 'active' ? 'Paused' : 'Resumed',
-                              )
-                            }
-                          >
-                            {goal.status === 'active' ? 'Pause' : 'Resume'}
-                          </Button>
-                        </Tooltip>
-                      </Space>
-                    }
-                  >
-                    <Space direction="vertical" size={12} style={{ width: '100%' }}>
-                      <div style={{ maxHeight: 120, overflow: 'auto' }}>
-                        <MarkdownLite text={goal.brief || '_No brief — the title alone is all the research prompt gets._'} />
-                      </div>
-                      {h && <GoalHealthRow health={h} />}
-                    </Space>
-                  </Card>
+                  />
                 </Col>
-              )
-            })}
-          </Row>
-        )}
+              ))}
+            </Row>
+          )}
+        </Space>
       </Card>
 
       {retired.length > 0 && (
@@ -226,11 +250,16 @@ export function GoalsPage() {
           <Space direction="vertical" size={8} style={{ width: '100%' }}>
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
               Not researched, and kept rather than deleted for two reasons: the work filed under them stays
-              attributed on the scoreboard, and the agent is refused if it suggests one of these again.
+              attributed on the scoreboard, and the agent is refused if it suggests one of these again. Click one to
+              review or bring it back.
             </Typography.Text>
-            <Space wrap>
+            <Space wrap size={[8, 8]}>
               {retired.map((goal) => (
-                <Tag key={goal.id} style={{ cursor: 'pointer' }} onClick={() => navigate(`/goals/${goal.id}`)}>
+                <Tag
+                  key={goal.id}
+                  style={{ cursor: 'pointer', marginInlineEnd: 0, paddingBlock: 3 }}
+                  onClick={() => navigate(`/goals/${goal.id}`)}
+                >
                   {goal.title}
                 </Tag>
               ))}
@@ -269,39 +298,216 @@ export function GoalsPage() {
   )
 }
 
+/** Past this many quiet cycles the research prompt starts asking for an adjacent angle instead. */
+const STALE_AFTER_EMPTY_CYCLES = 3
+
+/** Roughly three lines of brief; past that the card gets a Show more toggle. */
+const BRIEF_COLLAPSED_HEIGHT = 66
+
+function GoalCard({
+  goal,
+  health,
+  consoleOnly,
+  busy,
+  onEdit,
+  onToggleStatus,
+}: {
+  goal: GoalRow
+  health: GoalHealth | undefined
+  consoleOnly: boolean
+  busy: boolean
+  onEdit: () => void
+  onToggleStatus: () => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const brief = goal.brief?.trim() ?? ''
+  const stale = (health?.empty_cycles ?? 0) >= STALE_AFTER_EMPTY_CYCLES
+  const paused = goal.status === 'paused'
+
+  return (
+    <Card
+      size="small"
+      style={{ height: '100%', opacity: paused ? 0.75 : 1 }}
+      styles={{ body: { height: '100%', display: 'flex', flexDirection: 'column', gap: 12 } }}
+    >
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+        {/* minWidth:0 is what actually lets the title truncate — without it the flex item
+            refuses to shrink below its content and pushes the buttons off the card. */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <Tooltip title={goal.title}>
+            <div
+              style={{
+                fontWeight: 600,
+                fontSize: 15,
+                lineHeight: 1.35,
+                display: '-webkit-box',
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: 'vertical',
+                overflow: 'hidden',
+              }}
+            >
+              {goal.title}
+            </div>
+          </Tooltip>
+          <Space size={[6, 6]} wrap style={{ marginTop: 8 }}>
+            <StatusTag status={goal.status} />
+            {goal.origin === 'agent' && <Tag style={{ marginInlineEnd: 0 }}>agent-suggested</Tag>}
+            {goal.weight !== 1 && <Tag style={{ marginInlineEnd: 0 }}>weight {goal.weight}</Tag>}
+            {stale && !paused && (
+              <Tooltip title={`${health?.empty_cycles} cycles without a proposal — the lane may be worked out.`}>
+                <Tag color="warning" style={{ marginInlineEnd: 0 }}>
+                  going quiet
+                </Tag>
+              </Tooltip>
+            )}
+          </Space>
+        </div>
+        <Space size={4}>
+          <Tooltip title="Edit title, brief and weight">
+            <Button size="small" icon={<EditOutlined />} onClick={onEdit} />
+          </Tooltip>
+          <Tooltip
+            title={
+              consoleOnly
+                ? READ_ONLY_HINT
+                : paused
+                  ? 'Resume researching this lane'
+                  : 'Stop researching this without deleting its history'
+            }
+          >
+            <Button
+              size="small"
+              icon={paused ? <PlayCircleOutlined /> : <PauseOutlined />}
+              disabled={consoleOnly}
+              loading={busy}
+              onClick={onToggleStatus}
+            />
+          </Tooltip>
+        </Space>
+      </div>
+
+      {brief ? (
+        <div>
+          <div
+            style={
+              expanded
+                ? undefined
+                : { maxHeight: BRIEF_COLLAPSED_HEIGHT, overflow: 'hidden', position: 'relative' }
+            }
+          >
+            <MarkdownLite text={brief} style={{ fontSize: 13, color: palette.textMuted }} />
+            {!expanded && <FadeOut />}
+          </div>
+          <Button
+            type="link"
+            size="small"
+            style={{ padding: 0, height: 'auto', fontSize: 12 }}
+            onClick={() => setExpanded((v) => !v)}
+          >
+            {expanded ? 'Show less' : 'Show more'}
+          </Button>
+        </div>
+      ) : (
+        <Typography.Text type="secondary" italic style={{ fontSize: 13 }}>
+          No brief — the research prompt gets the title alone.
+        </Typography.Text>
+      )}
+
+      {/* Pinned to the bottom so metrics align across a row of unequal briefs. */}
+      <div style={{ marginTop: 'auto' }}>
+        {health ? <GoalHealthRow health={health} stale={stale} /> : null}
+      </div>
+    </Card>
+  )
+}
+
+/** Softens the clamp instead of chopping a line in half. Paints to the card's own background. */
+function FadeOut() {
+  const style: CSSProperties = {
+    position: 'absolute',
+    insetInline: 0,
+    bottom: 0,
+    height: 24,
+    background: `linear-gradient(to bottom, transparent, ${palette.bgRaised})`,
+    pointerEvents: 'none',
+  }
+  return <div style={style} />
+}
+
 function StatusTag({ status }: { status: GoalStatus }) {
-  const color =
-    status === 'active' ? palette.approved : status === 'paused' ? palette.pending : status === 'suggested' ? palette.pending : undefined
-  return <Tag color={color}>{status}</Tag>
+  // Preset names only. See the layout note at the top of this file.
+  const color: Record<GoalStatus, string | undefined> = {
+    active: 'success',
+    paused: 'warning',
+    suggested: 'processing',
+    retired: 'default',
+  }
+  return <Tag color={color[status]} style={{ marginInlineEnd: 0 }}>{status}</Tag>
 }
 
 /**
  * The numbers that answer "is this lane still worth researching?" — previously invisible, which
  * made a goal that had gone quiet look exactly like one nobody had gotten to yet.
+ *
+ * Hand-rolled rather than AntD `Statistic`: five of those in a row is a lot of vertical weight
+ * for five small integers, and its label color is the dim tertiary token, which is what made
+ * these unreadable against the card.
  */
-function GoalHealthRow({ health }: { health: GoalHealth }) {
-  const stale = health.empty_cycles >= 3
+function GoalHealthRow({ health, stale }: { health: GoalHealth; stale: boolean }) {
   return (
-    <Space size={24} wrap>
-      <Statistic title="Proposals" value={health.proposals} valueStyle={{ fontSize: 18 }} />
-      <Statistic title="Approved" value={health.approved} valueStyle={{ fontSize: 18 }} />
-      <Statistic title="Shipped" value={health.shipped} valueStyle={{ fontSize: 18 }} />
-      <Statistic
-        title="Model spend"
-        value={health.api_spend}
-        precision={2}
-        prefix="$"
-        valueStyle={{ fontSize: 18 }}
-      />
-      <Tooltip title="Research cycles since this goal last produced a proposal. Past three, the research prompt starts asking for an adjacent angle or a goal_suggest instead of more of the same.">
-        <Statistic
-          title="Empty cycles"
+    <div style={{ borderTop: `1px solid ${palette.border}`, paddingTop: 10 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px 22px' }}>
+        <Metric label="Proposals" value={health.proposals} />
+        <Metric label="Approved" value={health.approved} />
+        <Metric label="Shipped" value={health.shipped} />
+        <Metric label="Spend" value={money(health.api_spend)} />
+        <Metric
+          label="Empty cycles"
           value={health.empty_cycles}
-          valueStyle={{ fontSize: 18, color: stale ? palette.rejected : undefined }}
+          tone={stale ? palette.rejected : undefined}
+          hint="Research cycles since this goal last produced a proposal. Past three, the research prompt starts asking for an adjacent angle or a goal_suggest instead of more of the same."
         />
-      </Tooltip>
-    </Space>
+      </div>
+      <Typography.Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 8 }}>
+        {health.last_proposal_at
+          ? `Last proposal ${timeAgo(health.last_proposal_at)}`
+          : 'No proposals from this lane yet'}
+      </Typography.Text>
+    </div>
   )
+}
+
+function Metric({
+  label,
+  value,
+  tone,
+  hint,
+}: {
+  label: string
+  value: ReactNode
+  tone?: string
+  hint?: string
+}) {
+  const body = (
+    <div style={{ minWidth: 62 }}>
+      <div
+        style={{
+          fontSize: 10,
+          letterSpacing: 0.5,
+          textTransform: 'uppercase',
+          color: palette.textMuted,
+          marginBottom: 2,
+          whiteSpace: 'nowrap',
+        }}
+      >
+        {label}
+      </div>
+      <div className="mono" style={{ fontSize: 16, lineHeight: 1.2, color: tone ?? palette.textPrimary }}>
+        {value}
+      </div>
+    </div>
+  )
+  return hint ? <Tooltip title={hint}>{body}</Tooltip> : body
 }
 
 function GoalEditor({
@@ -331,6 +537,7 @@ function GoalEditor({
   }, [goal, draft])
 
   const isSuggestion = goal?.status === 'suggested'
+  const isRetired = goal?.status === 'retired'
 
   return (
     <Modal
@@ -356,13 +563,22 @@ function GoalEditor({
             </Popconfirm>
           )}
           <Button onClick={onClose}>Cancel</Button>
-          <Button
-            type="primary"
-            disabled={!title.trim() || consoleOnly}
-            onClick={() => void onSave({ title: title.trim(), brief, weight, ...(isSuggestion ? { status: 'active' as const } : {}) })}
-          >
-            {isSuggestion ? 'Save and accept' : 'Save'}
-          </Button>
+          <Tooltip title={consoleOnly ? READ_ONLY_HINT : undefined}>
+            <Button
+              type="primary"
+              disabled={!title.trim() || consoleOnly}
+              onClick={() =>
+                void onSave({
+                  title: title.trim(),
+                  brief,
+                  weight,
+                  ...(isSuggestion || isRetired ? { status: 'active' as const } : {}),
+                })
+              }
+            >
+              {isSuggestion ? 'Save and accept' : isRetired ? 'Save and reactivate' : 'Save'}
+            </Button>
+          </Tooltip>
         </Space>
       }
     >
@@ -375,13 +591,26 @@ function GoalEditor({
             description={goal?.rationale ?? undefined}
           />
         )}
+        {isRetired && (
+          <Alert
+            type="warning"
+            showIcon
+            message="This goal is retired — saving brings it back into the rotation."
+          />
+        )}
         <div>
           <Typography.Text strong>Title</Typography.Text>
           <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 4 }}>
             Short and stable. This is the grouping key on the Economics scoreboard, and what the agent is told to
             echo back verbatim when it files a proposal or a lesson — so renaming it splits the history.
           </Typography.Paragraph>
-          <Input value={title} onChange={(e) => setTitle(e.target.value)} />
+          <Input
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder="e.g. Swedish market"
+            showCount
+            maxLength={80}
+          />
         </div>
         <div>
           <Typography.Text strong>Brief</Typography.Text>
@@ -389,7 +618,12 @@ function GoalEditor({
             Passed to the research prompt word for word. Markdown is fine. Be specific about what counts and what
             doesn't — which markets, which buyers, which incumbents to rule out first.
           </Typography.Paragraph>
-          <Input.TextArea value={brief} onChange={(e) => setBrief(e.target.value)} autoSize={{ minRows: 5, maxRows: 16 }} />
+          <Input.TextArea
+            value={brief}
+            onChange={(e) => setBrief(e.target.value)}
+            autoSize={{ minRows: 5, maxRows: 16 }}
+            placeholder="Research in Swedish (svenska sökord, Flashback, r/sweden). Target enskild firma / aktiebolag pain points. Check Fortnox, Bokio and Visma before proposing something they already cover."
+          />
         </div>
         <Space align="center">
           <Typography.Text strong>Weight</Typography.Text>

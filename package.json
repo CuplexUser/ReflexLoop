@@ -12,6 +12,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "smoke-test": "tsx src/smoke-test.ts",
+    "test:github": "tsx src/github-live-test.ts",
     "web:dev": "npm run -w web dev",
     "web:build": "npm run -w web build",
     "web:lint": "npm run -w web lint"

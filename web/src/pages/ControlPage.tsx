@@ -21,7 +21,6 @@ import type { ControlState } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { recurrenceLabel } from '../format'
-import { palette } from '../theme'
 
 /**
  * Runtime knobs that used to require an env change and a restart. Everything here either
@@ -183,12 +182,12 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
           </Typography.Text>
           <Space wrap>
             {control.goals.filter((g) => g.status === 'active').map((g) => (
-              <Tag key={g.id} color={palette.approved}>
+              <Tag key={g.id} color="success">
                 {g.title}
               </Tag>
             ))}
             {control.goals.some((g) => g.status === 'suggested') && (
-              <Tag color={palette.pending} style={{ color: palette.bgSunken }}>
+              <Tag color="warning">
                 {control.goals.filter((g) => g.status === 'suggested').length} awaiting your decision
               </Tag>
             )}
@@ -204,9 +203,7 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
         title="Directive for the next cycle"
         extra={
           control.directive ? (
-            <Tag color={palette.pending} style={{ color: palette.bgSunken }}>
-              queued
-            </Tag>
+            <Tag color="warning">queued</Tag>
           ) : null
         }
       >

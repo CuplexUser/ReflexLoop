@@ -57,6 +57,7 @@ back — that refusal is deliberate, not a bug.
 ```bash
 npm install
 npm run smoke-test    # sanity-checks the DB + tool wiring directly, no API key needed — run this first
+npm run test:github   # opt-in live check of the GitHub write path; needs a real GITHUB_TOKEN, creates throwaway repos
 npm test              # vitest run — unit tests over src/**/*.test.ts, no API key needed
 npm run typecheck     # tsc --noEmit over src/
 npm start             # tsx src/orchestrator.ts — runs the agent loop + web console together (one process, one SQLite connection)
@@ -118,6 +119,22 @@ own history — the pairs it must catch and the follow-up pair it must not).
 `smoke-test.ts` runs end-to-end against a throwaway `./data/smoke-test.db`, and also builds the real tool
 registry and serializes every schema — which is the cheap way to catch a zod shape that can't be converted,
 since otherwise it surfaces as a provider 400 on the first live cycle.
+
+`src/integrations/github.test.ts` is the one place the "a mock of a wire format mostly tests the mock"
+rule is deliberately set aside, and **it is not sufficient on its own** — `npm run test:github`
+(`src/github-live-test.ts`) is the other half. What the unit tests cover is our *branching* across three
+states GitHub reports with three different statuses, which is where a real bug lived: a repo with zero
+commits rejects the **entire** Git Data API (blobs and trees included, not just the ref lookup) with
+`409 Git Repository is empty.`, so `github_create_repo` followed by `github_commit_files` — the normal
+shape of a build — could not work at all. `commitFiles` now bootstraps such a repo through the Contents
+API (the one write that functions there), then collapses that bootstrap into a single parentless commit
+so the history isn't left carrying an artifact of the API. A **404** on the ref is deliberately still an
+error rather than a second initial-commit path: treating it as one would report success while leaving an
+orphan branch, which is the same "reported fine, nothing there" failure one level subtler.
+The live script is what made this correct — the first version of the fix handled the 409 on the ref
+lookup and died on the very next call, and the mock agreed with it right up until the real API didn't.
+**Re-run `npm run test:github` after touching the write path**; it needs `GITHUB_TOKEN`, and cleanup
+needs the `delete_repo` scope (without it the throwaway repos survive and their URLs are printed).
 
 Frontend (`web/`) is an npm workspace of the root project — `npm install` at the root sets up both.
 Run its scripts from the root (below) or with `npm run <script> -w web` from anywhere:

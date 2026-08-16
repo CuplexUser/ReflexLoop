@@ -99,7 +99,7 @@ export function buildIntegrationsTools(): ToolDefinition[] {
 
   const githubCommitFiles = defineTool(
     "github_commit_files",
-    "Create or update any number of files on a branch as a single commit. Prefer this over repeated github_commit_file calls when scaffolding more than one file -- avoids a noisy one-commit-per-file history. Only usable when a proposal listing this tool has been approved.",
+    "Create or update any number of files on a branch as a single commit. Prefer this over repeated github_commit_file calls when scaffolding more than one file -- avoids a noisy one-commit-per-file history. Works on a repo that github_create_repo just made: a repo with no commits yet has no branch to build on, so this writes the initial commit and creates the branch. Only usable when a proposal listing this tool has been approved.",
     {
       owner: z.string(),
       repo: z.string(),
