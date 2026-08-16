@@ -27,6 +27,7 @@ import { emitAgentEvent, onAgentEvent, type AgentEvent } from "./events.js";
 import { submitDecision, hasPendingDecision } from "./review-gateway.js";
 import { fireReactiveTrigger } from "./reactive-triggers.js";
 import { ALL_GRANTABLE_TOOLS, toolRisk } from "./tool-catalog.js";
+import { configuredConnectorTools, connectorOperation, connectorStatus } from "./connectors/load.js";
 import { buildDeliverables, type DeliverableOutcomeRow } from "./deliverables.js";
 import { isConsoleOnlyMode } from "./console-mode.js";
 import { CONSOLE_ONLY_WRITABLE_ROUTES, type ControlSettingsWriter } from "./control-settings-writer.js";
@@ -144,9 +145,28 @@ export function startServer(
     });
   });
 
-  /** The tool catalog, so the console can badge which requested tools actually touch the world. */
+  /**
+   * The tool catalog, so the console can badge which requested tools actually touch the world.
+   *
+   * `configured` is only ever false for a connector whose credential is missing. It's here
+   * because that's a fact the operator needs at decision time -- approving a proposal fenced
+   * to a tool with no key behind it produces an act phase that can only fail -- and the
+   * catalog is where the console already looks.
+   */
   app.get("/api/tools", (_req, res) => {
-    res.json(ALL_GRANTABLE_TOOLS.map((name) => ({ name, risk: toolRisk(name) })));
+    const configured = new Set(configuredConnectorTools());
+    res.json(
+      ALL_GRANTABLE_TOOLS.map((name) => ({
+        name,
+        risk: toolRisk(name),
+        configured: !connectorOperation(name) || configured.has(name),
+      }))
+    );
+  });
+
+  /** Which connectors exist and which are still missing a key, for the Agent control page. */
+  app.get("/api/connectors", (_req, res) => {
+    res.json(connectorStatus());
   });
 
   app.get("/api/proposals", (_req, res) => {

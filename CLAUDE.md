@@ -156,7 +156,10 @@ provider's key (`OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / 
 search keys `TAVILY_API_KEY` / `BRAVE_API_KEY` (see below); optional integration keys `GITHUB_TOKEN` /
 `VERCEL_TOKEN` / `NETLIFY_AUTH_TOKEN` / `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
 `QDRANT_EMBEDDING_DIM` (all four required together for semantic search) — each integration or feature
-is simply unavailable, not a startup error, when its keys are missing.
+is simply unavailable, not a startup error, when its keys are missing. Connector keys
+(`STRIPE_API_KEY` / `RESEND_API_KEY` / `PLAUSIBLE_API_KEY` / `CLOUDFLARE_API_TOKEN`, plus
+`AGENT_CONNECTORS_DIR`) work the same way, except that they're read per call rather than at startup,
+so filling one in takes effect on the next cycle without a restart.
 
 **`AGENT_MODEL` has no default on purpose.** Providers rename and retire models constantly; a model id
 baked into the code fails at the first API call with an opaque 404 instead of at startup with a message
@@ -331,6 +334,26 @@ on). A directive is consumed — injected into one research prompt, then cleared
   lesson; deleting or merging research notes) are deliberately *not* model-callable tools — those stay
   with the orchestrator and the human. `buildMemoryTools(store)` returns them; `MemoryStore` itself is a
   plain class the orchestrator and `server.ts` call directly for everything the model must not control.
+
+  **Every proposal has to say how it makes money.** `proposal_create` requires a `revenueModel`, a
+  `monetization` block (who pays, price point, path to first dollar, days, key assumption, validation
+  signal) and an ordered `steps` list, stored as `revenue_model` / `monetization_json` / `steps_json`.
+  Before this the only structured money field was `expected_upside` — a bare number — so the
+  mechanism, the buyer and the steps lived in prose inside `description`, whose format spec didn't
+  even list the money path among its suggested bullets. The review decision is the one irreversible
+  human act in the loop and it was being made without the thing it most needs.
+
+  The load-bearing part is **one in-band cross-check**: an `owner: "agent"` step naming a `tool` that
+  isn't in `requiredTools` refuses the create, naming the step and the tool. The act phase is fenced
+  to exactly `requiredTools`, so such a step cannot run — and which of the two is wrong isn't
+  guessable from inside the tool, so it goes back to the model rather than being silently reconciled.
+  That check is what keeps "the steps needed" and "what the fence permits" one statement instead of
+  two unrelated pieces of prose. `actPhase` then passes the approved steps through verbatim
+  (`approvedPlanBrief`), human-owned ones included and marked as not the agent's to do; until that
+  existed, execution re-derived an approach from the description and could diverge from the plan that
+  got a yes. All three columns are nullable and **not backfilled** — a pre-existing proposal renders
+  no monetization section rather than a row of dashes, same stance as `goal_id`.
+
   Muting matters most: `searchLessons` is the single chokepoint
   every `lesson_search` goes through, so muting there removes a wrong lesson from the agent's reasoning
   everywhere at once while keeping the record of what was believed and when. `searchLessonsByText` is a
@@ -430,6 +453,8 @@ on). A directive is consumed — injected into one research prompt, then cleared
   result (or, for commits, its `owner`/`repo` input), never from scanning outcome notes or model prose
   for things that look like links. `DELIVERABLE_TOOLS` is both the SQL filter in
   `store.listDeliverableActions()` and the switch in `buildDeliverables`, so the two can't drift.
+  Connectors don't get a switch case: an operation declaring `deliverable` in its manifest is handled
+  by one generic branch, since `result` has already shaped its response into a top-level `url`.
   Unit-tested (`deliverables.test.ts`) — it's pure functions over rows, no API key needed.
 - `integrations/{github,vercel,netlify}.ts` + `integrations-server.ts` — thin API wrappers and the tools
   that expose them (`buildIntegrationsTools()`). Read-only tools (`github_read_repo`, `vercel_list_projects`, etc.) are free for the research
@@ -438,13 +463,44 @@ on). A directive is consumed — injected into one research prompt, then cleared
   creates/deploys something returns a plain `url` field on success — `memory-server.ts`'s
   `extractResultUrl` pulls that out generically (by field name, not per-tool switching) to back the
   Actions page's browsable result links.
+- `connectors/` — the second way to add a tool, and the one to reach for first. A connector is a JSON
+  manifest (`connectors/defs/*.json`) describing a REST API: base URL, auth, and a list of operations
+  with typed params. `manifest.ts` is the zod meta-schema, `load.ts` reads and validates the bundled
+  dir plus `AGENT_CONNECTORS_DIR` at module load, `tools.ts` turns each operation into an ordinary
+  `ToolDefinition`. Shipped: Stripe, Resend, Plausible, Cloudflare.
+
+  The point is that adding a connector stopped being a nine-file change — a client module, two
+  hand-maintained risk lists, a `deliverables.ts` switch case, a frontend label map — and became one
+  file. Each operation declares its own `risk` next to itself, and `tool-catalog.ts` folds those
+  declarations into the same lists everything already reads.
+
+  **What it deliberately can't express**: file-upload deploys (Netlify's sha1 digest manifest,
+  Vercel's file payload — those stay native TS in `integrations/`, and both kinds of tool look
+  identical to the model) and OAuth refresh flows, which is why the distribution category is email
+  and webhooks only. Manifests are operator-authored files at the same trust level as `.env`; the
+  agent never writes one.
+
+  **Credentials are read at call time, never captured at module load** — the opposite of what
+  `integrations/*.ts` do. That's what lets a key filled in while the loop runs work on the next call
+  rather than the next restart, and it's the shape to keep if more config moves out of `.env`. For
+  the same reason connector tools are **registered whether or not their key is set** (an unconfigured
+  one answers `Error: STRIPE_API_KEY is not set` in band, like the native integrations); what a
+  missing key changes is which tools the *research prompt and grant* mention, recomputed per cycle by
+  `configuredConnectorTools()`. A `deliverable` block on an operation is what puts its result on the
+  Deliverables page. `load.test.ts` / `tools.test.ts` cover manifest validation and request building;
+  a broken *bundled* manifest fails `npm run smoke-test` via `CONNECTOR_ERRORS`, while a broken one in
+  an operator's own dir is skipped and logged rather than taking the console down with it.
 - `tool-catalog.ts` — the one place that knows which tools exist and which touch the real world
   (`toolRisk` → write/read/memory). Three consumers used to each carry their own copy of that answer:
   `orchestrator.ts` (listing act-phase write tools in the research prompt), `server.ts` (validating
   operator edits to `required_tools` against `ALL_GRANTABLE_TOOLS` — now to warn on an uncatalogued name,
   not to reject it), and the console (badging risk at
-  decision time, via `GET /api/tools`). Read-only integration tools stay defined in
-  `integrations-server.ts` next to their handlers and are re-exported here.
+  decision time, via `GET /api/tools`). Read-only integration tools stay defined next to their
+  handlers — in `integrations-server.ts` for the hand-written clients, in a manifest for the
+  declarative connectors — and this module merges both. The lists carry **every** connector
+  operation, configured or not: what a missing credential changes is what research is told about,
+  never whether a name is a legitimate thing for a proposal to have asked for. `GET /api/tools`
+  reports `configured` per tool so the console can say so at decision time.
 - `agent-control.ts` — runtime knobs (pause, run-now, abort, domains, interval, directive) plus the
   execution snapshot the console reads. Same in-process bus shape as `review-gateway.ts` and
   `reactive-triggers.ts`.
@@ -465,7 +521,8 @@ Actions (every tool call
 on an *approved* proposal — action type, an input-derived description, and a browsable result URL when
 the tool returned one; phase-filterable, click a row for full input/output JSON via `ActionDialog`),
 Economics (spend over time, spend by phase, spend by provider/model, per-domain scoreboard with
-forecast accuracy), Lessons, Research notes, **Goals**, Agent control.
+forecast accuracy), Lessons, Research notes, **Goals**, Agent control (which also lists the
+connectors and which of them are still missing a key).
 
 **Goals is where the agent gets pointed**, and it replaced the newline-delimited textarea that used to
 live on Agent control (that card is now a link). Title and brief are separate fields, since the old one
@@ -484,7 +541,17 @@ real anchor on the card face. The links used to be four interactions deep (scrol
 expand the row → scroll right to a column that's off-screen at the arriving scroll position → open a
 dialog), which is indistinguishable from their not being there. If you add a write tool that creates
 something browsable, teach `deliverables.ts` about it — otherwise the thing it builds is reachable
-only from raw JSON.
+only from raw JSON. For a connector that means one `deliverable` block in its manifest, not a code
+change.
+
+**Where the money question gets answered.** `MonetizationBlock.tsx` renders a proposal's revenue
+model, monetization block and step list; `web/src/monetization.ts` holds the parsers and labels
+(split out so the component file exports only components — oxlint's fast-refresh rule). The dialog
+gets the full block, and `ProposalReviewCard` gets a deliberately compact two-line summary, because
+the Dashboard card is where the decision actually happens and the money path is the part that used to
+be missing there entirely. Everything renders from structured fields rather than Markdown, so
+`MarkdownLite`'s bold-and-bullets-only limit doesn't apply — and a legacy proposal with null columns
+renders nothing at all rather than a row of dashes.
 
 **No vendor names in the UI.** The loop is provider-neutral and the provider is a config switch, so a
 label like "Claude API spend" is wrong the moment someone points `AGENT_PROVIDER` elsewhere — and the

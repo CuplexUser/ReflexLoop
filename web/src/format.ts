@@ -101,10 +101,20 @@ function shortToolName(toolName: string): string {
   return toolName.replace(/^mcp__(memory|integrations)__/, '')
 }
 
-/** Short, human "type of action" label for a tool call, e.g. "Create repo". */
+/**
+ * Short, human "type of action" label for a tool call, e.g. "Create repo".
+ *
+ * The fallback is deliberately generic rather than a map entry per tool: connectors are
+ * declared in manifests now, so a new one must read acceptably here without a frontend
+ * change. `stripe_create_payment_link` becomes "Stripe create payment link"; only tools
+ * whose default reads badly earn a hand-written entry above.
+ */
 export function actionLabel(toolName: string): string {
   const short = shortToolName(toolName)
-  return ACTION_LABEL[short] ?? short.replace(/_/g, ' ')
+  const label = ACTION_LABEL[short]
+  if (label) return label
+  const words = short.replace(/_/g, ' ')
+  return words.charAt(0).toUpperCase() + words.slice(1)
 }
 
 /** One-line description filled in from the tool's actual input, e.g. `"my-repo" — a landing page`. */
@@ -154,7 +164,16 @@ export function actionDescription(toolName: string, inputRaw: string | null): st
       return String(input.query ?? '')
     case 'WebFetch':
       return String(input.url ?? '')
-    default:
-      return preview(inputRaw, 140)
+    default: {
+      // Connector tools have no hand-written case, by design. Their arguments are flat
+      // scalars by construction (a manifest can't declare anything else), so listing them
+      // reads far better than the raw JSON this used to fall back to.
+      const scalars = Object.entries(input).filter(([, v]) => v !== null && typeof v !== 'object')
+      if (scalars.length === 0) return preview(inputRaw, 140)
+      return scalars
+        .map(([k, v]) => `${k}: ${v}`)
+        .join(' · ')
+        .slice(0, 140)
+    }
   }
 }

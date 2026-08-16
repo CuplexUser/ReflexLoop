@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { MemoryStore } from "./memory-server.js";
+import { MemoryStore, parseMonetization, parseSteps } from "./memory-server.js";
 
 /**
  * Qdrant is mocked so these tests are deterministic and need no cluster, independent of any
@@ -588,5 +588,84 @@ describe("unified search", () => {
 
     const hits = await store.searchEverything("invoicing");
     expect(hits.map((h) => h.type).sort()).toEqual(["lesson", "proposal", "research_note"]);
+  });
+});
+
+// The tool wrapper, not just the store: the monetization block and the steps↔fence
+// cross-check only exist at the proposal_create boundary, and that check is the whole
+// reason the step list is worth storing -- a plan whose steps need tools the fence
+// doesn't grant is a plan that cannot run, stated as though it can.
+describe("proposal_create", () => {
+  const baseArgs = {
+    domain: "saas",
+    description: "**Invoice Lint** — a linter for invoice templates.\n\n- Ships as a CLI",
+    expectedCost: 20,
+    expectedTimeHours: 6,
+    expectedUpside: 400,
+    requiredTools: ["mcp__integrations__github_create_repo"],
+    revenueModel: "one_off" as const,
+    monetization: {
+      whoPays: "Freelance bookkeepers",
+      pricePoint: "$19 one-off",
+      pathToFirstDollar: "Stripe payment link on the README",
+      daysToFirstDollar: 14,
+      keyAssumption: "Bookkeepers will pay for a linter rather than eyeballing templates",
+      validationSignal: "First 3 paid downloads within two weeks",
+    },
+    steps: [
+      { title: "Create the repo", owner: "agent" as const, tool: "mcp__integrations__github_create_repo", doneWhen: "Repo exists with the CLI committed" },
+      { title: "Publish the payment link", owner: "human" as const, doneWhen: "Link resolves and accepts a test card" },
+    ],
+  };
+
+  async function create(args: Record<string, unknown>) {
+    const { buildMemoryTools } = await import("./memory-server.js");
+    const { ToolRegistry } = await import("./tools/registry.js");
+    const registry = new ToolRegistry(buildMemoryTools(store));
+    return registry.invoke("mcp__memory__proposal_create", args);
+  }
+
+  it("stores the monetization block and steps on the row", async () => {
+    const res = await create(baseArgs);
+    expect(res.isError).toBe(false);
+
+    const [row] = store.listAllProposals();
+    expect(row.revenue_model).toBe("one_off");
+    expect(parseMonetization(row)?.pathToFirstDollar).toBe("Stripe payment link on the README");
+    expect(parseSteps(row).map((s) => s.owner)).toEqual(["agent", "human"]);
+  });
+
+  it("refuses when an agent step needs a tool the fence doesn't grant", async () => {
+    const res = await create({
+      ...baseArgs,
+      steps: [
+        ...baseArgs.steps,
+        { title: "Deploy the landing page", owner: "agent", tool: "mcp__integrations__vercel_deploy", doneWhen: "Site is live" },
+      ],
+    });
+
+    expect(res.isError).toBe(false); // refused in band, like the duplicate check -- not an exception
+    expect(res.text).toContain("Not created");
+    expect(res.text).toContain("mcp__integrations__vercel_deploy");
+    expect(store.listAllProposals()).toHaveLength(0);
+  });
+
+  it("allows a human step to have no tool -- that's the point of marking it human", async () => {
+    const res = await create({
+      ...baseArgs,
+      steps: [
+        baseArgs.steps[0],
+        { title: "Register for the affiliate programme", owner: "human", doneWhen: "Approval email received" },
+      ],
+    });
+    expect(res.text).toContain("Created proposal");
+  });
+
+  it("rejects a proposal with no monetization block at all", async () => {
+    const { monetization: _omitted, ...withoutMonetization } = baseArgs;
+    const res = await create(withoutMonetization);
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("monetization");
+    expect(store.listAllProposals()).toHaveLength(0);
   });
 });

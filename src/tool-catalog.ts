@@ -11,13 +11,25 @@
 //   - the web console, badging which requested tools are side-effecting so the
 //     fence is legible at the moment someone decides on it.
 //
-// Read-only integration tools stay defined in integrations-server.ts next to
-// the handlers they describe; this module re-exports them so callers get the
-// whole catalog from one import.
+// Read-only integration tools stay defined next to the handlers they describe --
+// in integrations-server.ts for the hand-written clients, in a manifest for the
+// declarative connectors. This module merges both so callers get the whole catalog
+// from one import.
 
-import { READONLY_INTEGRATION_TOOLS } from "./integrations-server.js";
+// Connectors (src/connectors/) are manifest-declared tools rather than hand-written
+// ones, but they are tools like any other by the time they get here: each operation
+// declares its own risk in the manifest, and this module folds those declarations into
+// the same two lists everything downstream already reads. The lists carry *every*
+// operation, configured or not -- what a missing credential changes is which tools the
+// research phase is told about (see configuredConnectorTools), never whether a name is
+// a legitimate thing for a proposal to have asked for.
+import { CONNECTOR_READ_TOOLS, CONNECTOR_WRITE_TOOLS } from "./connectors/load.js";
+import { READONLY_INTEGRATION_TOOLS as NATIVE_READONLY_INTEGRATION_TOOLS } from "./integrations-server.js";
 
-export { READONLY_INTEGRATION_TOOLS };
+export const READONLY_INTEGRATION_TOOLS = [
+  ...NATIVE_READONLY_INTEGRATION_TOOLS,
+  ...CONNECTOR_READ_TOOLS,
+];
 
 /**
  * Act-phase-only tools that create, commit, or deploy something real. A proposal can only
@@ -33,6 +45,7 @@ export const WRITE_INTEGRATION_TOOLS = [
   "mcp__integrations__vercel_deploy",
   "mcp__integrations__netlify_create_site",
   "mcp__integrations__netlify_deploy",
+  ...CONNECTOR_WRITE_TOOLS,
 ];
 
 /** Built-in tools with no side effects beyond a network read. */

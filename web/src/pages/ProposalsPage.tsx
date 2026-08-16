@@ -2,10 +2,11 @@ import { useCallback, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { App, Button, Input, Popconfirm, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import { CheckCircleOutlined, CloseCircleOutlined } from '@ant-design/icons'
-import type { OutcomeRow, Priority, ProposalRow } from '../types'
+import type { OutcomeRow, Priority, ProposalRow, RevenueModel } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { ProposalDialog } from '../components/ProposalDialog'
+import { REVENUE_MODELS, parseMonetization, revenueModelLabel } from '../monetization'
 import { TableToolbar } from '../components/TableToolbar'
 import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, markdownPreview, recurrenceLabel, timeAgo } from '../format'
 import { useTableView } from '../hooks/useTableView'
@@ -20,6 +21,8 @@ const STATUS_COLOR: Record<ProposalRow['status'], string> = {
 }
 
 const PRIORITY_RANK: Record<Priority, number> = { urgent: 3, high: 2, normal: 1, low: 0 }
+
+const REVENUE_MODEL_FILTERS = REVENUE_MODELS.map((m) => ({ text: revenueModelLabel(m) as string, value: m }))
 
 export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[]; outcomes: OutcomeRow[] }) {
   const { message } = App.useApp()
@@ -123,6 +126,25 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
           ),
       },
       {
+        title: 'Revenue model',
+        dataIndex: 'revenue_model',
+        width: 140,
+        filters: REVENUE_MODEL_FILTERS,
+        onFilter: (value: unknown, record: ProposalRow) => record.revenue_model === value,
+        render: (model: RevenueModel | null) => {
+          const label = revenueModelLabel(model)
+          // Null on every proposal filed before the monetization block existed — those get a
+          // dash rather than being bucketed as "other", which would be a claim about them.
+          return label ? (
+            <Tag color="green">{label}</Tag>
+          ) : (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              —
+            </Typography.Text>
+          )
+        },
+      },
+      {
         title: 'Expected',
         width: 200,
         sorter: (a: ProposalRow, b: ProposalRow) => a.expected_upside - b.expected_upside,
@@ -181,19 +203,41 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
         <TableToolbar
           view={view}
           onExportCsv={() =>
-            exportCsv('proposals', filtered, [
-              { key: 'id', title: '#' },
-              { key: 'domain', title: 'Domain' },
-              { key: 'description', title: 'Description' },
-              { key: 'status', title: 'Status' },
-              { key: 'priority', title: 'Priority' },
-              { key: 'expected_cost', title: 'Expected cost' },
-              { key: 'expected_time_hours', title: 'Expected hours' },
-              { key: 'expected_upside', title: 'Expected upside' },
-              { key: 'required_tools', title: 'Required tools' },
-              { key: 'created_at', title: 'Created' },
-              { key: 'decided_at', title: 'Decided' },
-            ])
+            // The monetization block is flattened into its own columns rather than exported as
+            // the raw JSON it's stored as — a cell holding a whole object is worse than no
+            // column at all, and these are the fields anyone comparing proposals wants.
+            exportCsv(
+              'proposals',
+              filtered.map((p) => {
+                const monetization = parseMonetization(p)
+                return {
+                  ...p,
+                  revenue_model_label: revenueModelLabel(p.revenue_model) ?? '',
+                  who_pays: monetization?.whoPays ?? '',
+                  price_point: monetization?.pricePoint ?? '',
+                  path_to_first_dollar: monetization?.pathToFirstDollar ?? '',
+                  days_to_first_dollar: monetization?.daysToFirstDollar ?? '',
+                }
+              }),
+              [
+                { key: 'id', title: '#' },
+                { key: 'domain', title: 'Domain' },
+                { key: 'description', title: 'Description' },
+                { key: 'status', title: 'Status' },
+                { key: 'priority', title: 'Priority' },
+                { key: 'revenue_model_label', title: 'Revenue model' },
+                { key: 'who_pays', title: 'Who pays' },
+                { key: 'price_point', title: 'Price point' },
+                { key: 'path_to_first_dollar', title: 'Path to first dollar' },
+                { key: 'days_to_first_dollar', title: 'Days to first dollar' },
+                { key: 'expected_cost', title: 'Expected cost' },
+                { key: 'expected_time_hours', title: 'Expected hours' },
+                { key: 'expected_upside', title: 'Expected upside' },
+                { key: 'required_tools', title: 'Required tools' },
+                { key: 'created_at', title: 'Created' },
+                { key: 'decided_at', title: 'Decided' },
+              ]
+            )
           }
           onExportJson={() => exportJson('proposals', filtered)}
         />

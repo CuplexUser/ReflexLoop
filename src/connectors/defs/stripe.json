@@ -1,0 +1,95 @@
+{
+  "id": "stripe",
+  "label": "Stripe",
+  "baseUrl": "https://api.stripe.com/v1",
+  "docsUrl": "https://docs.stripe.com/api",
+  "auth": { "type": "bearer", "envVar": "STRIPE_API_KEY" },
+  "encoding": "form",
+  "operations": [
+    {
+      "name": "stripe_list_products",
+      "risk": "read",
+      "description": "List existing Stripe products, to check what is already set up before creating another. Read-only.",
+      "method": "GET",
+      "path": "/products",
+      "params": {
+        "limit": { "type": "integer", "in": "query", "default": 10, "describe": "How many products to return (max 100)" }
+      }
+    },
+    {
+      "name": "stripe_balance",
+      "risk": "read",
+      "description": "Current Stripe balance, available and pending. The measured answer to 'has this actually earned anything', as opposed to an estimate. Read-only.",
+      "method": "GET",
+      "path": "/balance",
+      "result": { "available": "available", "pending": "pending" }
+    },
+    {
+      "name": "stripe_list_charges",
+      "risk": "read",
+      "description": "List recent Stripe charges, so an outcome can report real revenue rather than a guess. Read-only.",
+      "method": "GET",
+      "path": "/charges",
+      "params": {
+        "limit": { "type": "integer", "in": "query", "default": 10, "describe": "How many charges to return (max 100)" }
+      }
+    },
+    {
+      "name": "stripe_create_product",
+      "risk": "write",
+      "description": "Create a Stripe product -- the thing being sold. Pair with stripe_create_price and stripe_create_payment_link to get a working checkout. Only usable when a proposal listing this tool has been approved.",
+      "method": "POST",
+      "path": "/products",
+      "params": {
+        "name": { "type": "string", "in": "body", "required": true, "describe": "Customer-facing product name" },
+        "description": { "type": "string", "in": "body", "describe": "One-line description shown at checkout" }
+      },
+      "result": { "id": "id", "name": "name" }
+    },
+    {
+      "name": "stripe_create_price",
+      "risk": "write",
+      "description": "Create a price for an existing Stripe product. Amounts are in the currency's smallest unit (2900 = $29.00). Only usable when a proposal listing this tool has been approved.",
+      "method": "POST",
+      "path": "/prices",
+      "params": {
+        "product": { "type": "string", "in": "body", "required": true, "describe": "Stripe product id (prod_...)" },
+        "unitAmount": {
+          "type": "integer",
+          "in": "body",
+          "as": "unit_amount",
+          "required": true,
+          "describe": "Amount in the smallest currency unit -- cents for usd, so 2900 means $29.00"
+        },
+        "currency": { "type": "string", "in": "body", "required": true, "describe": "Three-letter ISO code, e.g. 'usd'" },
+        "recurringInterval": {
+          "type": "enum",
+          "in": "body",
+          "as": "recurring[interval]",
+          "values": ["day", "week", "month", "year"],
+          "describe": "Omit for a one-off price; set it for a subscription"
+        }
+      },
+      "result": { "id": "id", "unitAmount": "unit_amount", "currency": "currency" }
+    },
+    {
+      "name": "stripe_create_payment_link",
+      "risk": "write",
+      "description": "Create a hosted Stripe checkout link for a price -- a URL a customer can pay at immediately, with no site or server needed. Returns the link as `url`. Only usable when a proposal listing this tool has been approved.",
+      "method": "POST",
+      "path": "/payment_links",
+      "params": {
+        "priceId": {
+          "type": "string",
+          "in": "body",
+          "as": "line_items[0][price]",
+          "required": true,
+          "describe": "Stripe price id (price_...) from stripe_create_price"
+        },
+        "quantity": { "type": "integer", "in": "body", "as": "line_items[0][quantity]", "default": 1 }
+      },
+      "result": { "url": "url", "id": "id" },
+      "deliverable": { "kind": "payment_link" }
+    }
+  ]
+}

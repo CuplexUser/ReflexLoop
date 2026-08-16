@@ -1,5 +1,33 @@
 export type Priority = 'low' | 'normal' | 'high' | 'urgent'
 
+export type RevenueModel =
+  | 'affiliate'
+  | 'subscription'
+  | 'one_off'
+  | 'ads'
+  | 'marketplace'
+  | 'service'
+  | 'lead_gen'
+  | 'other'
+
+/** How a proposal earns, as research had to state it before the proposal could be filed. */
+export interface Monetization {
+  whoPays: string
+  pricePoint: string
+  pathToFirstDollar: string
+  daysToFirstDollar: number
+  keyAssumption: string
+  validationSignal: string
+}
+
+/** One step between approval and revenue. Agent steps name the tool the fence has to grant. */
+export interface ProposalStep {
+  title: string
+  owner: 'agent' | 'human'
+  tool?: string
+  doneWhen: string
+}
+
 export interface ProposalRow {
   id: number
   domain: string
@@ -23,6 +51,12 @@ export interface ProposalRow {
   /** Set only when a human edited the scope at approval time -- what the model originally asked for. */
   original_required_tools: string | null
   original_description: string | null
+  /** All three are null on proposals written before the monetization block existed. */
+  revenue_model: RevenueModel | null
+  /** JSON-encoded {@link Monetization} -- parse with parseMonetization in MonetizationBlock. */
+  monetization_json: string | null
+  /** JSON-encoded {@link ProposalStep}[] -- parse with parseSteps in MonetizationBlock. */
+  steps_json: string | null
 }
 
 export interface OutcomeRow {
@@ -96,8 +130,9 @@ export interface ActionWithProposal {
   result_url: string | null
 }
 
-export type ArtifactKind = 'site' | 'repo' | 'pull_request'
-export type ArtifactProvider = 'github' | 'vercel' | 'netlify'
+export type ArtifactKind = 'site' | 'repo' | 'pull_request' | 'payment_link'
+/** 'github' | 'vercel' | 'netlify', or a connector's manifest id -- an open set. */
+export type ArtifactProvider = string
 
 /** One reachable thing an approved proposal produced -- a repo, a deployment, a PR. */
 export interface DeliverableArtifact {
@@ -199,6 +234,22 @@ export type ToolRisk = 'write' | 'read' | 'memory' | 'unknown'
 export interface ToolInfo {
   name: string
   risk: ToolRisk
+  /**
+   * False only for a connector whose credential is missing. The tool is still a
+   * legitimate thing to name in a fence -- it just can't do anything yet, which is
+   * worth knowing before approving a proposal that depends on it.
+   */
+  configured: boolean
+}
+
+/** A declarative connector (src/connectors/defs/*.json) and whether its key is set. */
+export interface ConnectorStatus {
+  id: string
+  label: string
+  configured: boolean
+  envVar: string | null
+  docsUrl: string | null
+  operations: { name: string; toolName: string; risk: 'read' | 'write'; description: string }[]
 }
 
 export interface SearchHit {

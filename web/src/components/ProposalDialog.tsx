@@ -7,6 +7,7 @@ import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, preview, recurrenceLabel, timeAgo } from '../format'
 import { palette } from '../theme'
 import { MarkdownLite } from './MarkdownLite'
+import { MonetizationBlock } from './MonetizationBlock'
 import { DecisionControls } from './DecisionControls'
 import { ToolFence } from './ToolFence'
 
@@ -138,6 +139,8 @@ export function ProposalDialog({
             {proposal.human_notes}
           </Typography.Paragraph>
         )}
+
+        <MonetizationBlock proposal={proposal} />
 
         <Space size={40} wrap>
           <Statistic title="Expected cost" value={proposal.expected_cost} precision={2} prefix="$" />

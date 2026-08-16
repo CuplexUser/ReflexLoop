@@ -18,6 +18,7 @@ import type {
   RunRow,
   SearchHit,
   StatusResponse,
+  ConnectorStatus,
   ToolInfo,
 } from './types'
 
@@ -65,6 +66,7 @@ async function send<T = { ok: true }>(path: string, method: string, body?: unkno
 export const api = {
   status: () => getJson<StatusResponse>('/api/status'),
   tools: () => getJson<ToolInfo[]>('/api/tools'),
+  connectors: () => getJson<ConnectorStatus[]>('/api/connectors'),
   proposals: () => getJson<ProposalRow[]>('/api/proposals'),
   proposalActions: (id: number) => getJson<ActionRow[]>(`/api/proposals/${id}/actions`),
   proposalRuns: (id: number) => getJson<RunRow[]>(`/api/proposals/${id}/runs`),

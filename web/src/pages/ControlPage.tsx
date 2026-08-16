@@ -17,7 +17,7 @@ import {
   Typography,
 } from 'antd'
 import { PauseCircleOutlined, PlayCircleOutlined, StopOutlined, ThunderboltOutlined } from '@ant-design/icons'
-import type { ControlState } from '../types'
+import type { ConnectorStatus, ControlState } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { recurrenceLabel } from '../format'
@@ -32,6 +32,63 @@ import { recurrenceLabel } from '../format'
  * run-now and abort need a loop that isn't there. Those three are disabled rather than left
  * to fail — run-now especially, which would otherwise report success and wake nothing.
  */
+/**
+ * Which declarative connectors exist and which are still missing a key. Read-only, and
+ * safe in console-only mode: it reports what the process can see, and changing it means
+ * editing .env, which is not something the console does.
+ *
+ * It earns a place here because "why did the act phase say STRIPE_API_KEY is not set" is
+ * otherwise only answerable by reading the source. Tools stay catalogued when unconfigured
+ * — a proposal can still name one — so the console has to say which are inert.
+ */
+function ConnectorsCard() {
+  const [connectors, setConnectors] = useState<ConnectorStatus[] | null>(null)
+
+  useEffect(() => {
+    api.connectors().then(setConnectors).catch(() => setConnectors([]))
+  }, [])
+
+  if (!connectors || connectors.length === 0) return null
+  const ready = connectors.filter((c) => c.configured).length
+
+  return (
+    <Card
+      size="small"
+      title="Connectors"
+      extra={
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          {ready} of {connectors.length} configured
+        </Typography.Text>
+      }
+    >
+      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          REST connectors declared as manifests in <code>src/connectors/defs/</code>. One without a key is
+          still catalogued and still nameable in a proposal's fence — it just answers "not set" if called,
+          and research isn't told about it. Setting a key takes effect on the next cycle, with no restart.
+        </Typography.Text>
+        <Space wrap size={8}>
+          {connectors.map((c) => (
+            <Tooltip
+              key={c.id}
+              title={
+                c.configured
+                  ? `${c.operations.length} tools · ${c.operations.filter((o) => o.risk === 'write').length} side-effecting`
+                  : `Set ${c.envVar} in .env to enable ${c.operations.length} tools`
+              }
+            >
+              <Tag color={c.configured ? 'success' : 'default'}>
+                {c.label}
+                {c.configured ? '' : ` · ${c.envVar} unset`}
+              </Tag>
+            </Tooltip>
+          ))}
+        </Space>
+      </Space>
+    </Card>
+  )
+}
+
 export function ControlPage({ historyVersion }: { historyVersion: number }) {
   const { message } = App.useApp()
   const consoleOnly = useConsoleOnly()
@@ -197,6 +254,8 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
           </Button>
         </Space>
       </Card>
+
+      <ConnectorsCard />
 
       <Card
         size="small"

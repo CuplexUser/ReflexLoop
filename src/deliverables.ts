@@ -14,6 +14,7 @@
 // for anything that looks like a link. An outcome note that mentions a URL is
 // the model's account of what it did; an artifact here is the API's.
 
+import { CONNECTOR_OPERATIONS, connectorOperation } from "./connectors/load.js";
 import { isErrorResult, parseToolResult } from "./tool-output.js";
 
 const P = "mcp__integrations__";
@@ -22,6 +23,9 @@ const P = "mcp__integrations__";
  * The act-phase tools that can contribute an artifact. Also what MemoryStore selects
  * on, so the query and the switch below can't drift apart -- a tool added to one and
  * not the other would silently produce a deliverable with a missing link.
+ *
+ * The connector half is derived from the manifests rather than listed by hand, so a
+ * declared `deliverable` block is the single place that decision gets made.
  */
 export const DELIVERABLE_TOOLS = [
   `${P}github_create_repo`,
@@ -34,10 +38,16 @@ export const DELIVERABLE_TOOLS = [
   `${P}vercel_get_project`,
   `${P}netlify_create_site`,
   `${P}netlify_deploy`,
+  ...CONNECTOR_OPERATIONS.filter((op) => op.spec.deliverable).map((op) => op.toolName),
 ];
 
-export type ArtifactKind = "site" | "repo" | "pull_request";
-export type ArtifactProvider = "github" | "vercel" | "netlify";
+export type ArtifactKind = "site" | "repo" | "pull_request" | "payment_link";
+/**
+ * The three hand-written integrations, or a connector's manifest id. Widened to a
+ * string when connectors arrived: the set is open now, and a union that has to be
+ * edited for every manifest is the coupling this layer exists to remove.
+ */
+export type ArtifactProvider = string;
 
 export interface DeliverableArtifact {
   kind: ArtifactKind;
@@ -199,6 +209,26 @@ export function buildDeliverables(
     const out = (result && typeof result === "object" ? result : {}) as Record<string, unknown>;
     const input = parseInput(action.tool_input);
     const at = { occurredAt: action.occurred_at, actionId: action.id };
+
+    // Connectors first, and generically: the manifest already said what kind of thing
+    // this operation produces and `result` already shaped the response into a top-level
+    // `url`, so there is nothing per-connector left to know. A new manifest with a
+    // `deliverable` block shows up here without touching this file.
+    const connectorOp = connectorOperation(action.tool_name);
+    if (connectorOp?.spec.deliverable) {
+      const url = str(out.url);
+      if (url) {
+        add(acc, {
+          kind: connectorOp.spec.deliverable.kind,
+          provider: connectorOp.connector.id,
+          label: str(out.label) ?? str(out.name) ?? str(input.name) ?? connectorOp.connector.label,
+          url: withScheme(url),
+          detail: connectorOp.spec.deliverable.detail ?? null,
+          ...at,
+        });
+      }
+      continue;
+    }
 
     switch (action.tool_name) {
       case `${P}github_create_repo`: {
@@ -365,4 +395,6 @@ export function buildDeliverables(
   return deliverables.sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt));
 }
 
-const KIND_ORDER: Record<ArtifactKind, number> = { site: 0, repo: 1, pull_request: 2 };
+// A payment link sorts first: on a proposal that produced one, it is the artifact the
+// operator came to the page for.
+const KIND_ORDER: Record<ArtifactKind, number> = { payment_link: 0, site: 1, repo: 2, pull_request: 3 };

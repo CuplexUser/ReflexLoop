@@ -1,0 +1,64 @@
+{
+  "id": "cloudflare",
+  "label": "Cloudflare",
+  "baseUrl": "https://api.cloudflare.com/client/v4",
+  "docsUrl": "https://developers.cloudflare.com/api/",
+  "auth": { "type": "bearer", "envVar": "CLOUDFLARE_API_TOKEN" },
+  "encoding": "json",
+  "operations": [
+    {
+      "name": "cloudflare_list_zones",
+      "risk": "read",
+      "description": "List Cloudflare zones (domains) on the account, with their ids -- the zone id is what DNS operations need. Read-only.",
+      "method": "GET",
+      "path": "/zones",
+      "params": {
+        "perPage": { "type": "integer", "in": "query", "as": "per_page", "default": 20 }
+      },
+      "result": { "zones": "result" }
+    },
+    {
+      "name": "cloudflare_list_pages_projects",
+      "risk": "read",
+      "description": "List Cloudflare Pages projects on an account. Read-only.",
+      "method": "GET",
+      "path": "/accounts/{accountId}/pages/projects",
+      "params": {
+        "accountId": { "type": "string", "in": "path", "required": true, "describe": "Cloudflare account id" }
+      },
+      "result": { "projects": "result" }
+    },
+    {
+      "name": "cloudflare_get_pages_project",
+      "risk": "read",
+      "description": "Read one Cloudflare Pages project, including its live subdomain and latest deployment. Read-only.",
+      "method": "GET",
+      "path": "/accounts/{accountId}/pages/projects/{projectName}",
+      "params": {
+        "accountId": { "type": "string", "in": "path", "required": true },
+        "projectName": { "type": "string", "in": "path", "required": true }
+      },
+      "result": {
+        "name": "result.name",
+        "url": "result.subdomain",
+        "latestDeployment": "result.latest_deployment.url"
+      }
+    },
+    {
+      "name": "cloudflare_create_dns_record",
+      "risk": "write",
+      "description": "Create a DNS record in a zone -- how a domain gets pointed at something that was just deployed. Only usable when a proposal listing this tool has been approved.",
+      "method": "POST",
+      "path": "/zones/{zoneId}/dns_records",
+      "params": {
+        "zoneId": { "type": "string", "in": "path", "required": true, "describe": "From cloudflare_list_zones" },
+        "type": { "type": "enum", "in": "body", "values": ["A", "AAAA", "CNAME", "TXT", "MX"], "required": true },
+        "name": { "type": "string", "in": "body", "required": true, "describe": "Record name, e.g. 'www' or the full hostname" },
+        "content": { "type": "string", "in": "body", "required": true, "describe": "Record value -- an IP for A, a hostname for CNAME" },
+        "ttl": { "type": "integer", "in": "body", "default": 1, "describe": "1 means automatic" },
+        "proxied": { "type": "boolean", "in": "body", "default": false }
+      },
+      "result": { "id": "result.id", "name": "result.name", "type": "result.type" }
+    }
+  ]
+}

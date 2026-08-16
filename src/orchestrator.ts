@@ -29,12 +29,16 @@ import {
   MemoryStore,
   buildMemoryTools,
   goalTitleFromDomain,
+  parseMonetization,
+  parseSteps,
   preview,
   type GoalRow,
   type Priority,
   type ProposalRow,
 } from "./memory-server.js";
 import { buildIntegrationsTools } from "./integrations-server.js";
+import { buildConnectorTools } from "./connectors/tools.js";
+import { configuredConnectorTools, connectorOperation } from "./connectors/load.js";
 import {
   MEMORY_TOOLS,
   READONLY_BUILTIN_TOOLS,
@@ -103,8 +107,20 @@ const llmByPhase = CONSOLE_ONLY ? null : loadConfigOrExit(resolveLlmClients);
 // different registry. buildWebTools() contributes WebFetch always and WebSearch only
 // when an HTTP search provider is configured -- in native mode the provider searches
 // server-side instead, and agent-loop.ts handles that from the same "WebSearch" grant.
+// Connector tools are registered whether or not their credential is set, exactly like
+// the hand-written integrations: an unconfigured one answers "Error: STRIPE_API_KEY is
+// not set" in band. Gating *registration* on the key would mean a key filled in later
+// needs a restart before the tool exists, which is the wrong trade -- what a missing
+// credential should change is what the research phase is told about (see
+// researchAllowedTools below), not what the process is capable of.
 const registry = loadConfigOrExit(
-  () => new ToolRegistry([...buildMemoryTools(store), ...buildIntegrationsTools(), ...buildWebTools()])
+  () =>
+    new ToolRegistry([
+      ...buildMemoryTools(store),
+      ...buildIntegrationsTools(),
+      ...buildConnectorTools(),
+      ...buildWebTools(),
+    ])
 );
 
 // MEMORY_TOOLS (always available, every phase) and WRITE_INTEGRATION_TOOLS
@@ -222,12 +238,36 @@ async function runPhase(opts: {
 // native mode agent-loop.ts reads this grant and turns on the provider's own
 // server-side search instead. Nothing outside this list is described to the model
 // or dispatchable by it; see the fence note in agent-loop.ts.
-const RESEARCH_ALLOWED_TOOLS = [
-  ...MEMORY_TOOLS,
-  ...RESEARCH_OUTPUT_TOOLS,
-  ...READONLY_BUILTIN_TOOLS,
-  ...READONLY_INTEGRATION_TOOLS,
-];
+//
+// Computed per cycle rather than fixed at module load: a connector whose credential
+// isn't set is dropped from the grant, so the model is never shown a read tool that
+// can only answer "KEY is not set" -- and a credential filled in while the loop runs
+// takes effect on the next cycle instead of the next restart.
+function availableIntegrationTools(): { read: string[]; write: string[] } {
+  const configured = new Set(configuredConnectorTools());
+  // A native integration is always "available" here -- it reports its own missing token
+  // in band. Only manifest-declared connectors are filtered, because there are many of
+  // them and most operators will have keys for a few.
+  const available = (name: string) => !connectorOperation(name) || configured.has(name);
+  return {
+    read: READONLY_INTEGRATION_TOOLS.filter(available),
+    write: WRITE_INTEGRATION_TOOLS.filter(available),
+  };
+}
+
+function researchAllowedTools(): string[] {
+  return [
+    ...MEMORY_TOOLS,
+    ...RESEARCH_OUTPUT_TOOLS,
+    ...READONLY_BUILTIN_TOOLS,
+    ...availableIntegrationTools().read,
+  ];
+}
+
+/** `mcp__integrations__github_read_repo` -> `github_read_repo`, for prose that reads better short. */
+function unqualified(toolName: string): string {
+  return toolName.replace(/^mcp__[a-z_]+__/, "");
+}
 
 const RESEARCH_SYSTEM = [
   BASE_SYSTEM,
@@ -403,15 +443,17 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
         : []),
       `The digests above are a floor, not the whole record. Call lesson_search and research_note_search for anything you're about to look into -- both do semantic matching, so they surface relevant history even when your wording doesn't match the original.`,
       `Also call action_history_search for each goal -- it shows what's actually been built/deployed/committed on approved proposals so far, so you don't propose duplicate work (e.g. a second repo for something already shipped). Prefer proposing the next step on existing work over starting over.`,
-      `You can use the read-only tools github_read_repo, github_read_file, github_search_repos, vercel_list_projects, vercel_get_project, netlify_list_sites, netlify_get_site to check the existing landscape (competing projects, your own prior projects) before proposing.`,
+      `You can use the read-only tools ${availableIntegrationTools().read.map(unqualified).join(", ")} to check the existing landscape (competing projects, your own prior projects, and whether anything already shipped is getting traffic or earning) before proposing.`,
       `Research for concrete, boundable opportunities to earn money. Use WebSearch/WebFetch and the read-only integration tools above. Save distilled findings with research_note_add as you go, and set \`kind\` on each one -- 'gap' when you find something underserved, 'saturated' when you check a space and it is already well covered. Marking the dead ends honestly is what stops a future cycle spending itself re-checking them, so they are worth recording even though they feel like nothing.`,
       `When you have specific ideas, call proposal_create for each one worth a human's attention -- typically 1, up to 3 per cycle if multiple goals turned up genuinely strong, distinct opportunities. Don't pad the count with weak ideas just to fill a quota.`,
-      `Each proposal needs a real cost/time/upside estimate and the exact tool names execution would need. Built-in tools are unprefixed (e.g. 'WebSearch'). MCP tools need their full qualified name -- the act-phase write tools available are: ${WRITE_INTEGRATION_TOOLS.join(", ")}. For GitHub work: prefer github_commit_files (one commit, many files) over repeated github_commit_file calls; and either commit straight to the default branch, or if you use github_create_pr, list github_merge_pr in required_tools too and merge it during the act phase -- an approved proposal has no further GitHub-side review to wait for, so an unmerged PR just leaves the default branch empty.`,
+      `Every proposal has to say how it makes money, in the \`monetization\` block: who specifically pays, at what price, and through what mechanism the first payment is actually collected. That mechanism has to exist today and be reachable either by an act-phase tool or by the operator -- a hosted payment link, a named affiliate programme you checked is open to new applicants, a specific ad network. "Add payments later", "monetize through partnerships" and "we'll figure out pricing" are the kinds of answer that get a proposal rejected, and rightly.`,
+      `\`steps\` is the ordered path from approval to that first dollar. Include the steps only a human can do (registering for the affiliate programme, pointing a domain, verifying a sending domain) with owner "human" -- leaving them out doesn't make them unnecessary, it just hides that the plan depends on them. For an agent step, name the tool it needs; that tool must also be in requiredTools, since the act phase is fenced to exactly that list and a step needing anything else cannot run.`,
+      `Each proposal needs a real cost/time/upside estimate and the exact tool names execution would need. Built-in tools are unprefixed (e.g. 'WebSearch'). MCP tools need their full qualified name -- the act-phase write tools available are: ${availableIntegrationTools().write.join(", ")}. For GitHub work: prefer github_commit_files (one commit, many files) over repeated github_commit_file calls; and either commit straight to the default branch, or if you use github_create_pr, list github_merge_pr in required_tools too and merge it during the act phase -- an approved proposal has no further GitHub-side review to wait for, so an unmerged PR just leaves the default branch empty.`,
       `Then stop -- do not act on any proposal, a human reviews each one next.`,
       `If nothing concrete and boundable comes out of the research, don't force a proposal -- just stop.`,
     ].join("\n"),
     system: RESEARCH_SYSTEM,
-    allowedTools: RESEARCH_ALLOWED_TOOLS,
+    allowedTools: researchAllowedTools(),
     maxTurns: RESEARCH_MAX_TURNS,
   });
 
@@ -473,7 +515,7 @@ async function handleReactiveTrigger(proposalId: number): Promise<void> {
         `If there isn't enough signal yet to propose something concrete, save a research_note explaining what's unclear and stop -- don't force a proposal.`,
       ].join("\n"),
       system: RESEARCH_SYSTEM,
-      allowedTools: RESEARCH_ALLOWED_TOOLS,
+      allowedTools: researchAllowedTools(),
       maxTurns: RESEARCH_MAX_TURNS,
     });
 
@@ -614,13 +656,51 @@ const ACT_MAX_TURNS = 60;
  */
 let actAbortController: AbortController | null = null;
 
+/**
+ * The monetization block and step list as the act phase should see them: the plan a human
+ * said yes to, restated so execution follows it rather than re-deriving one from the prose.
+ *
+ * Human-owned steps are included and explicitly marked as not the agent's to do. Dropping
+ * them would read as a shorter plan rather than a plan with a dependency in it, and the
+ * agent claiming an outcome while a human step is outstanding is exactly the overstatement
+ * outcome_record is supposed to avoid. Empty for a proposal created before these fields
+ * existed, which is why this returns lines to spread rather than a string.
+ */
+function approvedPlanBrief(proposal: ProposalRow): string[] {
+  const monetization = parseMonetization(proposal);
+  const steps = parseSteps(proposal);
+  const lines: string[] = [];
+
+  if (monetization) {
+    lines.push(
+      `How this is supposed to make money (${proposal.revenue_model ?? "unspecified"}): ${monetization.whoPays} pays ${monetization.pricePoint}. Path to the first dollar: ${monetization.pathToFirstDollar}. Build toward that specifically -- it is what the proposal was approved on.`
+    );
+  }
+  if (steps.length > 0) {
+    lines.push(
+      `The approved plan, in order:\n${steps
+        .map(
+          (s, i) =>
+            `  ${i + 1}. [${s.owner}] ${s.title}${s.tool ? ` (${unqualified(s.tool)})` : ""} -- done when: ${s.doneWhen}`
+        )
+        .join("\n")}`,
+      `Do the [agent] steps. The [human] ones are not yours to do and you have no tool for them -- when you reach one, note in outcome_record that it is outstanding rather than reporting the work as complete or pretending it was done.`
+    );
+  }
+  return lines;
+}
+
 async function actPhase(proposal: ProposalRow): Promise<void> {
   const requiredTools = proposal.required_tools.split(",").map((s) => s.trim()).filter(Boolean);
+  const readOnlyTools = availableIntegrationTools().read;
   const allowedTools = [
     ...new Set([
       ...MEMORY_TOOLS,
-      ...READONLY_INTEGRATION_TOOLS,
+      ...readOnlyTools,
       ...READONLY_BUILTIN_TOOLS,
+      // requiredTools is unfiltered on purpose: this is the approved fence, and a tool
+      // whose credential is missing must report that itself rather than vanish from a
+      // grant the human signed off on.
       ...requiredTools,
     ]),
   ];
@@ -632,7 +712,11 @@ async function actPhase(proposal: ProposalRow): Promise<void> {
     proposalId: proposal.id,
     prompt: [
       `Execute approved proposal #${proposal.id}: ${proposal.description}`,
-      `The only tools that can change anything real are the ones this proposal was approved for: ${requiredTools.join(", ")}. On top of those you always have memory tools for logging/recall, the read-only integration tools (github_read_repo, github_read_file, github_search_repos, vercel_list_projects, vercel_get_project, netlify_list_sites, netlify_get_site) for checking real state, and WebSearch/WebFetch.`,
+      // The plan the human actually approved. Until this was passed through, the act phase
+      // never saw the steps at all -- it re-derived an approach from the description and
+      // could diverge from the one that got a yes.
+      ...approvedPlanBrief(proposal),
+      `The only tools that can change anything real are the ones this proposal was approved for: ${requiredTools.join(", ")}. On top of those you always have memory tools for logging/recall, the read-only integration tools (${readOnlyTools.map(unqualified).join(", ")}) for checking real state, and WebSearch/WebFetch.`,
       `Use WebSearch/WebFetch while you build, not just before: check a library's current API, a package's real export names, or a config format rather than writing what you half-remember. You have no build step to catch a wrong import.`,
       `This is a real deliverable, not a stub -- fully implement the scope described above. Do not leave placeholder/TODO files, an empty repo, or a README-only scaffold standing in for the actual code.`,
       `You have no build or compile step available -- you cannot run the code you write. Before each commit, deliberately re-read every file you're about to write: confirm every import resolves to a file actually being committed, that the syntax is valid, and that package.json's dependencies/scripts match what the code actually uses.`,

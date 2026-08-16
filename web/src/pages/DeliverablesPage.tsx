@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   CloudUploadOutlined,
+  CreditCardOutlined,
   GithubOutlined,
   GlobalOutlined,
   LinkOutlined,
@@ -32,6 +33,7 @@ const REVIEW_OPTIONS = [
 ]
 
 function artifactIcon(artifact: DeliverableArtifact) {
+  if (artifact.kind === 'payment_link') return <CreditCardOutlined />
   if (artifact.kind === 'pull_request') return <PullRequestOutlined />
   if (artifact.kind === 'repo') return <GithubOutlined />
   return artifact.provider === 'vercel' ? <CloudUploadOutlined /> : <GlobalOutlined />

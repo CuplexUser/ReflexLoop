@@ -18,6 +18,22 @@ reflect into a lesson**, then repeat. Research can span several domains at
 once and surface more than one proposal per cycle; several proposals can sit
 pending review at the same time.
 
+**Every proposal has to say how it will make money.** Alongside the
+cost/time/upside estimate, research has to fill in a revenue model, who
+specifically pays, at what price, through what mechanism the *first* payment is
+actually collected, how many days that takes, the one assumption that would kill
+it, and what you'd measure to know it's working — plus an ordered step list from
+approval to that first dollar, with the human-only steps marked as such. The
+console shows all of it on the review card and in the proposal dialog, so the
+decision isn't made on a headline number and a paragraph of prose.
+
+Steps and the tool fence are checked against each other: a step the agent is
+meant to do, naming a tool the proposal isn't asking for, is refused at creation
+time. The act phase is fenced to exactly the approved tool list, so such a step
+could never have run — and the approved steps are now passed into the act phase
+verbatim, so execution follows the plan you said yes to rather than re-deriving
+one.
+
 At approval time you also set **priority** (low/normal/high/urgent) and,
 optionally, a **schedule** — run now, run at a future date/time, or repeat on
 a cadence until cancelled. Only one proposal's act+reflect phase ever runs at
@@ -96,6 +112,24 @@ there.
   is preferred over the older one-file-per-call `github_commit_file`;
   `github_merge_pr` exists so a proposal that opens a PR can also land it
   instead of leaving the default branch empty.
+- `src/connectors/` — **connectors declared as JSON, not code.** A manifest in
+  `src/connectors/defs/` describes a REST API (base URL, auth, and a list of
+  operations with typed params); the loader turns each operation into a normal
+  tool, with the same read/write risk split and the same fence. Shipped:
+  **Stripe** (products, prices, hosted payment links, plus balance and charge
+  reads), **Resend** (email), **Plausible** (traffic stats), **Cloudflare**
+  (zones, Pages, DNS). Add your own by dropping a file in that directory, or
+  point `AGENT_CONNECTORS_DIR` somewhere outside the repo.
+
+  Stripe is the one that changes what the loop can do: a payment link is a
+  real path from an approved proposal to a first dollar, and the balance/charge
+  reads let the act phase record **measured** revenue instead of an estimate.
+
+  A connector with no key set is still listed — its tools just report
+  `<KEY> is not set` if called, and research isn't told about them. Filling a
+  key in takes effect on the next cycle, with no restart. File-upload deploys
+  (Vercel, Netlify) and OAuth-refresh APIs (Reddit, X) can't be expressed this
+  way and stay hand-written.
 - `src/qdrant.ts` — Qdrant Cloud client: vector storage/search plus
   server-side embedding inference (Cloud Inference) in the same request, so
   there's no separate embeddings provider to rate-limit against. Fails soft:
@@ -152,8 +186,14 @@ Copy `.env.example` to `.env` and fill in what you have:
   Chrome extension, and a free web calculator/tool — not developer-only).
   See the tradeoff note below before adding many.
 - `GITHUB_TOKEN` / `VERCEL_TOKEN` / `NETLIFY_AUTH_TOKEN` — optional; omit any
-  of them and that integration's tools simply aren't usable. No Stripe
-  integration yet.
+  of them and that integration's tools simply aren't usable.
+- `STRIPE_API_KEY` / `RESEND_API_KEY` / `PLAUSIBLE_API_KEY` /
+  `CLOUDFLARE_API_TOKEN` — optional connector keys (see `src/connectors/`).
+  Unlike the three above, these are read per call rather than at startup, so
+  adding one takes effect on the next cycle without a restart. Use a Stripe
+  **test-mode** key (`sk_test_…`) until you're sure. `AGENT_CONNECTORS_DIR`
+  points at a directory of extra connector manifests, if you'd rather keep
+  them outside the repo.
 - `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
   `QDRANT_EMBEDDING_DIM` (+ `QDRANT_EMBEDDING_DISTANCE`) — optional, but all
   four of the first group are required together; enables semantic search.
@@ -193,15 +233,24 @@ npm run web:dev     # Vite dev server, proxies /api and /ws to the backend
   (`events` table) and reloaded on page load, so a refresh doesn't lose it.
 - **Live feed** — the full activity stream, filterable by phase: every tool
   call and model narration as it happens.
-- **Proposals** — full history with status, priority, and schedule; click a
-  row to open a dialog with the full description, stats, tool calls, and
-  Approve/Reject (with priority/schedule fields) for pending ones.
+- **Proposals** — full history with status, priority, revenue model, and
+  schedule; click a row to open a dialog with the full description, the
+  monetization block (who pays, price, path to the first dollar, key
+  assumption, validation signal), the ordered step list with the human-only
+  steps flagged, stats, tool calls, and Approve/Reject (with priority/schedule
+  fields) for pending ones.
 - **Actions** — grouped by parent proposal (expandable rows): every tool call
   across its act and reflect phases, expected vs. actual cost/time/upside,
   priority/schedule, and a "MVP done"/"needs refinement" review control.
   Setting "needs refinement" triggers the reactive research pass described
   above. Click a row for the full input/output JSON.
+- **Deliverables** — one card per approved proposal that produced something
+  reachable, with every artifact a real link: repo, live deployment, PR, and
+  now Stripe payment links.
 - **Lessons** / **Research notes** — the accumulated memory, browsable.
+- **Agent control** — pause, run-now, abort, a one-shot research directive,
+  and a connector list showing which are configured and which are still
+  missing a key.
 
 Approving or rejecting a proposal calls `POST /api/proposals/:id/decision`,
 which resolves that proposal's pending promise in `review-gateway.ts` —
@@ -262,6 +311,12 @@ signal in any one of them.
   add yourself at approval time *are* validated against the catalog.) Keep
   `expectedCost` realistic and don't approve proposals whose downside you
   wouldn't accept.
+- **Connector write tools spend real money or reach real people.** A Stripe
+  key creates live products and charges; a Resend key sends mail that can't be
+  recalled; a Cloudflare token edits DNS for a real domain. They are behind the
+  same approval fence as everything else, but the fence only limits *which*
+  tools run, not how well. Start with scoped, minimum-permission tokens and a
+  Stripe test-mode key, and read a proposal's step list before approving it.
 - **Set `AGENT_API_TOKEN` before exposing the console.** With it unset the
   API is open and nothing gates `/api/proposals/:id/decision` — anyone who
   can reach the port can approve spending. That's why `AGENT_BIND_HOST`

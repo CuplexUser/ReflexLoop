@@ -1,5 +1,7 @@
 import "dotenv/config";
 import { buildIntegrationsTools } from "./integrations-server.js";
+import { buildConnectorTools } from "./connectors/tools.js";
+import { CONNECTOR_ERRORS } from "./connectors/load.js";
 import { buildWebTools } from "./tools/web.js";
 import { ToolRegistry } from "./tools/registry.js";
 import { ALL_GRANTABLE_TOOLS } from "./tool-catalog.js";
@@ -27,7 +29,21 @@ const store = new MemoryStore(dbPath);
 // JSON Schema the wire needs. This is the cheap way to catch a zod shape that can't be
 // serialized -- otherwise the failure would surface as a provider 400 on the first
 // real cycle, which needs an API key and an hour of waiting to reach.
-const registry = new ToolRegistry([...buildMemoryTools(store), ...buildIntegrationsTools(), ...buildWebTools()]);
+// A manifest that fails validation is skipped at load rather than crashing the process,
+// which is right for an operator's own connector dir and wrong for the ones shipped here --
+// so this is where a broken bundled manifest becomes a build failure.
+if (CONNECTOR_ERRORS.length > 0) {
+  throw new Error(
+    `connector manifests failed to load:\n${CONNECTOR_ERRORS.map((e) => `  ${e.source}: ${e.message}`).join("\n")}`
+  );
+}
+
+const registry = new ToolRegistry([
+  ...buildMemoryTools(store),
+  ...buildIntegrationsTools(),
+  ...buildConnectorTools(),
+  ...buildWebTools(),
+]);
 const schemas = registry.schemas(registry.names());
 console.log(`registry: ${schemas.length} tools, all schemas serialized`);
 

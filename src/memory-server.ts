@@ -341,6 +341,21 @@ export class MemoryStore {
     // not as positive context, a distinction the store previously could not express. NULL
     // means unclassified (every pre-existing row) and is simply excluded from the negatives.
     this.ensureColumn("research_notes", "kind", "TEXT");
+
+    // How a proposal is supposed to make money, and what stands between approval and the
+    // first dollar. Until now the only structured money field was `expected_upside` -- a
+    // bare number -- so the mechanism, the buyer, the price and the steps lived in prose
+    // inside `description`, whose format spec didn't even list the money path among its
+    // suggested bullets. The review decision is the one irreversible human act in the loop
+    // and it was being made without the thing it most needs.
+    //
+    // All three are nullable and not backfilled: a proposal written before these existed
+    // may well have said all of it in prose, but parsing that back out would be guessing,
+    // and the console simply renders no section for a row that has none. Same stance as
+    // goal_id above.
+    this.ensureColumn("proposals", "revenue_model", "TEXT");
+    this.ensureColumn("proposals", "monetization_json", "TEXT");
+    this.ensureColumn("proposals", "steps_json", "TEXT");
   }
 
   /** Returns true if the column didn't already exist and was just added. */
@@ -960,10 +975,13 @@ export class MemoryStore {
     expectedUpside: number;
     requiredTools: string[];
     goalId?: number | null;
+    revenueModel?: RevenueModel | null;
+    monetization?: Monetization | null;
+    steps?: ProposalStep[] | null;
   }) {
     const stmt = this.db.prepare(
-      `INSERT INTO proposals (domain, description, expected_cost, expected_time_hours, expected_upside, required_tools, created_at, goal_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO proposals (domain, description, expected_cost, expected_time_hours, expected_upside, required_tools, created_at, goal_id, revenue_model, monetization_json, steps_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const result = stmt.run(
       p.domain,
@@ -973,7 +991,10 @@ export class MemoryStore {
       p.expectedUpside,
       p.requiredTools.join(","),
       now(),
-      p.goalId ?? null
+      p.goalId ?? null,
+      p.revenueModel ?? null,
+      p.monetization ? JSON.stringify(p.monetization) : null,
+      p.steps ? JSON.stringify(p.steps) : null
     );
     return Number(result.lastInsertRowid);
   }
@@ -1809,6 +1830,41 @@ interface LessonRow {
 
 export type Priority = "low" | "normal" | "high" | "urgent";
 
+/** How money actually arrives. Its own column, not folded into the JSON, so it can be grouped on. */
+export const REVENUE_MODELS = [
+  "affiliate",
+  "subscription",
+  "one_off",
+  "ads",
+  "marketplace",
+  "service",
+  "lead_gen",
+  "other",
+] as const;
+export type RevenueModel = (typeof REVENUE_MODELS)[number];
+
+/** The money path, as the research phase had to state it before the proposal could be filed. */
+export interface Monetization {
+  whoPays: string;
+  pricePoint: string;
+  pathToFirstDollar: string;
+  daysToFirstDollar: number;
+  keyAssumption: string;
+  validationSignal: string;
+}
+
+/**
+ * One step between approval and revenue. `tool` on an agent-owned step is checked against
+ * `required_tools` at create time, which is what keeps "the steps needed" and "what the fence
+ * permits" from becoming two unrelated pieces of prose.
+ */
+export interface ProposalStep {
+  title: string;
+  owner: "agent" | "human";
+  tool?: string;
+  doneWhen: string;
+}
+
 export interface ProposalRow {
   id: number;
   domain: string;
@@ -1829,6 +1885,33 @@ export interface ProposalRow {
   /** Set only when a human edited the scope at approval time -- what the model originally asked for. */
   original_required_tools: string | null;
   original_description: string | null;
+  /** Null on every proposal written before the monetization block existed; see migrate(). */
+  revenue_model: RevenueModel | null;
+  /** JSON-encoded {@link Monetization}. */
+  monetization_json: string | null;
+  /** JSON-encoded {@link ProposalStep}[]. */
+  steps_json: string | null;
+}
+
+/** Parses a proposal's stored monetization block, tolerating the nulls on legacy rows. */
+export function parseMonetization(row: Pick<ProposalRow, "monetization_json">): Monetization | null {
+  if (!row.monetization_json) return null;
+  try {
+    return JSON.parse(row.monetization_json) as Monetization;
+  } catch {
+    return null;
+  }
+}
+
+/** Parses a proposal's stored step list, tolerating the nulls on legacy rows. */
+export function parseSteps(row: Pick<ProposalRow, "steps_json">): ProposalStep[] {
+  if (!row.steps_json) return [];
+  try {
+    const parsed = JSON.parse(row.steps_json);
+    return Array.isArray(parsed) ? (parsed as ProposalStep[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -2044,7 +2127,7 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
 
   const proposalCreate = defineTool(
     "proposal_create",
-    "Propose a specific, boundable action for a human to approve. Every proposal needs a concrete cost/time/upside estimate and the exact list of tools it needs -- no proposal is executed without human approval, and execution is locked to exactly the tools listed here.",
+    "Propose a specific, boundable action for a human to approve. Every proposal needs a concrete cost/time/upside estimate, a monetization block saying how it actually earns and what the path to the first dollar is, an ordered step list, and the exact list of tools it needs -- no proposal is executed without human approval, and execution is locked to exactly the tools listed here.",
     {
       domain: z.string(),
       description: z
@@ -2059,8 +2142,66 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
       expectedTimeHours: z.number().min(0),
       expectedUpside: z.number().describe("Expected revenue or value if it works"),
       requiredTools: z.array(z.string()).describe("Exact tool names needed for execution, e.g. ['WebSearch','WebFetch']"),
+      revenueModel: z.enum(REVENUE_MODELS).describe("How money actually arrives"),
+      monetization: z
+        .object({
+          whoPays: z.string().describe("The specific buyer -- a role, a company type, a named market. Not 'users'."),
+          pricePoint: z.string().describe("e.g. '$29/mo', '3% affiliate commission on a ~$400 order', '$0.50 CPM'"),
+          pathToFirstDollar: z
+            .string()
+            .describe(
+              "The concrete mechanism that collects the first payment -- a Stripe payment link, a named " +
+                "affiliate programme, a specific ad network. Not 'monetize later' and not 'add payments'."
+            ),
+          daysToFirstDollar: z.number().int().min(0).describe("Realistic days from approval to first payment"),
+          keyAssumption: z.string().describe("The one thing that, if it turns out to be false, kills this"),
+          validationSignal: z.string().describe("What you would measure to know whether it is working"),
+        })
+        .describe("How this makes money. A human reviews this to decide; vagueness here is what gets rejected."),
+      steps: z
+        .array(
+          z.object({
+            title: z.string(),
+            owner: z.enum(["agent", "human"]).describe("'agent' if the act phase does it, 'human' if you cannot"),
+            tool: z
+              .string()
+              .optional()
+              .describe("For an agent step, the exact tool name it needs -- it must also be in requiredTools"),
+            doneWhen: z.string().describe("The observable condition that means this step is finished"),
+          })
+        )
+        .min(2)
+        .max(10)
+        .describe("Ordered steps from approval to the first dollar, including the ones only a human can do"),
     },
-    async ({ domain, description, expectedCost, expectedTimeHours, expectedUpside, requiredTools }) => {
+    async ({
+      domain,
+      description,
+      expectedCost,
+      expectedTimeHours,
+      expectedUpside,
+      requiredTools,
+      revenueModel,
+      monetization,
+      steps,
+    }) => {
+      // The steps and the fence have to be the same statement, not two pieces of prose that
+      // happen to sit on one row. An agent-owned step naming a tool the proposal isn't asking
+      // for means one of the two is wrong, and which one it is isn't guessable from here --
+      // so it goes back to the model rather than being silently reconciled. Refused in band,
+      // like the duplicate check below.
+      const missing = steps
+        .filter((s) => s.owner === "agent" && s.tool && !requiredTools.includes(s.tool))
+        .map((s) => `"${s.title}" needs ${s.tool}`);
+      if (missing.length > 0) {
+        return [
+          `Not created -- ${missing.length} step${missing.length === 1 ? "" : "s"} name a tool that isn't in requiredTools:`,
+          ...missing.map((m) => `  - ${m}`),
+          `requiredTools is: ${requiredTools.join(", ") || "(empty)"}`,
+          `The act phase is fenced to exactly requiredTools, so a step needing anything else cannot run. Either add the tool to requiredTools, or change that step's owner to "human" if a person has to do it.`,
+        ].join("\n");
+      }
+
       // Last line of defence against the same idea arriving under a new name. The research
       // prompt already lists the open queue, but advice loses to a good-sounding rewording --
       // this doesn't. Refused in-band (a normal tool result, not an exception) so the model
@@ -2089,6 +2230,9 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
         expectedUpside,
         requiredTools,
         goalId: store.resolveGoalId(domain),
+        revenueModel,
+        monetization,
+        steps,
       });
       return `Created proposal #${id}, status: pending. Stop here and wait for review -- do not act on it.`;
     }

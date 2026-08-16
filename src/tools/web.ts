@@ -71,8 +71,12 @@ export function htmlToText(html: string): string {
     .trim();
 }
 
-/** Blocks a fetch from being pointed at the machine's own network. */
-function assertPublicHttpUrl(raw: string): URL {
+/**
+ * Blocks a fetch from being pointed at the machine's own network. Exported because the
+ * declarative connectors in src/connectors/ resolve their request URLs from a manifest
+ * and need the same guarantee -- one check, not two that can drift.
+ */
+export function assertPublicHttpUrl(raw: string): URL {
   let url: URL;
   try {
     url = new URL(raw);

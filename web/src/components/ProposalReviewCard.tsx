@@ -4,6 +4,7 @@ import type { ProposalRow } from '../types'
 import { palette } from '../theme'
 import { timeAgo } from '../format'
 import { MarkdownLite } from './MarkdownLite'
+import { MonetizationSummary } from './MonetizationBlock'
 import { DecisionControls } from './DecisionControls'
 
 const { Title, Text } = Typography
@@ -31,6 +32,13 @@ export function ProposalReviewCard({ proposal }: { proposal: ProposalRow }) {
         </Space>
 
         <MarkdownLite text={proposal.description} style={{ maxWidth: 820 }} />
+
+        {/*
+          Compact on purpose — this card is where the decision is made, and the money path is
+          the part of it that used to be missing entirely. The full block (assumption,
+          validation signal, per-step detail) is one click away in the dialog.
+        */}
+        <MonetizationSummary proposal={proposal} />
 
         <Space size={40} wrap>
           <Statistic title="Expected cost" value={proposal.expected_cost} precision={2} prefix="$" />

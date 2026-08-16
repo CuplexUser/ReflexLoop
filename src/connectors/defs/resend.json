@@ -1,0 +1,33 @@
+{
+  "id": "resend",
+  "label": "Resend",
+  "baseUrl": "https://api.resend.com",
+  "docsUrl": "https://resend.com/docs/api-reference",
+  "auth": { "type": "bearer", "envVar": "RESEND_API_KEY" },
+  "encoding": "json",
+  "operations": [
+    {
+      "name": "resend_list_domains",
+      "risk": "read",
+      "description": "List verified sending domains. Check this before sending -- a send from an unverified domain fails. Read-only.",
+      "method": "GET",
+      "path": "/domains"
+    },
+    {
+      "name": "resend_send_email",
+      "risk": "write",
+      "description": "Send an email from a verified domain. Reaches real inboxes, so it is only usable when a proposal listing this tool has been approved.",
+      "method": "POST",
+      "path": "/emails",
+      "params": {
+        "from": { "type": "string", "in": "body", "required": true, "describe": "Sender, e.g. 'Name <hello@yourdomain.com>' -- the domain must be verified" },
+        "to": { "type": "string[]", "in": "body", "required": true, "describe": "Recipient addresses" },
+        "subject": { "type": "string", "in": "body", "required": true },
+        "html": { "type": "string", "in": "body", "describe": "HTML body; supply this or text" },
+        "text": { "type": "string", "in": "body", "describe": "Plain-text body; supply this or html" },
+        "replyTo": { "type": "string", "in": "body", "as": "reply_to" }
+      },
+      "result": { "id": "id" }
+    }
+  ]
+}

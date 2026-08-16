@@ -41,10 +41,13 @@ export function ToolFence({
   onChange?: (next: string[]) => void
 }) {
   const catalog = useToolCatalog()
-  const riskOf = (name: string): ToolRisk => catalog.get(name) ?? (catalog.size === 0 ? 'read' : 'unknown')
+  const riskOf = (name: string): ToolRisk => catalog.get(name)?.risk ?? (catalog.size === 0 ? 'read' : 'unknown')
   const writeCount = tools.filter((t) => riskOf(t) === 'write').length
   // Only meaningful once the catalog has loaded; before that everything looks unknown.
   const unknownTools = catalog.size === 0 ? [] : tools.filter((t) => !catalog.has(t))
+  // A connector tool whose key isn't set. Distinct from unknown: the name is real and the
+  // fence would grant it, but the act phase could only get "<KEY> is not set" back from it.
+  const unconfiguredTools = tools.filter((t) => catalog.get(t)?.configured === false)
 
   return (
     <div>
@@ -71,9 +74,11 @@ export function ToolFence({
             value={tools}
             onChange={(next: string[]) => onChange?.(next.map((t) => t.trim()).filter(Boolean))}
             placeholder="No tools — the act phase could create, commit or deploy nothing"
-            options={[...catalog.entries()].map(([name, risk]) => ({
-              value: name,
-              label: `${name.replace(/^mcp__(memory|integrations)__/, '')}${risk === 'write' ? '  ⚠ side-effecting' : ''}`,
+            options={[...catalog.values()].map((info) => ({
+              value: info.name,
+              label: `${info.name.replace(/^mcp__(memory|integrations)__/, '')}${
+                info.risk === 'write' ? '  ⚠ side-effecting' : ''
+              }${info.configured === false ? '  · no key set' : ''}`,
             }))}
             optionFilterProp="label"
             tokenSeparators={[',']}
@@ -87,6 +92,21 @@ export function ToolFence({
               description={`${unknownTools.join(', ')} — the act phase matches tools by exact name, so ${
                 unknownTools.length === 1 ? 'this one grants' : 'these grant'
               } nothing. Harmless, but check for a typo.`}
+            />
+          )}
+          {unconfiguredTools.length > 0 && (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginTop: 8 }}
+              message={`${unconfiguredTools.length} tool${
+                unconfiguredTools.length === 1 ? ' has' : 's have'
+              } no credential configured.`}
+              description={`${unconfiguredTools
+                .map((t) => t.replace(/^mcp__(memory|integrations)__/, ''))
+                .join(', ')} — the act phase will get "not set" back from ${
+                unconfiguredTools.length === 1 ? 'it' : 'them'
+              }. Set the key before approving, or narrow the fence.`}
             />
           )}
           {writeCount > 0 && (

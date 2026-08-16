@@ -1,0 +1,57 @@
+{
+  "id": "plausible",
+  "label": "Plausible",
+  "baseUrl": "https://plausible.io",
+  "docsUrl": "https://plausible.io/docs/stats-api",
+  "auth": { "type": "bearer", "envVar": "PLAUSIBLE_API_KEY" },
+  "encoding": "json",
+  "operations": [
+    {
+      "name": "plausible_aggregate",
+      "risk": "read",
+      "description": "Headline traffic numbers for a site over a period -- visitors, pageviews, bounce rate, visit duration. Use it to check whether something already shipped is getting traffic before proposing more work on it. Read-only.",
+      "method": "GET",
+      "path": "/api/v1/stats/aggregate",
+      "params": {
+        "siteId": { "type": "string", "in": "query", "as": "site_id", "required": true, "describe": "Domain as registered in Plausible, e.g. 'example.com'" },
+        "period": {
+          "type": "enum",
+          "in": "query",
+          "values": ["day", "7d", "30d", "month", "6mo", "12mo"],
+          "default": "30d"
+        },
+        "metrics": {
+          "type": "string",
+          "in": "query",
+          "default": "visitors,pageviews,bounce_rate,visit_duration",
+          "describe": "Comma-separated metric list"
+        }
+      },
+      "result": { "results": "results" }
+    },
+    {
+      "name": "plausible_breakdown",
+      "risk": "read",
+      "description": "Break a site's traffic down by a property -- referral source, page, country -- to see where visitors actually come from. Read-only.",
+      "method": "GET",
+      "path": "/api/v1/stats/breakdown",
+      "params": {
+        "siteId": { "type": "string", "in": "query", "as": "site_id", "required": true, "describe": "Domain as registered in Plausible" },
+        "property": {
+          "type": "string",
+          "in": "query",
+          "default": "visit:source",
+          "describe": "e.g. 'visit:source', 'event:page', 'visit:country'"
+        },
+        "period": {
+          "type": "enum",
+          "in": "query",
+          "values": ["day", "7d", "30d", "month", "6mo", "12mo"],
+          "default": "30d"
+        },
+        "limit": { "type": "integer", "in": "query", "default": 10 }
+      },
+      "result": { "results": "results" }
+    }
+  ]
+}
