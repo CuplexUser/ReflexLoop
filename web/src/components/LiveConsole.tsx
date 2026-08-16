@@ -9,6 +9,10 @@ function lineColor(type: AgentEvent['type']): string {
     case 'proposal_pending':
     case 'no_proposal':
       return palette.pending
+    // Not `pending` — an act phase that stopped partway through approved work is the one
+    // thing in this feed the operator has to act on, and it used to look like a clean finish.
+    case 'act_incomplete':
+      return palette.rejected
     case 'proposal_decided':
     case 'phase_done':
     case 'outcome_recorded':
@@ -49,6 +53,10 @@ function renderLine(event: AgentEvent): string {
       return event.toolCalls === 0
         ? `✗ no proposal — the research phase ran no tools and returned nothing; the model call likely failed`
         : `○ no proposal this cycle (${event.toolCalls} tool calls) — ${preview(event.reason, 300)}`
+    case 'act_incomplete':
+      // Spelled out rather than summarised: every entry here is a step of the approved plan
+      // that never ran, and the operator has to decide what to do about each one.
+      return `✗ proposal #${event.proposalId} act phase INCOMPLETE (${event.toolCalls} tool calls, ${event.stopReason}) — ${event.problems.join(' ')}`
     case 'cycle_idle':
       return `… idle until ${new Date(event.nextCycleAt).toLocaleTimeString()}`
     default:

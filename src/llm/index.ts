@@ -42,8 +42,35 @@ export { priceUsage, lookupPrice } from "./pricing.js";
 
 const DEFAULT_PROVIDER = "openrouter";
 
-/** Output cap per model call. Generous by default -- act phases write whole files. */
-export const MAX_OUTPUT_TOKENS = Number(process.env.AGENT_MAX_TOKENS ?? 8192);
+/**
+ * Reads a positive-integer env var, falling back to `fallback` for anything that isn't one.
+ *
+ * `??` alone is not enough here: a var that is present but *empty* -- `AGENT_MAX_TOKENS=` in
+ * a .env, which is how .env.example ships it -- is `""`, not `undefined`, so the default never
+ * applies and `Number("")` is 0. That shipped a `max_tokens: 0` on every single model call.
+ * OpenRouter happens to ignore it, which is the only reason it went unnoticed; a provider that
+ * honours it would cap every response at nothing.
+ */
+function positiveIntEnv(name: string, fallback: number): number {
+  const parsed = Number((process.env[name] ?? "").trim());
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+/**
+ * Output cap per model call.
+ *
+ * 8192 was the documented default and it is **not** enough: the largest successful act-phase
+ * commit in this agent's own history is a ~55k-character `github_commit_files` call, roughly
+ * 16k output tokens, and the whole point of the act phase is writing whole files in one call.
+ * It only ever worked because the bug above sent `max_tokens: 0` and OpenRouter ignored it --
+ * fixing the coercion without raising this would have turned a dormant bug into a live one
+ * that truncates every real build.
+ *
+ * 32768 clears the observed high-water mark with room to spare and is at or under the output
+ * limit of every model in providers.ts. OpenRouter clamps a too-large value to the model's own
+ * maximum rather than erroring; lower it here if you point the loop at a provider that doesn't.
+ */
+export const MAX_OUTPUT_TOKENS = positiveIntEnv("AGENT_MAX_TOKENS", 32768);
 
 /** The three phases that call a model. Matches the `phase` column in `runs`. */
 export type PhaseName = "research_plan" | "act" | "reflect";

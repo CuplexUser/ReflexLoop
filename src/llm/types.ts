@@ -85,9 +85,34 @@ export interface ChatResponse {
    * `null` means "price it yourself from the table" -- see pricing.ts.
    */
   reportedCostUsd: number | null;
+  /**
+   * The provider's own finish reason, verbatim. Read by {@link isTruncationStop} -- a
+   * turn that stopped because it ran out of output budget looks exactly like one that
+   * stopped because the model was done, and only this field tells them apart.
+   */
   stopReason: string;
   /** Adapter-owned native form of this turn; agent-loop carries it onto the assistant message. */
   providerRaw?: unknown;
+}
+
+/**
+ * Whether a provider's finish reason means "cut off mid-generation" rather than "finished".
+ *
+ * This matters because of how the loop decides a run is over: it stops when a turn comes
+ * back with no tool calls. A truncated turn also has no tool calls -- the model was still
+ * writing when the output budget ran out -- so without this check the two are the same
+ * event, and a phase that died halfway through reports success. That is exactly how
+ * proposal #27 created a repo, announced "now I'll write the full prototype", and finished
+ * clean with an empty repo and nothing committed.
+ *
+ * Matched case-insensitively and across vocabularies because OpenRouter passes the
+ * upstream provider's spelling straight through: OpenAI-compatible says `length`,
+ * Anthropic says `max_tokens`, Google says `MAX_TOKENS`.
+ */
+const TRUNCATION_STOPS = new Set(["length", "max_tokens", "max_output_tokens", "model_length", "token_limit"]);
+
+export function isTruncationStop(stopReason: string): boolean {
+  return TRUNCATION_STOPS.has(stopReason.trim().toLowerCase());
 }
 
 export interface LlmClient {

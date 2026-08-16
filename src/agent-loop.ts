@@ -16,6 +16,7 @@
 
 import { MAX_OUTPUT_TOKENS } from "./llm/index.js";
 import { priceUsage } from "./llm/pricing.js";
+import { isTruncationStop } from "./llm/types.js";
 import type { ChatMessage, LlmClient } from "./llm/types.js";
 import { getSearchConfig } from "./search/index.js";
 import type { ToolRegistry } from "./tools/registry.js";
@@ -40,12 +41,26 @@ export interface AgentRunOptions {
   onTurnCost?: (usd: number) => void;
 }
 
+/**
+ * Why the loop stopped.
+ *
+ * `truncated` is the one that used to be invisible. The loop ends a run when a turn comes
+ * back with no tool calls -- and a turn cut off at the output limit has no tool calls either,
+ * because the model was still writing when the budget ran out. Both adapters have always
+ * reported the provider's finish reason and nothing read it, so the two were the same event:
+ * a phase that died mid-sentence returned `end_turn` and its caller treated it as a clean
+ * finish. Callers that care whether the work actually got done must branch on this.
+ */
+export type AgentStopReason = "end_turn" | "max_turns" | "truncated";
+
 export interface AgentRunResult {
   /** The model's last text, i.e. what it said when it stopped calling tools. */
   finalText: string;
   costUsd: number;
   turns: number;
-  stopReason: "end_turn" | "max_turns";
+  stopReason: AgentStopReason;
+  /** The provider's own finish reason for the last turn, verbatim, for the log and the feed. */
+  providerStopReason: string;
 }
 
 /**
@@ -102,6 +117,7 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
   let costUsd = 0;
   let finalText = "";
   let turns = 0;
+  let lastStopReason = "";
 
   for (turns = 1; turns <= opts.maxTurns; turns++) {
     if (signal?.aborted) throw new Error("Aborted");
@@ -115,6 +131,7 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
       signal,
     });
 
+    lastStopReason = response.stopReason;
     const turnCost = priceUsage(client.provider, client.model, response.usage, response.reportedCostUsd);
     costUsd += turnCost;
     opts.onTurnCost?.(turnCost);
@@ -123,7 +140,32 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
       opts.onAssistantText?.(response.text);
     }
     if (response.toolCalls.length === 0) {
-      return { finalText, costUsd, turns, stopReason: "end_turn" };
+      // The one place "the model is done" and "the model was cut off" have to be told
+      // apart -- they arrive here identically. See AgentStopReason.
+      const truncated = isTruncationStop(response.stopReason);
+      if (truncated) {
+        console.warn(
+          `[agent-loop] the model's last turn was cut off at the output limit (${MAX_OUTPUT_TOKENS} tokens, finish_reason=${response.stopReason}) before it called any tool; the run stopped mid-task.`
+        );
+      }
+      return {
+        finalText,
+        costUsd,
+        turns,
+        stopReason: truncated ? "truncated" : "end_turn",
+        providerStopReason: response.stopReason,
+      };
+    }
+
+    // Truncated *with* tool calls is a different, self-correcting failure: the last call's
+    // argument JSON is incomplete, parseArgs hands the tool `{}`, and its zod schema returns
+    // a validation error the model can act on. Worth saying out loud anyway -- if the payload
+    // that overflowed is the one the task needs, the retry overflows the same way and the
+    // phase burns turns until the budget runs out.
+    if (isTruncationStop(response.stopReason)) {
+      console.warn(
+        `[agent-loop] turn ${turns} hit the ${MAX_OUTPUT_TOKENS}-token output limit mid-call; ${response.toolCalls.map((c) => c.name).join(", ")} may have incomplete arguments.`
+      );
     }
 
     messages.push({
@@ -192,5 +234,5 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
     }
   }
 
-  return { finalText, costUsd, turns: opts.maxTurns, stopReason: "max_turns" };
+  return { finalText, costUsd, turns: opts.maxTurns, stopReason: "max_turns", providerStopReason: lastStopReason };
 }

@@ -26,6 +26,11 @@ export type AgentEvent =
   // carried because zero of them means something different -- the phase never researched
   // anything, which is a failure, not a decision.
   | { type: "no_proposal"; reason: string; toolCalls: number }
+  // The act-phase counterpart, and the one that was missing: a phase that stopped partway
+  // through the approved plan emitted `phase_done` exactly like one that finished it. See
+  // act-verification.ts for how "partway" is decided and why it's the steps' declared tools
+  // rather than their `doneWhen` prose.
+  | { type: "act_incomplete"; proposalId: number; problems: string[]; toolCalls: number; stopReason: string }
   // The agent pointing at a lane it isn't allowed to enter. Surfaced live because a suggestion
   // sits inert until a human accepts it -- an operator who never sees it is a suggestion that
   // silently does nothing, which is the same as not having the tool.

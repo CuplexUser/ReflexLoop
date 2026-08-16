@@ -123,6 +123,9 @@ reported-cost path, and the deliberate $0-for-unknown-model behaviour). The adap
 aren't unit-tested — they're thin over HTTP, and a mock of a provider's wire format mostly tests the mock.
 `src/proposal-similarity.test.ts` (the duplicate check, against real proposals from the agent's
 own history — the pairs it must catch and the follow-up pair it must not).
+`src/act-verification.test.ts` (whether an act phase finished the approved plan, run against
+proposal #27's real step list and real tool calls — the case that motivated the module) and
+`src/llm/types.test.ts` (the truncation-vocabulary list, which a new provider can quietly break).
 `smoke-test.ts` runs end-to-end against a throwaway `./data/smoke-test.db`, and also builds the real tool
 registry and serializes every schema — which is the cheap way to catch a zod shape that can't be converted,
 since otherwise it surfaces as a provider 400 on the first live cycle.
@@ -172,6 +175,16 @@ so filling one in takes effect on the next cycle without a restart.
 baked into the code fails at the first API call with an opaque 404 instead of at startup with a message
 naming the provider and its model list. Don't add one.
 
+**`AGENT_MAX_TOKENS` defaults to 32768, and numeric env vars go through `positiveIntEnv`.** Two things
+were wrong here at once. `Number(process.env.X ?? default)` does not do what it looks like it does: a
+var that is present but empty — which is how `.env.example` ships this one — is `""`, not `undefined`,
+so the default never applies and `Number("")` is 0. Every model call shipped `max_tokens: 0`, and it
+went unnoticed only because OpenRouter ignores it. Fixing that alone would have been a *regression*:
+8192 was the documented default, and the largest successful act-phase commit in this agent's history is
+~16k output tokens, so the act phase only ever worked because the cap wasn't being applied. A low value
+here doesn't produce a smaller build, it produces one that stops mid-file. **Use `positiveIntEnv` for
+any new numeric env var** rather than `Number(... ?? d)`.
+
 ## Architecture
 
 ### The four-phase loop (`src/orchestrator.ts`)
@@ -219,8 +232,21 @@ Each cycle: **research + plan → human review → act → outcome + reflect**.
   proofread for syntax/import errors since there's no build step available to actually run the code, and
   re-read the real committed/deployed state before calling `outcome_record`. The whole grant is passed to
   `runAgent` as `allowedTools`, which is now the entire fence — see the note at the top of this file.
+
+  **The prompt asking for something is not the same as it having happened**, which is what
+  `verifyAct` (`act-verification.ts`) exists to close. Act used to be "done" the moment `runAgent`
+  returned, and `runAgent` returns whenever the model stops calling tools — so proposal #27 created a
+  repo, said "now I'll write the full prototype", returned no tool call, and the loop emitted
+  `phase_done`, reflected on a nonexistent outcome, and left an empty repo on the Deliverables page.
+  Now the run is checked against the approved plan and an incomplete one emits `act_incomplete`
+  (the act-phase counterpart of `no_proposal`), writes an orchestrator-authored failure outcome if the
+  agent recorded none, and tells reflect what actually went wrong. It is **not** a retry: re-running
+  act would repeat whatever side effects already landed, and side effects happening exactly once
+  inside an approved fence is the property the whole design rests on.
 - **reflect** (`reflectPhase`) — calls `lesson_search` first; reinforces an existing lesson via
   `lesson_reinforce` if this outcome confirmed/contradicted it, otherwise adds one new generalized lesson.
+  Takes act's verdict, so a phase that half-executed is described as the failure it was instead of
+  being announced as "has an outcome recorded now" when nothing recorded one.
 
 **Concurrency**: research runs one cycle at a time on `AGENT_CYCLE_INTERVAL_MS`. Every new proposal
 immediately starts waiting for review in parallel with any others already pending. Once approved, a
@@ -277,6 +303,16 @@ on). A directive is consumed — injected into one research prompt, then cleared
 - `agent-loop.ts` — the replacement for the SDK's `query()`: ask the model, run the tools it asked for,
   feed results back, repeat to `maxTurns`. Provider-agnostic (it only touches an `LlmClient`), and the
   place the tool fence is enforced.
+
+  **The loop ends when a turn has no tool calls — so it has to know *why* there are none.** A turn cut
+  off at the output limit has no tool calls either, because the model was still writing. Both adapters
+  had always reported the provider's finish reason and nothing read it, so the two were literally the
+  same event and a phase that died mid-sentence returned a clean `end_turn`. `AgentStopReason` now
+  carries a third value, `truncated`, decided by `isTruncationStop` in `llm/types.ts` — which matches
+  across vocabularies (`length`, `max_tokens`, `MAX_TOKENS`) because OpenRouter passes the upstream
+  provider's spelling straight through. **A new provider means checking that list.** Truncation *with*
+  tool calls is left to self-correct (the last call's JSON is incomplete, `parseArgs` hands the tool
+  `{}`, zod rejects it) but is warned about, since a payload that overflows once overflows on retry too.
 
   **Tool calls run concurrently only when the whole batch is pure reads** (`canRunConcurrently`, gated
   on `toolRisk`). Research is latency-bound on the network — one run in the ledger took 39 minutes,
@@ -463,6 +499,21 @@ on). A directive is consumed — injected into one research prompt, then cleared
   Connectors don't get a switch case: an operation declaring `deliverable` in its manifest is handled
   by one generic branch, since `result` has already shaped its response into a top-level `url`.
   Unit-tested (`deliverables.test.ts`) — it's pure functions over rows, no API key needed.
+- `act-verification.ts` — `verifyAct`: did the act phase do what the human approved? Pure functions
+  over the phase's tool calls plus the proposal's `steps_json`, in the same style as
+  `deliverables.ts`, so no store and no API key.
+
+  **It checks each agent-owned step's declared `tool`, not its `doneWhen` prose**, and that choice is
+  the module. `doneWhen` is free text a model wrote — proposal #27's happened to be machine-checkable
+  ("index.html + README.md + app.js are readable on the default branch") and the next one won't be, and
+  a verifier that parses natural language is wrong in both directions. The tool name is exact, it's
+  already what `proposal_create` cross-checks against `required_tools` at create time, and it's in
+  `actions.tool_name` verbatim — so this is the same invariant one phase later: a step said it needed
+  this tool and the fence was widened to allow it, therefore it must have run. A call that came back
+  `isError` doesn't count, or a `409 Git Repository is empty` would read as a completed commit.
+  Truncation, exhausted turns, a phase with zero tool calls, and a missing `outcome_record` are all
+  reported separately, because they call for different responses. `act-verification.test.ts` runs the
+  real #27 step list and tool calls through it.
 - `integrations/{github,vercel,netlify}.ts` + `integrations-server.ts` — thin API wrappers and the tools
   that expose them (`buildIntegrationsTools()`). Read-only tools (`github_read_repo`, `vercel_list_projects`, etc.) are free for the research
   phase to call. Write tools (`github_create_repo`, `vercel_deploy`, `netlify_deploy`, etc.) only work in

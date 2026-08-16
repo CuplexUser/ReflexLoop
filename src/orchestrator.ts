@@ -19,7 +19,8 @@
 // Run with: npx tsx src/orchestrator.ts
 
 import "dotenv/config";
-import { runAgent } from "./agent-loop.js";
+import { runAgent, type AgentStopReason } from "./agent-loop.js";
+import { verifyAct, type ActVerdict } from "./act-verification.js";
 import { describeClients, resolveLlmClients } from "./llm/index.js";
 import { isConsoleOnlyMode } from "./console-mode.js";
 import { getSearchConfig } from "./search/index.js";
@@ -172,6 +173,17 @@ const BASE_SYSTEM = [
   "Be concrete and honest. Estimates are estimates and must be labelled as such; recorded outcomes must be what actually happened, including failures.",
 ].join("\n");
 
+interface PhaseResult {
+  finalText: string;
+  costUsd: number;
+  toolCalls: number;
+  /** Every call the phase made, with the tool's own in-band error flag. Act verifies against this. */
+  calls: { name: string; isError: boolean }[];
+  /** How the run ended. `truncated` means the model was cut off, not that it finished. */
+  stopReason: AgentStopReason;
+  providerStopReason: string;
+}
+
 /**
  * Runs one phase to completion, logging every tool call and the phase's API spend.
  *
@@ -187,7 +199,7 @@ async function runPhase(opts: {
   maxTurns: number;
   proposalId: number | null;
   signal?: AbortSignal;
-}): Promise<{ finalText: string; costUsd: number; toolCalls: number }> {
+}): Promise<PhaseResult> {
   // An aborted run still gets its cost and duration logged below -- spend already
   // incurred counts against profit whether or not the phase finished.
   const startedAt = new Date().toISOString();
@@ -197,6 +209,10 @@ async function runPhase(opts: {
   // Returned so callers can tell "the model worked and concluded X" from "the model
   // returned nothing" -- both otherwise look like a phase that completed normally.
   let toolCalls = 0;
+  // The calls themselves, not just the count: act verifies the approved plan against them.
+  const calls: { name: string; isError: boolean }[] = [];
+  let stopReason: AgentStopReason = "end_turn";
+  let providerStopReason = "";
 
   // Unreachable in console-only mode -- nothing calls a phase there -- but the check keeps
   // that a stated invariant rather than a null dereference if something ever does.
@@ -222,16 +238,24 @@ async function runPhase(opts: {
         console.log(`[${opts.phase}] model: ${preview(text, 300)}`);
         emitAgentEvent({ type: "model_text", phase: opts.phase, proposalId: opts.proposalId, text });
       },
-      onToolCall: (toolName, input, output) => {
+      onToolCall: (toolName, input, output, isError) => {
         toolCalls++;
+        calls.push({ name: toolName, isError });
         store.logAction(opts.proposalId, opts.phase, toolName, input, output);
         console.log(`[${opts.phase}] tool: ${toolName} ${preview(input)}`);
         emitAgentEvent({ type: "tool_call", phase: opts.phase, proposalId: opts.proposalId, toolName, input });
       },
     });
     finalText = result.finalText;
+    stopReason = result.stopReason;
+    providerStopReason = result.providerStopReason;
     if (result.stopReason === "max_turns") {
       console.warn(`[${opts.phase}] hit the ${opts.maxTurns}-turn limit; stopping with whatever it had done so far.`);
+    }
+    if (result.stopReason === "truncated") {
+      console.warn(
+        `[${opts.phase}] the model was cut off at the output limit and never finished; treat this run as incomplete.`
+      );
     }
   } finally {
     // In the finally so an aborted or failed phase is still accounted for: the spend
@@ -249,7 +273,7 @@ async function runPhase(opts: {
     });
   }
 
-  return { finalText, costUsd, toolCalls };
+  return { finalText, costUsd, toolCalls, calls, stopReason, providerStopReason };
 }
 
 // ---- phase 1: research + plan -------------------------------------------
@@ -721,7 +745,21 @@ function approvedPlanBrief(proposal: ProposalRow): string[] {
   return lines;
 }
 
-async function actPhase(proposal: ProposalRow): Promise<void> {
+/**
+ * Runs the approved work, then checks that it actually got done.
+ *
+ * The check is the point. Before it, this function returned as soon as `runPhase` did and the
+ * loop went straight to reflect -- so an act phase that created a repo and then stopped, which
+ * is what happened to proposal #27, was indistinguishable from one that built and deployed the
+ * whole thing. The verdict is returned so the caller can hand reflect an honest description of
+ * what it is reflecting on; see act-verification.ts for what "done" is decided from.
+ *
+ * Deliberately **not** a retry. Re-running act on a phase that half-executed would repeat
+ * whatever side effects already landed, and the loop's whole safety story is that side effects
+ * happen once, inside a human-approved fence. An incomplete run is reported and left for the
+ * operator, exactly like a rejected proposal.
+ */
+async function actPhase(proposal: ProposalRow): Promise<ActVerdict> {
   const requiredTools = proposal.required_tools.split(",").map((s) => s.trim()).filter(Boolean);
   const readOnlyTools = availableIntegrationTools().read;
   const allowedTools = [
@@ -738,7 +776,7 @@ async function actPhase(proposal: ProposalRow): Promise<void> {
   const abortController = new AbortController();
   actAbortController = abortController;
 
-  await runPhase({
+  const result = await runPhase({
     phase: "act",
     proposalId: proposal.id,
     prompt: [
@@ -762,16 +800,70 @@ async function actPhase(proposal: ProposalRow): Promise<void> {
     // Only clear if this run still owns the slot -- a later act phase may have claimed it.
     if (actAbortController === abortController) actAbortController = null;
   });
+
+  const verdict = verifyAct(parseSteps(proposal), {
+    toolCalls: result.calls,
+    stopReason: result.stopReason,
+    providerStopReason: result.providerStopReason,
+  });
+  if (verdict.complete) return verdict;
+
+  console.warn(`[act] proposal #${proposal.id} did not complete:\n  - ${verdict.problems.join("\n  - ")}`);
+  emitAgentEvent({
+    type: "act_incomplete",
+    proposalId: proposal.id,
+    problems: verdict.problems,
+    toolCalls: result.toolCalls,
+    stopReason: result.stopReason,
+  });
+
+  // Only when the agent recorded nothing at all. If it *did* call outcome_record and the plan
+  // is still unfinished, its own account stands -- overwriting a self-reported outcome with a
+  // second row would double-count in the scoreboard, and the event above already says the plan
+  // didn't run. This row exists so the silent case stops being silent: #27's act phase left the
+  // ledger with no outcome whatsoever, which reads as "hasn't reported yet", forever.
+  //
+  // Written by the orchestrator rather than the model on purpose -- recording what actually
+  // happened is not a model-callable capability, and this is the same boundary the rest of the
+  // outcome bookkeeping already sits on.
+  if (!verdict.outcomeRecorded) {
+    store.recordOutcome({
+      proposalId: proposal.id,
+      actualRevenue: 0,
+      actualCost: result.costUsd,
+      success: false,
+      notes: [
+        "Recorded by the orchestrator, not the agent: the act phase ended without calling outcome_record.",
+        ...verdict.problems,
+      ].join(" "),
+    });
+    emitAgentEvent({ type: "outcome_recorded", proposalId: proposal.id });
+  }
+  return verdict;
 }
 
 // ---- phase 4: reflect ---------------------------------------------------
 
-async function reflectPhase(proposal: ProposalRow): Promise<void> {
+async function reflectPhase(proposal: ProposalRow, verdict?: ActVerdict): Promise<void> {
+  // Told the truth about what it's reflecting on. The old prompt asserted "has an outcome
+  // recorded now" unconditionally, which for #27 was simply false -- act had recorded nothing,
+  // and reflect was left to infer that from action_history_search or not at all.
+  const incomplete =
+    verdict && !verdict.complete
+      ? [
+          `The act phase did NOT complete the approved plan. What went wrong:\n  - ${verdict.problems.join("\n  - ")}`,
+          `Draw the lesson from that failure, not from an imagined success. A partial build -- a repo created but never filled, a deploy that never ran -- is a failure to record honestly, not a partial win.`,
+        ]
+      : [];
+
   await runPhase({
     phase: "reflect",
     proposalId: proposal.id,
     prompt: [
-      `Proposal #${proposal.id} in domain "${proposal.domain}" has an outcome recorded now.`,
+      verdict && !verdict.complete
+        ? `Proposal #${proposal.id} in domain "${proposal.domain}" has just finished its act phase.`
+        : `Proposal #${proposal.id} in domain "${proposal.domain}" has an outcome recorded now.`,
+      ...incomplete,
       `Call lesson_search for this domain first. If an existing lesson was confirmed or contradicted by this outcome, call lesson_reinforce on it instead of duplicating it.`,
       `Otherwise, call lesson_add exactly once with a generalized, reusable takeaway -- not a play-by-play retelling of what happened this one time.`,
     ].join("\n"),
@@ -836,10 +928,11 @@ async function drainQueue(): Promise<void> {
     if (next.wasScheduled) {
       emitAgentEvent({ type: "scheduled_run_starting", proposal: next.proposal });
     }
-    await actPhase(next.proposal);
+    const verdict = await actPhase(next.proposal);
     // Reflect only after an act phase that actually ran to completion -- an aborted or
     // failed act throws past this, so there's no outcome for it to draw a lesson from.
-    await reflectPhase(next.proposal);
+    // A phase that *ran* but didn't finish the plan still reflects, and now gets told so.
+    await reflectPhase(next.proposal, verdict);
   } catch (err) {
     console.error(`[act] proposal #${next.proposal.id} failed:`, err);
   } finally {
