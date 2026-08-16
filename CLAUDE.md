@@ -126,7 +126,8 @@ own history — the pairs it must catch and the follow-up pair it must not).
 `src/act-verification.test.ts` (whether an act phase finished the approved plan, run against
 proposal #27's real step list and real tool calls — the case that motivated the module) and
 `src/llm/types.test.ts` (the truncation-vocabulary list, which a new provider can quietly break),
-`src/shutdown.test.ts` (the teardown order, the grace period, and the forced second signal), and
+`src/shutdown.test.ts` (the teardown order, the grace period, and the forced second signal),
+`src/aborted.test.ts` (that both shapes of deliberate abort are recognized and a real failure isn't), and
 `src/agent-loop.test.ts` (the nudge — the exception to the no-loop-tests rule, see that module).
 `smoke-test.ts` runs end-to-end against a throwaway `./data/smoke-test.db`, and also builds the real tool
 registry and serializes every schema — which is the cheap way to catch a zod shape that can't be converted,
@@ -693,6 +694,18 @@ on). A directive is consumed — injected into one research prompt, then cleared
   state, because the signal itself is untestable here: Node on Windows emulates `SIGINT` as
   unconditional termination, so only a real console Ctrl-C is catchable and no test can fire one.
   `shutdown.test.ts` covers the sequence; the wiring in `orchestrator.ts` is the one line left over.
+
+  **An abort is not a failure, and `aborted.ts` is what lets the unwinding code say so.**
+  Interrupting a phase means throwing out of it, which reaches the same `catch` a provider 500
+  would — so a clean Ctrl-C printed `[act] proposal #30 failed:` and a stack trace pointing at our
+  own `abort()`, one line above `Bye.`. Two shapes have to be recognized, which is why this isn't
+  message-sniffing: fetch throws a `DOMException` named `AbortError` when the request is in flight,
+  and the loop throws `AbortedError` when it notices `signal.aborted` between calls. The
+  **`mainLoop().catch` at the bottom of `orchestrator.ts` is the one that mattered**: an abort
+  during research rejected all the way out to it, and it called `process.exit(1)` — racing the
+  shutdown sequence to the exit and winning, so the "clean" path exited 1 with the database closed
+  by process teardown. For the same reason the reactive trigger is `.catch`ed rather than `void`ed:
+  a floating rejection there took the process down mid-shutdown.
 - `events.ts` / `review-gateway.ts` / `server.ts` — the live layer under the web UI. `events.ts` is an
   in-process bus the orchestrator emits to; `server.ts` persists each event via `store.logEvent()` *then*
   rebroadcasts it over WebSocket with the same `{id, occurredAt}` the DB assigned, and serves the REST API

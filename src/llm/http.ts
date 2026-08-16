@@ -9,6 +9,7 @@
 // a bad model id or a malformed tool schema is returned immediately -- retrying it
 // just delays a failure the operator needs to see.
 
+import { AbortedError } from "../aborted.js";
 import { LlmError } from "./types.js";
 
 const MAX_ATTEMPTS = Number(process.env.AGENT_LLM_MAX_ATTEMPTS ?? 4);
@@ -17,7 +18,7 @@ const BASE_BACKOFF_MS = 1000;
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
-      reject(new Error("Aborted"));
+      reject(new AbortedError());
       return;
     }
     const timer = setTimeout(done, ms);
@@ -28,7 +29,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     }
     function onAbort() {
       clearTimeout(timer);
-      reject(new Error("Aborted"));
+      reject(new AbortedError());
     }
     signal?.addEventListener("abort", onAbort, { once: true });
   });
@@ -55,7 +56,7 @@ export async function postJson<T>(opts: {
   let lastError: LlmError | null = null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    if (opts.signal?.aborted) throw new Error("Aborted");
+    if (opts.signal?.aborted) throw new AbortedError();
 
     let res: Response;
     try {

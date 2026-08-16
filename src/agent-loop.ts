@@ -14,6 +14,7 @@
 // so the core invariant -- act can only touch what the approved proposal named -- is
 // enforced by the shape of the code rather than by configuration.
 
+import { AbortedError } from "./aborted.js";
 import { MAX_OUTPUT_TOKENS } from "./llm/index.js";
 import { priceUsage } from "./llm/pricing.js";
 import { isTruncationStop } from "./llm/types.js";
@@ -158,7 +159,7 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
   const observedCalls: ObservedCall[] = [];
 
   for (turns = 1; turns <= opts.maxTurns; turns++) {
-    if (signal?.aborted) throw new Error("Aborted");
+    if (signal?.aborted) throw new AbortedError();
 
     const response = await client.chat({
       system: opts.system,
@@ -240,14 +241,14 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
     const precomputed = canRunConcurrently(response.toolCalls, allowedTools, registry)
       ? await Promise.all(
           response.toolCalls.map(async (call) => {
-            if (signal?.aborted) throw new Error("Aborted");
+            if (signal?.aborted) throw new AbortedError();
             return registry.invoke(call.name, call.args);
           })
         )
       : null;
 
     for (const [index, call] of response.toolCalls.entries()) {
-      if (signal?.aborted) throw new Error("Aborted");
+      if (signal?.aborted) throw new AbortedError();
 
       // Results are consumed in the model's original call order regardless of which finished
       // first, so the transcript, the actions table and the console's activity feed read the

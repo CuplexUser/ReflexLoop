@@ -21,6 +21,7 @@
 import "dotenv/config";
 import { runAgent, type AgentRunOptions, type AgentStopReason } from "./agent-loop.js";
 import { verifyAct, type ActVerdict } from "./act-verification.js";
+import { isAbortError } from "./aborted.js";
 import { describeClients, resolveLlmClients } from "./llm/index.js";
 import { isTruncationStop } from "./llm/types.js";
 import { isConsoleOnlyMode } from "./console-mode.js";
@@ -996,7 +997,15 @@ async function drainQueue(): Promise<void> {
     // A phase that *ran* but didn't finish the plan still reflects, and now gets told so.
     await reflectPhase(next.proposal, verdict);
   } catch (err) {
-    console.error(`[act] proposal #${next.proposal.id} failed:`, err);
+    // An abort is the operator stopping this build, or the process shutting down -- both are
+    // things they asked for, so neither is an error. Reported as one, a clean Ctrl-C printed a
+    // stack trace pointing at our own abort() directly above "Bye.". The row stays `running`
+    // (markActStarted wrote it before the model was called) and the next startup reaps it.
+    if (isAbortError(err)) {
+      console.log(`[act] proposal #${next.proposal.id} interrupted; it is marked interrupted on the next start.`);
+    } else {
+      console.error(`[act] proposal #${next.proposal.id} failed:`, err);
+    }
   } finally {
     store.advanceOrClearSchedule(next.proposal.id, {
       recurring: Boolean(next.proposal.recurrence_ms),
@@ -1059,7 +1068,12 @@ function enqueueForReview(proposal: ProposalRow): void {
         await reflectOnRejectionPhase(decided);
       }
     } catch (err) {
-      console.error(`[review] proposal #${proposal.id} failed:`, err);
+      // Same as the act queue: a shutdown mid-rejection-reflect is not a failure of this review.
+      if (isAbortError(err)) {
+        console.log(`[review] proposal #${proposal.id} interrupted by shutdown.`);
+      } else {
+        console.error(`[review] proposal #${proposal.id} failed:`, err);
+      }
     }
   })();
 }
@@ -1167,7 +1181,15 @@ async function mainLoop() {
   });
   persistSettings = (patch) => store.saveSettings(patch);
   const server = startServer(store, SERVER_PORT);
-  onReactiveTrigger((t) => void handleReactiveTrigger(t.proposalId));
+  // Caught rather than voided: this runs a research phase under the shutdown signal, so a
+  // Ctrl-C during one rejected a floating promise and took the process down as an unhandled
+  // rejection -- mid-shutdown, before the handles were closed.
+  onReactiveTrigger((t) => {
+    handleReactiveTrigger(t.proposalId).catch((err: unknown) => {
+      if (isAbortError(err)) return;
+      console.error(`[reactive] proposal #${t.proposalId} failed:`, err);
+    });
+  });
   onRunNow(() => wakeCycle());
   onAbort((proposalId) => {
     if (actAbortController && runningProposalId === proposalId) {
@@ -1322,7 +1344,12 @@ function installSignalHandlers(server?: { close(): unknown }): void {
   }
 }
 
-mainLoop().catch((err) => {
+mainLoop().catch((err: unknown) => {
+  // Ctrl-C during a research cycle aborts the in-flight request, which rejects all the way out
+  // here -- and this path used to print the stack and `process.exit(1)` immediately, racing the
+  // shutdown sequence to the exit and beating it: a clean stop reported as a crash, with the
+  // database closed by process teardown rather than by us. The shutdown owns the exit; leave.
+  if (shuttingDown && isAbortError(err)) return;
   console.error(err);
   if (!shuttingDown) store.close();
   process.exit(1);
