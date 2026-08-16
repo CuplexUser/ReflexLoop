@@ -28,6 +28,9 @@ import { submitDecision, hasPendingDecision } from "./review-gateway.js";
 import { fireReactiveTrigger } from "./reactive-triggers.js";
 import { ALL_GRANTABLE_TOOLS, toolRisk } from "./tool-catalog.js";
 import { configuredConnectorTools, connectorOperation, connectorStatus } from "./connectors/load.js";
+import { listSettings, updateSettings } from "./settings.js";
+import { PROVIDERS, PROVIDER_IDS, resolveLlmClients } from "./llm/index.js";
+import { getSearchConfig } from "./search/index.js";
 import { buildDeliverables, type DeliverableOutcomeRow } from "./deliverables.js";
 import { isConsoleOnlyMode } from "./console-mode.js";
 import { CONSOLE_ONLY_WRITABLE_ROUTES, type ControlSettingsWriter } from "./control-settings-writer.js";
@@ -167,6 +170,65 @@ export function startServer(
   /** Which connectors exist and which are still missing a key, for the Agent control page. */
   app.get("/api/connectors", (_req, res) => {
     res.json(connectorStatus());
+  });
+
+  /**
+   * Operator settings, plus the two things the console can't work out for itself: which
+   * providers actually have a key in `.env`, and which search backends do. Without those the
+   * page would happily offer a provider whose key is missing, and the failure would surface an
+   * hour later on the next cycle instead of at the click.
+   */
+  app.get("/api/settings", (_req, res) => {
+    res.json({
+      settings: listSettings(),
+      providers: PROVIDER_IDS.map((id) => ({
+        id,
+        label: PROVIDERS[id].label,
+        hasKey: Boolean((process.env[PROVIDERS[id].apiKeyEnv] ?? "").trim()),
+        apiKeyEnv: PROVIDERS[id].apiKeyEnv,
+        modelsUrl: PROVIDERS[id].modelsUrl,
+      })),
+      searchKeys: {
+        tavily: Boolean((process.env.TAVILY_API_KEY ?? "").trim()),
+        brave: Boolean((process.env.BRAVE_API_KEY ?? "").trim()),
+      },
+    });
+  });
+
+  /**
+   * Saves a settings patch, or none of it.
+   *
+   * The `verify` callback is the guard that field validation can't provide: it re-resolves the
+   * LLM clients and the search config against the *already-applied* values, so a provider with
+   * no key, a model that resolves to nothing, or a search mode missing its key is rejected here
+   * -- with the message the startup check used to give -- rather than being saved and failing
+   * on the next cycle. `updateSettings` rolls back if it throws.
+   */
+  app.post("/api/settings", (req, res) => {
+    const patch = req.body as Record<string, unknown> | undefined;
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+      return res.status(400).json({ error: "Body must be an object of setting keys." });
+    }
+
+    // Scoped to what the patch actually touches. Verifying everything on every save would let
+    // an unrelated misconfiguration (no AGENT_MODEL yet) block an unrelated valid edit -- and
+    // that is the normal state of a fresh install, where the first thing you'd do is set the
+    // model from this very page. It also means console-only mode gets the model check rather
+    // than skipping it: resolveLlmClients() is a pure function of settings plus the API keys in
+    // .env, so it needs no running loop, and that mode is exactly where the next run's model
+    // gets configured.
+    const touched = Object.keys(patch);
+    const touchesModel = touched.some((k) => /model|provider/i.test(k));
+    const touchesSearch = touched.includes("searchProvider");
+
+    const { error } = updateSettings(patch, () => {
+      if (touchesModel) resolveLlmClients();
+      if (touchesSearch) getSearchConfig();
+      return null;
+    });
+    if (error) return res.status(400).json({ error });
+
+    res.json({ ok: true, settings: listSettings() });
   });
 
   app.get("/api/proposals", (_req, res) => {

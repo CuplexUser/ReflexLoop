@@ -17,6 +17,8 @@ import type {
   ResearchNoteRow,
   RunRow,
   SearchHit,
+  SettingView,
+  SettingsResponse,
   StatusResponse,
   ConnectorStatus,
   ToolInfo,
@@ -67,6 +69,10 @@ export const api = {
   status: () => getJson<StatusResponse>('/api/status'),
   tools: () => getJson<ToolInfo[]>('/api/tools'),
   connectors: () => getJson<ConnectorStatus[]>('/api/connectors'),
+  settings: () => getJson<SettingsResponse>('/api/settings'),
+  /** Applies a patch atomically -- the server rejects the whole thing if any value is bad. */
+  saveSettings: (patch: Record<string, string | number>) =>
+    send<{ ok: true; settings: SettingView[] }>('/api/settings', 'POST', patch),
   proposals: () => getJson<ProposalRow[]>('/api/proposals'),
   proposalActions: (id: number) => getJson<ActionRow[]>(`/api/proposals/${id}/actions`),
   proposalRuns: (id: number) => getJson<RunRow[]>(`/api/proposals/${id}/runs`),

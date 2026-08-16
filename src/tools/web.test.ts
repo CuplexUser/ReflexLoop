@@ -1,12 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resetSearchConfig } from "../search/index.js";
+import { resetSettings } from "../settings.js";
 import { buildWebTools, htmlToText } from "./web.js";
 import { ToolRegistry } from "./registry.js";
 
 beforeEach(() => {
-  // buildWebTools reads the search mode, which is cached after the first call.
-  resetSearchConfig();
+  // The search mode is a setting now, and settings.ts seeds itself from the environment on
+  // first read and then holds that value -- correct in production, where env doesn't change
+  // mid-process, but it means a later vi.stubEnv would otherwise be ignored. Reset both
+  // caches, in this order: the search config's own cache keys off the setting.
   vi.unstubAllEnvs();
+  resetSettings();
+  resetSearchConfig();
 });
 
 describe("htmlToText", () => {
@@ -34,20 +39,28 @@ describe("htmlToText", () => {
 });
 
 describe("buildWebTools", () => {
-  it("always registers WebFetch", () => {
+  // Registration used to be conditional on a search provider existing at startup, which
+  // quietly made the search mode restart-only: switching from native to tavily left no tool
+  // to call. Both tools are now always registered and the *mode* is read at use -- whether
+  // WebSearch is described to the model is decided per run in agent-loop.ts.
+  it("registers both tools whatever the search mode", () => {
     vi.stubEnv("AGENT_SEARCH_PROVIDER", "none");
-    expect(buildWebTools().map((t) => t.name)).toEqual(["WebFetch"]);
-  });
+    expect(buildWebTools().map((t) => t.name).sort()).toEqual(["WebFetch", "WebSearch"]);
 
-  it("registers WebSearch only when an HTTP search provider is configured", () => {
+    vi.stubEnv("AGENT_SEARCH_PROVIDER", "native");
+    expect(buildWebTools().map((t) => t.name).sort()).toEqual(["WebFetch", "WebSearch"]);
+
     vi.stubEnv("AGENT_SEARCH_PROVIDER", "tavily");
     vi.stubEnv("TAVILY_API_KEY", "test-key");
     expect(buildWebTools().map((t) => t.name).sort()).toEqual(["WebFetch", "WebSearch"]);
   });
 
-  it("registers no WebSearch tool in native mode -- the provider searches instead", () => {
-    vi.stubEnv("AGENT_SEARCH_PROVIDER", "native");
-    expect(buildWebTools().map((t) => t.name)).toEqual(["WebFetch"]);
+  it("reports in band when WebSearch is called with no HTTP provider behind it", async () => {
+    vi.stubEnv("AGENT_SEARCH_PROVIDER", "none");
+    const registry = new ToolRegistry(buildWebTools());
+    const result = await registry.invoke("WebSearch", { query: "anything" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("not configured");
   });
 });
 

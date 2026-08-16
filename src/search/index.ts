@@ -20,6 +20,7 @@
 // AGENT_SEARCH_PROVIDER selects; the default, "auto", picks the first that's usable:
 // Tavily, then Brave, then native, then none.
 
+import { getSetting } from "../settings.js";
 import { createBraveProvider } from "./brave.js";
 import { createTavilyProvider } from "./tavily.js";
 import type { SearchProvider } from "./types.js";
@@ -34,22 +35,34 @@ export interface SearchConfig {
   provider: SearchProvider | null;
 }
 
-let cached: SearchConfig | null = null;
+let cached: { signature: string; config: SearchConfig } | null = null;
+
+function signature(): string {
+  // The three inputs build() actually reads. Caching against them rather than a plain
+  // boolean means a mode changed from the console invalidates this by itself -- no
+  // subscription to wire up, and no way for the cache to outlive the setting that
+  // produced it.
+  return [
+    getSetting("searchProvider"),
+    (process.env.TAVILY_API_KEY ?? "").trim() ? "t" : "-",
+    (process.env.BRAVE_API_KEY ?? "").trim() ? "b" : "-",
+  ].join("|");
+}
 
 function build(): SearchConfig {
   const tavilyKey = (process.env.TAVILY_API_KEY ?? "").trim();
   const braveKey = (process.env.BRAVE_API_KEY ?? "").trim();
-  const requested = (process.env.AGENT_SEARCH_PROVIDER ?? "auto").trim().toLowerCase();
+  const requested = getSetting("searchProvider").trim().toLowerCase();
 
   const withTavily = (): SearchConfig => ({ mode: "tavily", provider: createTavilyProvider(tavilyKey) });
   const withBrave = (): SearchConfig => ({ mode: "brave", provider: createBraveProvider(braveKey) });
 
   switch (requested) {
     case "tavily":
-      if (!tavilyKey) throw new Error("AGENT_SEARCH_PROVIDER=tavily requires TAVILY_API_KEY.");
+      if (!tavilyKey) throw new Error("Search provider 'tavily' requires TAVILY_API_KEY in .env.");
       return withTavily();
     case "brave":
-      if (!braveKey) throw new Error("AGENT_SEARCH_PROVIDER=brave requires BRAVE_API_KEY.");
+      if (!braveKey) throw new Error("Search provider 'brave' requires BRAVE_API_KEY in .env.");
       return withBrave();
     case "native":
       return { mode: "native", provider: null };
@@ -61,14 +74,15 @@ function build(): SearchConfig {
       return { mode: "native", provider: null };
     default:
       throw new Error(
-        `AGENT_SEARCH_PROVIDER="${requested}" is not supported. Use one of: auto, tavily, brave, native, none.`
+        `Search provider "${requested}" is not supported. Use one of: auto, tavily, brave, native, none.`
       );
   }
 }
 
 export function getSearchConfig(): SearchConfig {
-  if (!cached) cached = build();
-  return cached;
+  const current = signature();
+  if (cached?.signature !== current) cached = { signature: current, config: build() };
+  return cached.config;
 }
 
 /** Test seam: forces the next getSearchConfig() to re-read the environment. */

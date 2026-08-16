@@ -161,26 +161,32 @@ export function buildWebTools(): ToolDefinition[] {
     ),
   ];
 
-  const { provider } = getSearchConfig();
-  if (provider) {
-    tools.push(
-      defineTool(
-        "WebSearch",
-        "Search the web and return ranked results with titles, URLs and snippets. Use it to find sources; follow up with WebFetch to read any result in full.",
-        {
-          query: z.string().describe("The search query"),
-          limit: z.number().int().positive().max(20).optional().describe("Maximum results to return (default 8)"),
-        },
-        async ({ query, limit }) => {
-          try {
-            return formatResults(query, await provider.search(query, limit ?? 8));
-          } catch (err) {
-            return { text: `Error searching for "${query}": ${err instanceof Error ? err.message : String(err)}`, isError: true };
-          }
+  // WebSearch is registered unconditionally, and resolves its provider inside the handler.
+  // It used to be registered only when a search provider existed at startup, which quietly
+  // made the search mode a restart-only setting: switching from native to tavily left no
+  // tool to call. Whether the model is *offered* WebSearch is decided per run in
+  // agent-loop.ts, which is also where native mode is turned on -- one place, read at use.
+  tools.push(
+    defineTool(
+      "WebSearch",
+      "Search the web and return ranked results with titles, URLs and snippets. Use it to find sources; follow up with WebFetch to read any result in full.",
+      {
+        query: z.string().describe("The search query"),
+        limit: z.number().int().positive().max(20).optional().describe("Maximum results to return (default 8)"),
+      },
+      async ({ query, limit }) => {
+        const { provider } = getSearchConfig();
+        if (!provider) {
+          return { text: "Error: web search is not configured. Use WebFetch on a known URL instead.", isError: true };
         }
-      )
-    );
-  }
+        try {
+          return formatResults(query, await provider.search(query, limit ?? 8));
+        } catch (err) {
+          return { text: `Error searching for "${query}": ${err instanceof Error ? err.message : String(err)}`, isError: true };
+        }
+      }
+    )
+  );
 
   return tools;
 }

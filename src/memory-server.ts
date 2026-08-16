@@ -1500,6 +1500,45 @@ export class MemoryStore {
     return out;
   }
 
+  /**
+   * Operator settings (settings.ts), stored in the same table under a `setting:` prefix.
+   *
+   * A prefix rather than a second table because these are the same kind of thing as the
+   * control keys -- an operator preference that outlives the process -- and because
+   * `loadControlSettings` above already ignores keys it doesn't recognise, so the two
+   * namespaces can't collide. Validation lives in settings.ts, not here: this returns the
+   * raw parsed values and lets the registry decide what is acceptable, so a setting whose
+   * range changes doesn't need a migration.
+   */
+  loadSettings(): Record<string, unknown> {
+    const rows = this.db
+      .prepare(`SELECT key, value FROM control_settings WHERE key LIKE 'setting:%'`)
+      .all() as unknown as { key: string; value: string }[];
+    const out: Record<string, unknown> = {};
+    for (const row of rows) {
+      try {
+        out[row.key.slice("setting:".length)] = JSON.parse(row.value);
+      } catch {
+        // Same stance as loadControlSettings: a hand-edited row falls back to the env
+        // value for that key rather than stopping the loop from starting.
+        console.warn(`[settings] ignoring unparseable setting "${row.key}"`);
+      }
+    }
+    return out;
+  }
+
+  saveSettings(patch: Record<string, unknown>): void {
+    const stmt = this.db.prepare(
+      `INSERT INTO control_settings (key, value, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    );
+    const at = now();
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === undefined) continue;
+      stmt.run(`setting:${key}`, JSON.stringify(value), at);
+    }
+  }
+
   /** Upserts each key present in the patch; `directive: null` clears it (a consumed directive). */
   saveControlSettings(patch: PersistedControl): void {
     const stmt = this.db.prepare(

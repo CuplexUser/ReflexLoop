@@ -242,6 +242,41 @@ export interface ToolInfo {
   configured: boolean
 }
 
+/** Where a setting's current value came from -- see src/settings.ts for the precedence. */
+export type SettingSource = 'database' | 'environment' | 'default'
+
+export interface SettingView {
+  key: string
+  label: string
+  help: string
+  group: 'loop' | 'search' | 'model'
+  type: 'integer' | 'string' | 'enum'
+  /** The env var this seeds from, and what an operator would have edited before. */
+  envVar: string
+  options?: string[]
+  min?: number
+  max?: number
+  /** True when '' is meaningful -- a per-phase override that inherits the base setting. */
+  allowsEmpty?: boolean
+  value: string | number
+  source: SettingSource
+}
+
+export interface ProviderInfo {
+  id: string
+  label: string
+  /** Whether this provider's key is present in .env. Keys deliberately never moved to the DB. */
+  hasKey: boolean
+  apiKeyEnv: string
+  modelsUrl: string
+}
+
+export interface SettingsResponse {
+  settings: SettingView[]
+  providers: ProviderInfo[]
+  searchKeys: { tavily: boolean; brave: boolean }
+}
+
 /** A declarative connector (src/connectors/defs/*.json) and whether its key is set. */
 export interface ConnectorStatus {
   id: string

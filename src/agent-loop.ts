@@ -89,8 +89,14 @@ function canRunConcurrently(calls: { name: string }[], allowedTools: string[], r
 
 export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
   const { client, registry, allowedTools, signal } = opts;
-  const tools = registry.schemas(allowedTools);
   const nativeSearch = wantsNativeSearch(client, allowedTools);
+  // The local WebSearch tool is always registered, so which modes actually offer it is
+  // decided here, per run, from the current setting -- that's what lets the search mode
+  // change without a restart. In `native` the provider searches server-side and describing
+  // a local tool as well would mean two searches; in `none` there is nothing behind it.
+  const describable =
+    getSearchConfig().provider === null ? allowedTools.filter((name) => name !== "WebSearch") : allowedTools;
+  const tools = registry.schemas(describable);
   const messages: ChatMessage[] = [{ role: "user", content: opts.prompt }];
 
   let costUsd = 0;

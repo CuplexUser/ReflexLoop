@@ -21,6 +21,7 @@
 
 import { DatabaseSync } from "node:sqlite";
 import type { PersistedControl } from "./memory-server.js";
+import { SETTINGS } from "./settings.js";
 
 /**
  * The keys console-only mode may persist -- domains, cycle interval, and the pause switch.
@@ -29,6 +30,9 @@ import type { PersistedControl } from "./memory-server.js";
  * the API refuses that route in this mode too -- this is the second of the two layers.
  */
 const WRITABLE_KEYS = new Set(["domains", "cycleIntervalMs", "paused"]);
+
+/** The settings registry is the allowlist -- see `saveSettings` below for why it isn't copied. */
+const WRITABLE_SETTING_KEYS = new Set<string>(SETTINGS.map((s) => s.key));
 
 /**
  * The API routes the above corresponds to. server.ts allows exactly these in console-only mode.
@@ -51,6 +55,7 @@ export const CONSOLE_ONLY_WRITABLE_ROUTES: RegExp[] = [
   /^\/goals\/\d+$/,
   /^\/goals\/\d+\/accept$/,
   /^\/goals\/\d+\/dismiss$/,
+  /^\/settings$/,
 ];
 
 /** Columns of `goals` this writer may set. Anything else in a patch is ignored, as with the keys above. */
@@ -92,6 +97,29 @@ export class ControlSettingsWriter {
     for (const [key, value] of Object.entries(patch)) {
       if (value === undefined || !WRITABLE_KEYS.has(key)) continue;
       stmt.run(key, JSON.stringify(value), at);
+    }
+  }
+
+  /**
+   * Upserts operator settings (settings.ts), under the same `setting:` prefix MemoryStore uses.
+   *
+   * The allowlist is `SETTINGS` itself rather than a second hand-written list -- the registry is
+   * already the definition of what a setting is, and a copy here would be one more pair of lists
+   * to keep in step. The narrowness that matters is still enforced: the prefix means no statement
+   * in this method can reach a control key, let alone another table.
+   *
+   * These belong in this mode for the same reason domains and interval do: they're what the next
+   * real run reads at startup, and this mode exists to set that up before starting it.
+   */
+  saveSettings(patch: Record<string, unknown>): void {
+    const stmt = this.db.prepare(
+      `INSERT INTO control_settings (key, value, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    );
+    const at = new Date().toISOString();
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === undefined || !WRITABLE_SETTING_KEYS.has(key)) continue;
+      stmt.run(`setting:${key}`, JSON.stringify(value), at);
     }
   }
 

@@ -81,6 +81,11 @@ there.
   runs next. Every tool call is logged, and every phase's model API cost is
   recorded so spend counts against profit — computed from token usage, or
   taken from the provider when it reports a real per-call charge.
+- `src/settings.ts` — operator settings stored in the database and editable
+  from the console's Settings page, so they no longer need a `.env` edit and
+  a restart. `.env` still seeds them; a value set in the console then wins.
+  Adding a setting is one entry in the registry — the API and the page are
+  driven off it. Secrets and bootstrap values are excluded on purpose.
 - `src/agent-loop.ts` — the agentic loop itself: ask the model, run the tools
   it asked for, feed the results back, repeat. This is also where each phase's
   tool fence is enforced — a tool outside the phase's grant is never described
@@ -251,6 +256,25 @@ npm run web:dev     # Vite dev server, proxies /api and /ws to the backend
 - **Agent control** — pause, run-now, abort, a one-shot research directive,
   and a connector list showing which are configured and which are still
   missing a key.
+- **Settings** — the knobs that used to need a `.env` edit and a restart:
+  the pending-proposal cap, the search mode, and the provider and model each
+  phase runs on (with per-phase overrides). Changes apply from the next
+  phase; a cycle already in flight finishes on the model it started with.
+
+  Every field says whether its value is coming from the database, `.env`, or
+  a built-in default — once a saved value beats `.env`, "I edited `.env` and
+  nothing happened" is otherwise a confusing few minutes. Saves are
+  all-or-nothing and verified before they commit: switching to a provider
+  whose key isn't in `.env`, or a search mode whose key is missing, is
+  refused at the click with the same message startup used to give, rather
+  than failing an hour later on the next cycle.
+
+  **API keys and secrets deliberately stayed in `.env`** — provider keys,
+  `GITHUB_TOKEN`, the connector keys. A leaked `agent.db` (or one of the
+  `.bak` files next to it) costs you the agent's memory; it shouldn't also
+  cost you a live Stripe key. The database path, port, bind host and
+  `AGENT_API_TOKEN` stay there too, for the plainer reason that you need the
+  database before you can read settings out of it.
 
 Approving or rejecting a proposal calls `POST /api/proposals/:id/decision`,
 which resolves that proposal's pending promise in `review-gateway.ts` —

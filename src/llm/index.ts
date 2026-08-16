@@ -22,7 +22,15 @@
 // stays a two-line .env. Provider and model override independently: setting only
 // AGENT_ACT_MODEL keeps the base provider and swaps the model on it, which is the
 // common case when both models live behind one OpenRouter key.
+//
+// All ten of those are now *settings* (settings.ts) rather than direct env reads, so
+// they can be changed from the console without a restart -- the env vars above are
+// what they seed from, and still what they fall back to. API keys deliberately did not
+// move: they stay in .env, so `buildClient` still reads the environment for those.
+// `resolveLlmClients()` is therefore called again on a settings change, and its throw
+// on a missing key is what the console's save-time verification catches.
 
+import { getSetting } from "../settings.js";
 import { AnthropicClient } from "./anthropic.js";
 import { OpenAiCompatibleClient } from "./openai-compatible.js";
 import { PROVIDERS, PROVIDER_IDS, isProviderId } from "./providers.js";
@@ -40,10 +48,11 @@ export const MAX_OUTPUT_TOKENS = Number(process.env.AGENT_MAX_TOKENS ?? 8192);
 /** The three phases that call a model. Matches the `phase` column in `runs`. */
 export type PhaseName = "research_plan" | "act" | "reflect";
 
-const PHASE_ENV_PREFIX: Record<PhaseName, string> = {
-  research_plan: "AGENT_RESEARCH",
-  act: "AGENT_ACT",
-  reflect: "AGENT_REFLECT",
+/** Per-phase override settings, and the env var each one seeds from (used only in error text). */
+const PHASE_OVERRIDES: Record<PhaseName, { provider: "researchProvider" | "actProvider" | "reflectProvider"; model: "researchModel" | "actModel" | "reflectModel"; envPrefix: string }> = {
+  research_plan: { provider: "researchProvider", model: "researchModel", envPrefix: "AGENT_RESEARCH" },
+  act: { provider: "actProvider", model: "actModel", envPrefix: "AGENT_ACT" },
+  reflect: { provider: "reflectProvider", model: "reflectModel", envPrefix: "AGENT_REFLECT" },
 };
 
 function env(name: string): string {
@@ -79,26 +88,26 @@ function resolveProviderId(value: string, source: string): ProviderId {
  * how many distinct models are actually in play.
  */
 export function resolveLlmClients(): Record<PhaseName, LlmClient> {
-  const baseProviderRaw = env("AGENT_PROVIDER") || DEFAULT_PROVIDER;
-  const baseProvider = resolveProviderId(baseProviderRaw.toLowerCase(), "AGENT_PROVIDER");
-  const baseModel = env("AGENT_MODEL");
+  const baseProviderRaw = getSetting("llmProvider") || DEFAULT_PROVIDER;
+  const baseProvider = resolveProviderId(baseProviderRaw.toLowerCase(), "Provider");
+  const baseModel = getSetting("llmModel").trim();
 
   const cache = new Map<string, LlmClient>();
   const clients = {} as Record<PhaseName, LlmClient>;
 
-  for (const phase of Object.keys(PHASE_ENV_PREFIX) as PhaseName[]) {
-    const prefix = PHASE_ENV_PREFIX[phase];
-    const providerRaw = env(`${prefix}_PROVIDER`);
+  for (const phase of Object.keys(PHASE_OVERRIDES) as PhaseName[]) {
+    const override = PHASE_OVERRIDES[phase];
+    const providerRaw = getSetting(override.provider).trim();
     const provider = providerRaw
-      ? resolveProviderId(providerRaw.toLowerCase(), `${prefix}_PROVIDER`)
+      ? resolveProviderId(providerRaw.toLowerCase(), `${override.envPrefix}_PROVIDER`)
       : baseProvider;
-    const model = env(`${prefix}_MODEL`) || baseModel;
+    const model = getSetting(override.model).trim() || baseModel;
 
     if (!model) {
       const spec = PROVIDERS[provider];
       throw new Error(
-        `No model configured for the ${phase} phase. Set AGENT_MODEL (used by every phase) ` +
-          `or ${prefix}_MODEL, to a model id ${spec.label} accepts -- its current list is at ${spec.modelsUrl}.`
+        `No model configured for the ${phase} phase. Set the base model (used by every phase) ` +
+          `or the ${phase} override, to a model id ${spec.label} accepts -- its current list is at ${spec.modelsUrl}.`
       );
     }
 

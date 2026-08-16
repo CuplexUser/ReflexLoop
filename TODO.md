@@ -20,8 +20,13 @@
 - [ ] Move large blobs/JSON out of SQLite (deferred -- see note below, not worth doing yet)
 - [ ] Code-split the frontend bundle (1.3MB / 415KB gzipped, one chunk -- Vite warns on every
       build). Not urgent for a localhost console, but it's the only build warning left.
+- [x] Move settings from `.env` into the database, editable in the console -- **slice 1 done**
+      (max pending proposals, search mode, provider/model incl. per-phase overrides). Remaining
+      slices in the note below; secrets and bootstrap values stay in `.env` by decision.
 - [x] Switch to npm workspaces
 - [x] Switch to Qdrant Cloud
+- [x] Declarative connectors + Stripe/Resend/Plausible/Cloudflare
+- [x] Monetization block + step list on every proposal
 
 ## Fix table column resize collapsing neighbouring columns
 
@@ -236,3 +241,133 @@ that would abort the wrong run, and it contradicts the serialization guarantee t
 rest of the design assumes. Concurrent dispatch of read-only tool calls within a turn
 is already implemented (`canRunConcurrently` in `agent-loop.ts`) and is where the
 free latency win actually was.
+
+## Move settings from `.env` into the database
+
+Investigated 2026-08-16; **slice 1 shipped the same day** (`src/settings.ts`, `/api/settings`,
+`web/src/pages/SettingsPage.tsx`). What shipped, and what is still open, is at the bottom of this
+note. The goal: fewer things that need a file edit and a
+restart, and a console that can change them. The finding: this is worth doing, but **not as
+one migration** — the ~32 env vars fall into four classes with genuinely different answers,
+and one of them (secrets) is a security decision rather than a refactor.
+
+### The rule that makes it work
+
+**Read at use, not at module load.** That is the whole "no restart" property, and most of the
+codebase currently violates it: `integrations/{github,vercel,netlify}.ts`, `qdrant.ts`,
+`server.ts` and `tools/web.ts` all capture `process.env.X` into a module-level `const`, which
+freezes the answer at import time. (It's also why those integration tests need a dynamic
+`await import()` to work at all.)
+
+`src/connectors/` was deliberately built the other way — `isConfigured()` and `authHeaders()`
+read the env on every call, and `configuredConnectorTools()` is a function the research phase
+re-invokes each cycle — specifically so a key filled in mid-run takes effect on the next call.
+**That is the shape to copy.** Anything converted to a DB setting has to be read through an
+accessor at the point of use, or the setting will appear to save and change nothing until a
+restart, which is worse than not moving it.
+
+### The four classes
+
+**1. Bootstrap — cannot move, don't try.**
+`AGENT_DB_PATH` (you need the database to read settings out of it), `AGENT_SERVER_PORT`,
+`AGENT_BIND_HOST`, `AGENT_CONSOLE_ONLY`, and `AGENT_API_TOKEN` — the last is a genuine
+chicken-and-egg, since the token gates the console that would edit it. These stay in `.env`
+and that's correct, not a gap.
+
+**2. Already done — the precedent to follow.**
+`AGENT_DOMAINS`, `AGENT_CYCLE_INTERVAL_MS` and pause already live in `control_settings`
+(key/JSON value) via `agent-control.ts`'s `persist` callback, with env as a *seed* for a fresh
+DB and the saved value winning after that. `mainLoop` re-reads control state each pass rather
+than closing over constants, which is exactly the "read at use" rule above. Everything below
+should extend this table and this pattern rather than inventing a second mechanism.
+
+**3. The easy wins — plain behavioural knobs, no secrets, real payoff.**
+In rough order of value:
+
+- `AGENT_MAX_PENDING_PROPOSALS` — a throttle you'd actually want to change while watching a
+  queue build up.
+- `AGENT_SEARCH_PROVIDER` — already has the seam: `getSearchConfig()` caches, and
+  `resetSearchConfig()` exists as a test hook. Note the one wrinkle: `native` mode changes
+  *whether the `WebSearch` tool is registered*, and the registry is built once at startup.
+  Same answer as connectors — register it always and let the mode decide at call time, or
+  accept that this one setting needs a restart and say so in the UI.
+- `AGENT_MODEL` / `AGENT_PROVIDER` and the per-phase overrides — high value (switching the act
+  model without a restart is a real workflow) but the most invasive: `llm/index.ts` resolves
+  clients once into `llmByPhase`. Needs a `resolveLlmClients()` re-run on change, and the
+  startup validation that produces the good "here is your provider's model list" error has to
+  move into the save path so a bad model id is rejected at the console, not at the next cycle.
+- `AGENT_TEMPERATURE`, `AGENT_MAX_TOKENS`, `AGENT_LLM_MAX_ATTEMPTS`, `AGENT_SCHEDULER_TICK_MS`,
+  `AGENT_WEBFETCH_*` — trivial once the accessor exists, low individual value.
+
+**4. Secrets — a decision, not a refactor.**
+Provider keys, `GITHUB_TOKEN`, and the connector keys are the ones most annoying to change
+today and the ones with a real cost to moving. Putting them in `data/agent.db` means plaintext
+credentials in a file that is *also* opened by console-only mode, copied into
+`agent.db.bak-*` files sitting next to it, and handed around as "the database". Today a leaked
+DB costs you the agent's memory; afterwards it costs you a Stripe key.
+
+If it's done: keep them in a separate table with an explicit `secret` flag, never return the
+value over `/api`(only `{set: true, hint: "sk_…3f9a"}`), never log it, and treat the backup
+files as secret-bearing. **Or** don't move them and instead close the actual gap, which is
+narrower than it looks: connector keys already take effect without a restart, so the only real
+friction left is having to open a file. A "which keys are missing" display — which the Agent
+control page now has — solves most of the pain at none of the risk.
+
+### Sketch of the mechanism
+
+A `settings` table alongside `control_settings` (or an extension of it), plus a declarative
+registry in code: key, type, default, `envVar` fallback, `secret?`, `restartRequired?`, and a
+validator. Resolution order **DB value → env → default**, through one `getSetting(key)`
+accessor that replaces the direct `process.env` reads. The registry then drives the console
+page for free — field types, help text, and an honest "needs a restart" badge on the few that
+do.
+
+Two constraints that are easy to miss:
+
+- **Console-only mode.** `ControlSettingsWriter` deliberately reaches exactly three keys of one
+  table and nothing else, and `CONSOLE_ONLY_WRITABLE_ROUTES` is the matching server allowlist.
+  A settings page means widening that writer — do it by extending its key allowlist, never by
+  relaxing the store to read/write. The whole design of that module is that the capability
+  added is the small one.
+- **Precedence has to be visible.** Once a DB value wins over `.env`, an operator editing
+  `.env` and seeing nothing happen is the confusing failure. The console should show, per
+  setting, whether the value came from the database, the environment, or the default — the same
+  problem `AGENT_DOMAINS` already has, where editing it after the console has set goals does
+  nothing.
+
+### What slice 1 actually shipped
+
+The registry + accessor, stored in `control_settings` under a `setting:` prefix (no new table --
+same key/JSON shape, and `loadControlSettings` already ignores keys it doesn't know). Settings
+moved: `AGENT_MAX_PENDING_PROPOSALS`, `AGENT_SEARCH_PROVIDER`, and `AGENT_PROVIDER`/`AGENT_MODEL`
+plus all six per-phase overrides.
+
+The overrides came along rather than being left for later on purpose: leaving them in `.env` while
+the base pair moved would have created exactly the silent-precedence trap this note warns about --
+set the model in the console, and an `AGENT_ACT_MODEL` line in `.env` would quietly win for the act
+phase with nothing saying so.
+
+Two things turned out to matter more than expected:
+
+- **`getSearchConfig()` had to become self-invalidating**, caching against a signature of its own
+  inputs rather than a boolean, and `buildWebTools()` had to stop registering `WebSearch`
+  conditionally. Conditional registration silently made the search mode restart-only: switching
+  from `native` to `tavily` left no tool to call. Whether the model is *offered* WebSearch is now
+  decided per run in `agent-loop.ts`, which is where native mode was already turned on.
+- **`verify` on the write path.** Field validation cannot catch a provider that is spelled
+  correctly and has no API key, which is the single most likely mistake on that page.
+  `updateSettings` takes a callback, runs it against the applied state, and rolls back -- and
+  `server.ts` scopes it to what the patch touched, so a missing `AGENT_MODEL` on a fresh install
+  doesn't block someone changing the proposal cap.
+
+### Still open
+
+- **Class 3 leftovers**: `AGENT_TEMPERATURE`, `AGENT_MAX_TOKENS`, `AGENT_LLM_MAX_ATTEMPTS`,
+  `AGENT_SCHEDULER_TICK_MS`, `AGENT_WEBFETCH_*`. Trivial now -- one registry entry each plus
+  switching the read site off `process.env`. `MAX_OUTPUT_TOKENS` in `llm/index.ts` is the one to
+  watch: it's a module-level const, so it needs the read-at-use treatment.
+- **`AGENT_CYCLE_INTERVAL_MS` and pause** are still on the Agent control page via
+  `agent-control.ts`, which predates this and works. Worth folding into the settings registry only
+  if a third mechanism starts to look likely -- not for tidiness.
+- **Secrets**: still `.env`, still the right call. Revisit only with a real answer for the backup
+  files and a `secret` flag that never returns the value over the API.

@@ -59,6 +59,7 @@ import {
 } from "./agent-control.js";
 import { startServer } from "./server.js";
 import { ControlSettingsWriter } from "./control-settings-writer.js";
+import { getSetting, initSettings, onSettingsChanged } from "./settings.js";
 
 const DOMAINS = (process.env.AGENT_DOMAINS ?? "micro-SaaS tool for developers (self-built and self-hosted),Chrome extension for developers,VS Code extension for developers")
   .split(",")
@@ -71,13 +72,25 @@ const CONSOLE_ONLY = isConsoleOnlyMode();
 const DB_PATH = process.env.AGENT_DB_PATH ?? "./data/agent.db";
 const CYCLE_INTERVAL_MS = Number(process.env.AGENT_CYCLE_INTERVAL_MS ?? 1000 * 60 * 60); // 1h default
 const SERVER_PORT = Number(process.env.AGENT_SERVER_PORT ?? 4001);
-const MAX_PENDING_PROPOSALS = Number(process.env.AGENT_MAX_PENDING_PROPOSALS ?? 5);
 // How often the scheduler checks for approved proposals whose next_run_at has
 // arrived (scheduled/recurring ones -- immediate approvals skip this and run
 // right away, see humanReviewPhase). Default: 15s.
 const SCHEDULER_TICK_MS = Number(process.env.AGENT_SCHEDULER_TICK_MS ?? 15_000);
 
 const store = new MemoryStore(DB_PATH, { readOnly: CONSOLE_ONLY });
+
+/**
+ * Where a settings write goes. Assigned below once the mode is known -- the real run writes
+ * through the store, console-only through its narrow `ControlSettingsWriter`. It starts as a
+ * no-op because settings have to be initialised before `resolveLlmClients()` runs at module
+ * scope, and nothing can save one until the API server is listening.
+ */
+let persistSettings: (patch: Record<string, unknown>) => void = () => {};
+
+// Before the LLM clients resolve, because provider and model are settings now: a stored
+// value has to win over the env var by the time the first client is built, or the console's
+// choice would apply only from the *second* start after it was made.
+initSettings({ stored: store.loadSettings(), persist: (patch) => persistSettings(patch) });
 
 /**
  * Config problems (no AGENT_MODEL, an unknown provider, a search mode whose key is
@@ -101,7 +114,25 @@ function loadConfigOrExit<T>(load: () => T): T {
 //
 // Null in console-only mode: no phase runs there, so requiring a provider key and a
 // valid AGENT_MODEL just to look at the database would defeat the point of the mode.
-const llmByPhase = CONSOLE_ONLY ? null : loadConfigOrExit(resolveLlmClients);
+//
+// `let`, because provider and model are settings the console can change. The rebuild below
+// is what makes that take effect without a restart -- phases read `llmByPhase[phase]` at the
+// moment they run, so a cycle already in flight finishes on the client it started with.
+let llmByPhase = CONSOLE_ONLY ? null : loadConfigOrExit(resolveLlmClients);
+
+onSettingsChanged((changed) => {
+  const touchesModels = Object.keys(changed).some((key) => key.toLowerCase().includes("model") || key.toLowerCase().includes("provider"));
+  if (!touchesModels || CONSOLE_ONLY) return;
+  try {
+    llmByPhase = resolveLlmClients();
+    console.log(`[settings] models now: ${describeClients(llmByPhase).join(", ")}`);
+  } catch (err) {
+    // The API verifies a model change before committing it, so reaching here means the
+    // rollback notification -- keep the clients that were working rather than leaving the
+    // loop with none.
+    console.warn(`[settings] keeping the previous model clients: ${err instanceof Error ? err.message : String(err)}`);
+  }
+});
 
 // One registry for the whole process; each phase gets a subset by name, never a
 // different registry. buildWebTools() contributes WebFetch always and WebSearch only
@@ -886,6 +917,10 @@ function serveConsoleOnly(): void {
     directive: saved.directive,
     persist: (patch) => settingsWriter.save(patch),
   });
+  // Settings are the same kind of thing as domains/interval/pause here: values the *next*
+  // real run reads at startup. They go through the same narrow writer, which has its own
+  // key allowlist -- the store stays read-only.
+  persistSettings = (patch) => settingsWriter.saveSettings(patch);
   startServer(store, SERVER_PORT, { settingsWriter });
 }
 
@@ -938,6 +973,7 @@ async function mainLoop() {
     directive: saved.directive,
     persist: (patch) => store.saveControlSettings(patch),
   });
+  persistSettings = (patch) => store.saveSettings(patch);
   startServer(store, SERVER_PORT);
   onReactiveTrigger((t) => void handleReactiveTrigger(t.proposalId));
   onRunNow(() => wakeCycle());
@@ -971,8 +1007,10 @@ async function mainLoop() {
 
     if (control.paused) {
       console.log("Loop is paused by the operator; skipping research this cycle.");
-    } else if (pendingCount >= MAX_PENDING_PROPOSALS) {
-      console.log(`${pendingCount} proposals already pending review (max ${MAX_PENDING_PROPOSALS}); skipping research this cycle.`);
+    } else if (pendingCount >= getSetting("maxPendingProposals")) {
+      console.log(
+        `${pendingCount} proposals already pending review (max ${getSetting("maxPendingProposals")}); skipping research this cycle.`
+      );
     } else {
       const proposals = await researchAndPlanPhase();
       if (proposals.length > 0) {

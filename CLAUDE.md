@@ -94,6 +94,13 @@ independently ignores any key or column outside its own two allowlists.
 `goal_id` across proposals, lessons, notes and runs, and this writer must not be able to reach those
 tables. Dismissing (status → `retired`) is the reversible equivalent and stays within `goals`.
 
+Settings (`src/settings.ts`) are writable here for the same reason: they're what the next real run
+reads at startup, and this is the mode you'd use to set it up before starting it. They go through the
+same writer, whose allowlist is the `SETTINGS` registry itself rather than a second hand-written list.
+Model validation is **not** skipped here — `resolveLlmClients()` is a pure function of settings plus
+the API keys in `.env`, so it needs no running loop, and this is precisely where the next run's model
+gets chosen.
+
 `directive`, run-now and abort are **excluded on purpose** even though a directive persists like the
 others: all three need a research loop, and this mode has none. Run-now especially would answer 200
 and wake nothing — a control that reports success and has no effect is worse than one that refuses.
@@ -504,6 +511,37 @@ on). A directive is consumed — injected into one research prompt, then cleared
 - `agent-control.ts` — runtime knobs (pause, run-now, abort, domains, interval, directive) plus the
   execution snapshot the console reads. Same in-process bus shape as `review-gateway.ts` and
   `reactive-triggers.ts`.
+- `settings.ts` — operator settings that used to need a `.env` edit and a restart: the pending-proposal
+  cap, the search mode, and the provider/model for each phase. Same shape as `agent-control.ts` on
+  purpose — in-memory state plus an injected `persist`, importing nothing from `MemoryStore` — and
+  stored in `control_settings` under a `setting:` prefix, so console-only mode can write them through
+  the same narrow `ControlSettingsWriter` rather than being handed the store.
+
+  **The rule the whole thing rests on: read at use, not at module load.** A setting captured into a
+  module-level const freezes at import time, so it would appear to save and change nothing until a
+  restart — worse than not moving it. `llm/index.ts` and `search/index.ts` now call `getSetting()` at
+  the point of use, `orchestrator.ts` rebuilds its clients on change, and `getSearchConfig()` caches
+  against a signature of its own inputs so it invalidates itself.
+
+  **Three guards on a write, and the third is the one that matters.** Per-field validation against the
+  registry; all-or-nothing (a half-applied model change is a configuration nobody asked for); and a
+  `verify` callback run against the already-applied state and rolled back if it fails. Only the third
+  can catch a provider that is spelled correctly but has no API key — `server.ts` supplies it by
+  re-resolving the LLM clients and the search config, scoped to what the patch actually touched, so an
+  unrelated misconfiguration can't block an unrelated valid edit. Moving model selection out of startup
+  was the risky half of this: startup validation gave an error naming the provider's model list, and
+  without `verify` the same mistake made from the console would surface an hour later as a 404.
+
+  **Precedence is stored > env > default, and `source` reports which won.** Once a stored value beats
+  `.env`, "I edited .env and nothing happened" is the confusing failure — the same one `AGENT_DOMAINS`
+  already had. Every field on the Settings page says where its value came from.
+
+  **Secrets and bootstrap values deliberately did not move.** Provider keys, `GITHUB_TOKEN` and the
+  connector keys stay in `.env`: a leaked `agent.db` (or one of the `.bak-*` files beside it) costs you
+  the agent's memory today and would cost you a live credential otherwise. `AGENT_DB_PATH`, the port,
+  the bind host and `AGENT_API_TOKEN` can't move at all — you need the database before you can read
+  settings out of it, and the token gates the console that would edit it. Adding a setting is one entry
+  in `SETTINGS`; the API, the source reporting and the page are all driven off it.
 - `events.ts` / `review-gateway.ts` / `server.ts` — the live layer under the web UI. `events.ts` is an
   in-process bus the orchestrator emits to; `server.ts` persists each event via `store.logEvent()` *then*
   rebroadcasts it over WebSocket with the same `{id, occurredAt}` the DB assigned, and serves the REST API
@@ -522,7 +560,14 @@ on an *approved* proposal — action type, an input-derived description, and a b
 the tool returned one; phase-filterable, click a row for full input/output JSON via `ActionDialog`),
 Economics (spend over time, spend by phase, spend by provider/model, per-domain scoreboard with
 forecast accuracy), Lessons, Research notes, **Goals**, Agent control (which also lists the
-connectors and which of them are still missing a key).
+connectors and which of them are still missing a key), **Settings**.
+
+**Settings is driven entirely off the registry** in `src/settings.ts` — label, help, type, range,
+options and the source of each value all come from the server, so adding a setting there needs no
+change in `SettingsPage.tsx`. It shows which providers actually have a key in `.env` (they never moved
+to the database), tags every field with where its value came from, and saves the *diff* rather than
+every field, because the server applies a patch atomically and sending everything would let one
+unrelated invalid value block an unrelated valid edit.
 
 **Goals is where the agent gets pointed**, and it replaced the newline-delimited textarea that used to
 live on Agent control (that card is now a link). Title and brief are separate fields, since the old one
