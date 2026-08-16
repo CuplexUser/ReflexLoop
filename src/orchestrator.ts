@@ -49,7 +49,7 @@ import {
   WRITE_INTEGRATION_TOOLS,
 } from "./tool-catalog.js";
 import { emitAgentEvent } from "./events.js";
-import { waitForDecision } from "./review-gateway.js";
+import { hasPendingDecision, waitForDecision } from "./review-gateway.js";
 import { onReactiveTrigger } from "./reactive-triggers.js";
 import {
   consumeDirective,
@@ -1018,8 +1018,40 @@ function schedulerTick(): void {
   }
 }
 
-/** Fire-and-forget: waits for this proposal's review independently of any others in flight. */
+/**
+ * Gives a review resolver to any pending proposal that doesn't have one.
+ *
+ * A proposal becomes visible the instant `proposal_create` writes the row, but it only becomes
+ * *decidable* when `enqueueForReview` puts a resolver in the review gateway -- and that used to
+ * happen only when the whole research phase returned. Since a phase routinely runs 10-15 minutes
+ * after filing its first proposal, the console showed a pending proposal that answered
+ * "No pending decision for this proposal" to every Approve click for the rest of the phase.
+ * That is what happened to #30: filed 19:32:14, still un-approvable at 19:37 because the phase
+ * that created it was still going.
+ *
+ * Written as a reconciliation sweep rather than a notification on create, because "the row is
+ * pending and nothing is waiting on it" is the condition that actually matters, and it has more
+ * causes than one: a research phase aborted midway, a reactive pass that threw, a decision
+ * endpoint that raced a restart. Fixing only the notification would leave the rest.
+ *
+ * Runs on the scheduler interval, so worst case a new proposal is decidable ~15s after it exists.
+ */
+function reviewSweep(): void {
+  for (const p of store.listPendingProposals()) {
+    enqueueForReview(p);
+  }
+}
+
+/**
+ * Fire-and-forget: waits for this proposal's review independently of any others in flight.
+ *
+ * Guarded, because a proposal now reaches here from two directions -- `reviewSweep` within
+ * seconds of it being written, and the research phase enqueueing everything it created when it
+ * finally returns. A second `waitForDecision` would replace the first resolver, stranding that
+ * promise and its `humanReviewPhase` forever.
+ */
 function enqueueForReview(proposal: ProposalRow): void {
+  if (hasPendingDecision(proposal.id)) return;
   void (async () => {
     try {
       const decided = await humanReviewPhase(proposal);
@@ -1187,7 +1219,10 @@ async function mainLoop() {
   // Catch up on anything already due (scheduled/recurring proposals whose time
   // arrived while the process was down), then keep checking on an interval.
   schedulerTick();
-  schedulerTimer = setInterval(schedulerTick, SCHEDULER_TICK_MS);
+  schedulerTimer = setInterval(() => {
+    schedulerTick();
+    reviewSweep();
+  }, SCHEDULER_TICK_MS);
   installSignalHandlers(server);
 
   while (!shuttingDown) {

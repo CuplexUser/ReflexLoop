@@ -217,7 +217,16 @@ Each cycle: **research + plan → human review → act → outcome + reflect**.
   it as a considered decision.
 - **human review** (`humanReviewPhase`) — emits a `proposal_pending` event and blocks on
   `waitForDecision()` (`review-gateway.ts`), resolved when a person clicks Approve/Reject in the web UI
-  (`POST /api/proposals/:id/decision`). Multiple proposals can be under review concurrently, each on its
+  (`POST /api/proposals/:id/decision`).
+
+  **A proposal becomes visible when the row is written and decidable only when a resolver exists**,
+  and those were far apart: `enqueueForReview` ran only when the whole research phase *returned*, so a
+  proposal filed 10 minutes into a 15-minute phase sat in the console answering "No pending decision
+  for this proposal" to every Approve click until the phase ended. `reviewSweep()` closes it on the
+  scheduler interval (~15s worst case). It's a reconciliation sweep, not a notification on create,
+  because "pending row, nothing waiting on it" has several causes — an aborted research phase, a
+  reactive pass that threw — and fixing only the create path would leave the rest. `enqueueForReview`
+  is idempotent via `hasPendingDecision`, since a proposal now arrives from both directions. Multiple proposals can be under review concurrently, each on its
   own promise. The decision can carry **scope edits** (`editedDescription`, `editedRequiredTools`);
   those are applied via `store.applyProposalEdits` *before* `decideProposal` flips the status, so a
   proposal is never approved while still carrying its pre-edit fence. `original_required_tools` /
