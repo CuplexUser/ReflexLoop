@@ -162,10 +162,16 @@ interface Accumulator {
   lastActivityAt: string;
   /** PR number -> artifact key, so a later merge can annotate the PR it merged. */
   pullRequests: Map<number, string>;
+  /** Supersede group ("vercel:project:production") -> the artifact key currently holding it. */
+  latestByGroup: Map<string, string>;
+}
+
+function artifactKey(artifact: DeliverableArtifact): string {
+  return `${artifact.kind}:${artifact.url}`;
 }
 
 function add(acc: Accumulator, artifact: DeliverableArtifact): void {
-  const key = `${artifact.kind}:${artifact.url}`;
+  const key = artifactKey(artifact);
   const existing = acc.artifacts.get(key);
   // Same URL seen twice (a deploy, then the read-back that confirms it): keep the
   // first sighting's identity but let a later, more specific detail win.
@@ -174,6 +180,26 @@ function add(acc: Accumulator, artifact: DeliverableArtifact): void {
     return;
   }
   acc.artifacts.set(key, artifact);
+}
+
+/**
+ * Add an artifact that *replaces* the last one in its group rather than joining it.
+ *
+ * Every Vercel deploy mints its own immutable deployment URL, so re-running a build
+ * added a row to the card each time -- proposal #30 accumulated three identical
+ * `automationsolver-play · production` links, which is growth without improvement:
+ * only the last one is what the project serves, and `vercel.deploy` now deletes the
+ * ones it superseded, so the earlier links are dead as well as redundant.
+ *
+ * The group is project + target, never just the project, because a preview deploy does
+ * not supersede production -- they are two different live things.
+ */
+function addSuperseding(acc: Accumulator, group: string, artifact: DeliverableArtifact): void {
+  const previous = acc.latestByGroup.get(group);
+  const key = artifactKey(artifact);
+  if (previous && previous !== key) acc.artifacts.delete(previous);
+  add(acc, artifact);
+  acc.latestByGroup.set(group, key);
 }
 
 /**
@@ -212,6 +238,7 @@ export function buildDeliverables(
         startedAt: action.occurred_at,
         lastActivityAt: action.occurred_at,
         pullRequests: new Map(),
+        latestByGroup: new Map(),
       };
       accs.set(action.proposal_id, acc);
     }
@@ -314,12 +341,14 @@ export function buildDeliverables(
         const url = str(out.url);
         acc.name = acc.name ?? str(input.projectName);
         if (url) {
-          add(acc, {
+          const project = str(input.projectName);
+          const target = str(input.target) ?? "preview";
+          addSuperseding(acc, `vercel:${project ?? url}:${target}`, {
             kind: "site",
             provider: "vercel",
-            label: str(input.projectName) ?? url,
+            label: project ?? url,
             url: withScheme(url),
-            detail: str(input.target) ?? "preview",
+            detail: target,
             ...at,
           });
         }

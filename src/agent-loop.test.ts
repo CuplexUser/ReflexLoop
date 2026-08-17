@@ -92,6 +92,36 @@ describe("runAgent nudge", () => {
     expect(result.stopReason).toBe("end_turn");
   });
 
+  it("trims a turn that overflowed the output limit and says what to do differently", async () => {
+    const spilled = "x".repeat(50_000);
+    const { client, seen } = scriptedClient([
+      { text: `Here is index.html:\n${spilled}`, stopReason: "length" },
+      { text: "ok", stopReason: "stop" },
+    ]);
+
+    await runAgent({
+      client,
+      registry: registry(),
+      system: "s",
+      prompt: "p",
+      allowedTools: ALLOWED,
+      maxTurns: 10,
+      nudge: ({ calls }) => (calls.length === 0 ? "Call github_commit_files now." : null),
+    });
+
+    const [replayed, nudge] = seen[1].slice(1);
+    // The cut-off fragment can't be committed and would crowd the context for every later
+    // turn, making the next overflow more likely -- only its opening is replayed.
+    expect(replayed.content.length).toBeLessThan(600);
+    expect(replayed.content).toContain("Here is index.html");
+    expect(replayed.content).toContain("cut off at the output limit");
+    expect(replayed.providerRaw).toBeUndefined();
+    // And the model is told the thing it doesn't otherwise know: repeating itself the same
+    // way overflows the same way.
+    expect(nudge.content).toContain("put them in the tool call itself");
+    expect(nudge.content).toContain("Call github_commit_files now.");
+  });
+
   it("sends the nudge as a user turn after the model's own, keeping the transcript intact", async () => {
     const { client, seen } = scriptedClient([ANNOUNCED_BUT_DID_NOTHING, { text: "ok", stopReason: "stop" }]);
 

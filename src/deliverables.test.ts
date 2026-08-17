@@ -100,6 +100,23 @@ describe("buildDeliverables", () => {
     expect(d.artifacts.filter((a) => a.kind === "site")).toHaveLength(2);
   });
 
+  // Proposal #30's card grew a row per re-run -- three identical
+  // "automationsolver-play · production" links, only the last of which the project served.
+  it("keeps only the newest deploy of a project+target, but never across targets", () => {
+    const rows = [
+      action(`${P}vercel_deploy`, { projectName: "play", target: "production" }, plainText({ url: "https://play-one.vercel.app" })),
+      action(`${P}vercel_deploy`, { projectName: "play", target: "preview" }, plainText({ url: "https://play-prev.vercel.app" })),
+      action(`${P}vercel_deploy`, { projectName: "play", target: "production" }, plainText({ url: "https://play-two.vercel.app" })),
+      action(`${P}vercel_deploy`, { projectName: "play", target: "production" }, plainText({ url: "https://play-three.vercel.app" })),
+    ];
+
+    const [d] = buildDeliverables(rows, [proposal], []);
+    const sites = d.artifacts.filter((a) => a.kind === "site");
+
+    expect(sites.map((a) => a.url)).toEqual(["https://play-prev.vercel.app", "https://play-three.vercel.app"]);
+    expect(d.siteUrl).toBe("https://play-three.vercel.app");
+  });
+
   it("ignores failed calls, unapproved proposals, and proposals that built nothing linkable", () => {
     const rows = [
       action(`${P}github_create_repo`, { name: "nope" }, plainText("Error: GITHUB_TOKEN is not set")),

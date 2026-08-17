@@ -89,6 +89,41 @@ const MAX_NUDGES = 2;
  */
 const EMPTY_TURN_PLACEHOLDER = "(no output)";
 
+/**
+ * How much of a cut-off turn is replayed to the model when it gets nudged.
+ *
+ * A turn that overflowed the output limit without calling a tool is a model writing a file
+ * out as prose instead of putting it in the tool call -- 32k tokens of an unfinished
+ * something. Replaying it verbatim is the worst of both: the fragment is unusable (nothing
+ * can be committed from it), and it stays in the context window for every remaining turn,
+ * making the *next* turn more likely to overflow the same way. Only the opening survives,
+ * as a reminder of what it was starting, and the instruction below says what to do instead.
+ */
+const TRUNCATED_REPLAY_CHARS = 400;
+
+function truncatedTurnSummary(text: string): string {
+  const head = text.trim().slice(0, TRUNCATED_REPLAY_CHARS);
+  return head === ""
+    ? EMPTY_TURN_PLACEHOLDER
+    : `${head}…\n\n[cut off at the output limit; the rest of this message was dropped]`;
+}
+
+/**
+ * Prefixed to the caller's nudge when the turn ended by overflowing rather than by stopping.
+ *
+ * Without it the model is told "you didn't finish, do X" -- advice it already agreed with, and
+ * following it the same way overflows again. What it actually needs to know is that long
+ * content belongs in the tool call, in pieces small enough to land.
+ */
+function truncationNudge(): string {
+  return (
+    `Your previous message ran past the ${MAX_OUTPUT_TOKENS}-token output limit and was cut off before ` +
+    `you called any tool, so none of it was saved and it has been trimmed out of this conversation. ` +
+    `Don't write file contents or long explanations as a message -- put them in the tool call itself, ` +
+    `and split the work into several smaller calls (a large file per call, not the whole build in one).`
+  );
+}
+
 export interface AgentRunResult {
   /** The model's last text, i.e. what it said when it stopped calling tools. */
   finalText: string;
@@ -198,14 +233,24 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
           : null;
       if (message) {
         nudgesUsed++;
-        console.warn(`[agent-loop] the model stopped without finishing; nudging (${nudgesUsed}/${MAX_NUDGES}).`);
-        messages.push({
-          role: "assistant",
-          content: response.text || EMPTY_TURN_PLACEHOLDER,
-          toolCalls: [],
-          providerRaw: response.providerRaw,
-        });
-        messages.push({ role: "user", content: message });
+        console.warn(
+          `[agent-loop] the model ${truncated ? "was cut off mid-message" : "stopped without finishing"}; nudging (${nudgesUsed}/${MAX_NUDGES}).`
+        );
+        // `providerRaw` is deliberately dropped on the truncation path: the Anthropic adapter
+        // replays it in preference to `content`, so keeping it would put the whole cut-off
+        // turn straight back into the request the trimming exists to keep small. There are no
+        // tool_use blocks in it to preserve -- that is what makes this the truncation path.
+        messages.push(
+          truncated
+            ? { role: "assistant", content: truncatedTurnSummary(response.text), toolCalls: [] }
+            : {
+                role: "assistant",
+                content: response.text || EMPTY_TURN_PLACEHOLDER,
+                toolCalls: [],
+                providerRaw: response.providerRaw,
+              }
+        );
+        messages.push({ role: "user", content: truncated ? `${truncationNudge()}\n\n${message}` : message });
         continue;
       }
 

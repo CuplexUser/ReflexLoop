@@ -22,7 +22,7 @@ import "dotenv/config";
 import { runAgent, type AgentRunOptions, type AgentStopReason } from "./agent-loop.js";
 import { verifyAct, type ActVerdict } from "./act-verification.js";
 import { isAbortError } from "./aborted.js";
-import { describeClients, resolveLlmClients } from "./llm/index.js";
+import { describeClients, getLlmClients } from "./llm/index.js";
 import { isTruncationStop } from "./llm/types.js";
 import { isConsoleOnlyMode } from "./console-mode.js";
 import { getSearchConfig } from "./search/index.js";
@@ -117,25 +117,24 @@ function loadConfigOrExit<T>(load: () => T): T {
 // no build step to catch mistakes, and reflect is two short memory calls. See the
 // AGENT_*_PROVIDER / AGENT_*_MODEL overrides in llm/index.ts.
 //
-// Null in console-only mode: no phase runs there, so requiring a provider key and a
+// Skipped in console-only mode: no phase runs there, so requiring a provider key and a
 // valid AGENT_MODEL just to look at the database would defeat the point of the mode.
 //
-// `let`, because provider and model are settings the console can change. The rebuild below
-// is what makes that take effect without a restart -- phases read `llmByPhase[phase]` at the
-// moment they run, so a cycle already in flight finishes on the client it started with.
-let llmByPhase = CONSOLE_ONLY ? null : loadConfigOrExit(resolveLlmClients);
+// Resolved here only to fail fast on a bad .env; the phases don't hold on to the result.
+// `getLlmClients()` re-derives itself whenever the provider/model settings change, so each
+// phase picks up a console change when it starts -- a cycle already in flight finishes on
+// the client it started with, and nothing depends on a notification arriving.
+if (!CONSOLE_ONLY) loadConfigOrExit(getLlmClients);
 
 onSettingsChanged((changed) => {
   const touchesModels = Object.keys(changed).some((key) => key.toLowerCase().includes("model") || key.toLowerCase().includes("provider"));
   if (!touchesModels || CONSOLE_ONLY) return;
+  // Purely the log line: the switch itself happens in getLlmClients(), whether or not this
+  // runs. An operator who changed a model wants to see that it landed.
   try {
-    llmByPhase = resolveLlmClients();
-    console.log(`[settings] models now: ${describeClients(llmByPhase).join(", ")}`);
+    console.log(`[settings] models now: ${describeClients(getLlmClients()).join(", ")}`);
   } catch (err) {
-    // The API verifies a model change before committing it, so reaching here means the
-    // rollback notification -- keep the clients that were working rather than leaving the
-    // loop with none.
-    console.warn(`[settings] keeping the previous model clients: ${err instanceof Error ? err.message : String(err)}`);
+    console.warn(`[settings] could not resolve the new model: ${err instanceof Error ? err.message : String(err)}`);
   }
 });
 
@@ -220,8 +219,11 @@ async function runPhase(opts: {
   let providerStopReason = "";
 
   // Unreachable in console-only mode -- nothing calls a phase there -- but the check keeps
-  // that a stated invariant rather than a null dereference if something ever does.
-  if (!llmByPhase) throw new Error("No model client: this process is running console-only (--console-only).");
+  // that a stated invariant rather than a confusing config error if something ever does.
+  if (CONSOLE_ONLY) throw new Error("No model client: this process is running console-only (--console-only).");
+  // Read once, at the top: the phase runs on one model from here to the ledger row below,
+  // even if the operator changes the setting while it's in flight.
+  const client = getLlmClients()[opts.phase];
 
   emitAgentEvent({ type: "phase_start", phase: opts.phase, proposalId: opts.proposalId });
 
@@ -231,7 +233,7 @@ async function runPhase(opts: {
 
   try {
     const result = await runAgent({
-      client: llmByPhase[opts.phase],
+      client,
       registry,
       system: opts.system,
       prompt: opts.prompt,
@@ -281,7 +283,6 @@ async function runPhase(opts: {
     // This is also what a graceful shutdown exists to reach -- an unhandled Ctrl-C skips
     // every finally in the process, so the whole cycle's spend simply disappeared.
     console.log(`[${opts.phase}] done in ${((Date.now() - t0) / 1000).toFixed(1)}s, cost $${costUsd.toFixed(4)}`);
-    const client = llmByPhase[opts.phase];
     store.logRun(opts.proposalId, opts.phase, costUsd, Date.now() - t0, startedAt, client.provider, client.model);
     emitAgentEvent({
       type: "phase_done",
@@ -1149,7 +1150,7 @@ async function mainLoop() {
 
   const search = getSearchConfig();
   console.log(`Agent runner starting. DB: ${DB_PATH}`);
-  console.log(`Models: ${describeClients(llmByPhase!).join(", ")}. Web search: ${search.mode}.`);
+  console.log(`Models: ${describeClients(getLlmClients()).join(", ")}. Web search: ${search.mode}.`);
   if (search.mode === "none") {
     console.warn(
       "[search] No web search is configured -- research will run on WebFetch and the read-only " +

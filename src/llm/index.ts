@@ -1,8 +1,10 @@
 // src/llm/index.ts
 //
-// Resolves the LlmClient(s) from the environment, once, at startup. Phases take a
-// client as a parameter, so a phase can never quietly reach for a model other than
-// the one the operator configured for it.
+// Resolves the LlmClient(s) the phases run on. Phases take a client as a parameter,
+// so a phase can never quietly reach for a model other than the one the operator
+// configured for it -- and they take it from `getLlmClients()` at the moment they
+// start, so a model changed in the console applies to the next phase rather than the
+// next process.
 //
 // AGENT_PROVIDER picks the provider (default: openrouter -- one key reaches Claude,
 // GPT, Grok and Kimi, and it reports real per-call cost so the Economics page stays
@@ -148,6 +150,36 @@ export function resolveLlmClients(): Record<PhaseName, LlmClient> {
   }
 
   return clients;
+}
+
+/** Every setting `resolveLlmClients` reads, so a change to any of them invalidates the cache. */
+const MODEL_SETTING_KEYS = [
+  "llmProvider",
+  "llmModel",
+  ...Object.values(PHASE_OVERRIDES).flatMap((o) => [o.provider, o.model]),
+] as const;
+
+let cached: { signature: string; clients: Record<PhaseName, LlmClient> } | null = null;
+
+/**
+ * The clients a phase should run on *right now*.
+ *
+ * Same self-invalidating shape as `getSearchConfig()`, and for the same reason: a settings
+ * change has to reach the loop without a restart, and hanging that on a change notification
+ * means the loop keeps a stale model whenever the notification doesn't arrive -- a failure
+ * with no symptom except the model quietly not being the one the console says it is.
+ * Resolving from the current settings at the moment a phase starts has no such gap; the cache
+ * only exists so this isn't rebuilt per call, and it is keyed on the settings themselves.
+ *
+ * A phase already running keeps the client it started with -- the caller reads this once, at
+ * the top of the phase. Changing model mid-phase would leave one transcript split across two.
+ */
+export function getLlmClients(): Record<PhaseName, LlmClient> {
+  const signature = MODEL_SETTING_KEYS.map((key) => getSetting(key)).join(" ");
+  if (!cached || cached.signature !== signature) {
+    cached = { signature, clients: resolveLlmClients() };
+  }
+  return cached.clients;
 }
 
 /** One line per distinct model in use, for the startup log. */

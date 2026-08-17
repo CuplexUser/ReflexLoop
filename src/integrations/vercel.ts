@@ -6,6 +6,9 @@
 // supports small inline text files (the deployments API's `files[].data`
 // field), which fits what this agent would realistically produce: a static
 // tool, a landing page, a small app scaffold -- not binary assets.
+//
+// deploy waits for the new deployment to finish building and then deletes the
+// ones it superseded (same project, same target, older) -- see pruneSuperseded.
 
 const VERCEL_TOKEN = process.env.VERCEL_TOKEN;
 const API = "https://api.vercel.com";
@@ -56,6 +59,103 @@ export interface DeployFile {
   content: string;
 }
 
+export interface DeploymentSummary {
+  id: string;
+  url: string;
+  /** Vercel reports a preview deployment's target as null; normalized here. */
+  target: "production" | "preview";
+  createdAt: number;
+}
+
+export async function listDeployments(projectName: string, limit = 100): Promise<DeploymentSummary[]> {
+  const data = await vc<{ deployments: { uid: string; url: string; target?: string | null; created: number }[] }>(
+    `/v6/deployments?app=${encodeURIComponent(projectName)}&limit=${limit}`
+  );
+  return data.deployments.map((d) => ({
+    id: d.uid,
+    url: `https://${d.url}`,
+    target: d.target === "production" ? "production" : "preview",
+    createdAt: d.created,
+  }));
+}
+
+export async function deleteDeployment(id: string): Promise<void> {
+  await vc(`/v13/deployments/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+async function deploymentState(id: string): Promise<string> {
+  const d = await vc<{ readyState?: string; status?: string }>(`/v13/deployments/${encodeURIComponent(id)}`);
+  return d.readyState ?? d.status ?? "UNKNOWN";
+}
+
+const READY_POLL_INTERVAL_MS = 3000;
+const READY_POLL_TIMEOUT_MS = 90_000;
+const TERMINAL_STATES = new Set(["READY", "ERROR", "CANCELED", "DELETED"]);
+
+/**
+ * Wait for a deployment to stop building. `POST /deployments` answers immediately with
+ * QUEUED, which is not enough to act on: the pruning below deletes what this deployment
+ * replaces, and doing that while it is still building would take the site down if the
+ * build then fails. Returns the last state seen -- a timeout is reported, not thrown,
+ * since the deploy itself already succeeded.
+ */
+async function waitForTerminalState(id: string, initial: string): Promise<string> {
+  let state = initial;
+  const deadline = Date.now() + READY_POLL_TIMEOUT_MS;
+  while (!TERMINAL_STATES.has(state) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, READY_POLL_INTERVAL_MS));
+    try {
+      state = await deploymentState(id);
+    } catch {
+      return state; // A transient read failure isn't worth failing a good deploy over.
+    }
+  }
+  return state;
+}
+
+/**
+ * Delete the deployments this one just replaced.
+ *
+ * Every deploy mints a new immutable URL, so without this a project accumulates one
+ * live-looking site per build (proposal #30 had three), all but the newest of which is
+ * stale content still reachable by anyone holding the link. Scoped to the same project
+ * *and* target, and only to deployments older than the new one -- a preview must not
+ * delete production, and the deployment now serving the project must survive.
+ *
+ * Best-effort by construction: it runs after the deploy has succeeded, so a failure here
+ * is reported in `cleanup` and never turns a good deploy into a failed tool call.
+ */
+async function pruneSuperseded(
+  projectName: string,
+  target: "production" | "preview",
+  keepId: string,
+  state: string
+): Promise<{ removed: string[]; cleanup: string | null }> {
+  if (state !== "READY") {
+    return { removed: [], cleanup: `new deployment is ${state}, so earlier ${target} deployments were left in place` };
+  }
+  try {
+    const all = await listDeployments(projectName);
+    const keep = all.find((d) => d.id === keepId);
+    const stale = all.filter(
+      (d) => d.id !== keepId && d.target === target && (keep === undefined || d.createdAt < keep.createdAt)
+    );
+    const removed: string[] = [];
+    const failed: string[] = [];
+    for (const d of stale) {
+      try {
+        await deleteDeployment(d.id);
+        removed.push(d.url);
+      } catch {
+        failed.push(d.url);
+      }
+    }
+    return { removed, cleanup: failed.length === 0 ? null : `could not delete ${failed.join(", ")}` };
+  } catch (err) {
+    return { removed: [], cleanup: `could not list earlier deployments: ${(err as Error).message}` };
+  }
+}
+
 export async function deploy(projectName: string, files: DeployFile[], target: "production" | "preview" = "preview") {
   const data = await vc<{ id: string; url: string; readyState: string }>(`/v13/deployments`, {
     method: "POST",
@@ -66,5 +166,7 @@ export async function deploy(projectName: string, files: DeployFile[], target: "
       projectSettings: { framework: null },
     }),
   });
-  return { id: data.id, url: `https://${data.url}`, status: data.readyState };
+  const status = await waitForTerminalState(data.id, data.readyState);
+  const { removed, cleanup } = await pruneSuperseded(projectName, target, data.id, status);
+  return { id: data.id, url: `https://${data.url}`, status, removedDeployments: removed, cleanup };
 }

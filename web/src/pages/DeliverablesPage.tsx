@@ -342,17 +342,6 @@ export function DeliverablesPage({
         </Text>
       </Space>
 
-      {/* Deployments behind a provider's access wall look identical to broken ones from here,
-          and the agent has hit that repeatedly -- say so once rather than per card. */}
-      {liveCount > 0 && (
-        <Alert
-          type="info"
-          showIcon
-          closable
-          message="A live URL that opens on a login wall isn't broken — it's the provider gating it (Vercel Deployment Protection), which only you can turn off in their dashboard."
-        />
-      )}
-
       {error !== null && (
         <Alert
           type="error"

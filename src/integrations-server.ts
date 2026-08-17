@@ -147,7 +147,7 @@ export function buildIntegrationsTools(): ToolDefinition[] {
 
   const vercelDeploy = defineTool(
     "vercel_deploy",
-    "Deploy a small set of files to Vercel. Only usable when a proposal listing this tool has been approved. Files are inline text (no binaries).",
+    "Deploy a small set of files to Vercel, wait for the build to finish, and delete the older deployments of the same project and target that this one replaces. Only usable when a proposal listing this tool has been approved. Files are inline text (no binaries).",
     {
       projectName: z.string(),
       files: z.array(z.object({ path: z.string(), content: z.string() })).min(1),

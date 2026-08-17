@@ -342,6 +342,15 @@ on). A directive is consumed — injected into one research prompt, then cleared
   `agent-loop.test.ts` is the deliberate exception to "don't unit-test the loop": this is loop logic
   driven through our own `LlmClient` interface, not a mock of anyone's wire format.
 
+  **A nudge after a *truncated* turn is a different nudge.** A turn that overflowed the output
+  limit without calling a tool is a model writing a file out as prose instead of putting it in the
+  call — telling it "you didn't finish, do X" is advice it already agrees with, and following it the
+  same way overflows again. So that path says what to do differently (content goes in the tool call,
+  split across smaller calls) and replays only the first `TRUNCATED_REPLAY_CHARS` of the cut-off
+  turn: the fragment can't be committed from, and keeping 32k of it in context makes the *next* turn
+  likelier to overflow too. `providerRaw` is dropped there on purpose — the Anthropic adapter
+  replays it in preference to `content`, which would put the whole turn back.
+
   **Tool calls run concurrently only when the whole batch is pure reads** (`canRunConcurrently`, gated
   on `toolRisk`). Research is latency-bound on the network — one run in the ledger took 39 minutes,
   almost all of it WebSearch/WebFetch in series — so this is free wall-clock. The bar is deliberately
@@ -546,6 +555,16 @@ on). A directive is consumed — injected into one research prompt, then cleared
   filtered: an abandoned build's repo is still a real thing the operator needs to open, usually
   to clean it up, and hiding the card recreates the original problem from the other side.
 
+  **A re-run supersedes, it doesn't accumulate.** Every Vercel deploy mints its own immutable
+  deployment URL, so re-running a build added a row to the card each time — #30 carried three
+  identical `automationsolver-play · production` links, only the last of which the project
+  served. `addSuperseding` keeps the newest per project **and target**: a preview does not
+  supersede production, they're two different live things. The other half is in
+  `integrations/vercel.ts`, where `deploy` waits for the new deployment to reach `READY` and then
+  deletes the older ones it replaced — waiting first is what keeps a failed build from taking the
+  live site down with it, and a cleanup failure is reported in the result rather than failing a
+  deploy that already succeeded.
+
   **Dispatching a build by hand** is `POST /api/proposals/:id/rerun`, offered from two places:
   the Deliverables card (which *is* the empty repo — finding out a build stopped and restarting
   it shouldn't be two screens) and `ProposalDialog`, which covers a proposal that produced no
@@ -658,8 +677,17 @@ on). A directive is consumed — injected into one research prompt, then cleared
   **The rule the whole thing rests on: read at use, not at module load.** A setting captured into a
   module-level const freezes at import time, so it would appear to save and change nothing until a
   restart — worse than not moving it. `llm/index.ts` and `search/index.ts` now call `getSetting()` at
-  the point of use, `orchestrator.ts` rebuilds its clients on change, and `getSearchConfig()` caches
-  against a signature of its own inputs so it invalidates itself.
+  the point of use and `getSearchConfig()` / `getLlmClients()` cache against a signature of their own
+  inputs so they invalidate themselves.
+
+  **Self-invalidation, not a change notification.** `runPhase` used to run on a module-level
+  `llmByPhase` that an `onSettingsChanged` listener rebuilt, which meant a model change reached the
+  loop only if that one notification arrived — and a missed one has no symptom except the loop
+  quietly running a model the console says it isn't. `getLlmClients()` re-derives from the current
+  settings instead, so the next phase to start picks the change up whatever happened to the event;
+  the listener that remains only logs. **A phase already running keeps its client** — it's read once
+  at the top of `runPhase` and reused for the ledger row, so a mid-phase change can't split one
+  transcript across two models or misattribute the spend.
 
   **Three guards on a write, and the third is the one that matters.** Per-field validation against the
   registry; all-or-nothing (a half-applied model change is a configuration nobody asked for); and a
