@@ -93,14 +93,24 @@ export function startServer(
    * Re-reads goals from the DB into control state after any mutation. A full re-read rather than
    * patching the in-memory copy: the table is the source of truth, and re-reading it is the one
    * update that cannot disagree with it.
+   *
+   * Also wakes the loop, the same signal the "Run cycle now" button sends. Research already reads
+   * goals fresh every cycle -- what it didn't have was a way to start that cycle *now* rather than
+   * at the end of whatever interval was already in flight, so a goal added or edited mid-interval
+   * sat unresearched for however long was left of it. A no-op if the loop is mid-cycle already
+   * (the next cycle picks the change up regardless) or if nothing is listening, as in
+   * console-only mode.
    */
-  const refreshGoals = () => setGoals(store.listGoals().map((g) => ({
-    id: g.id,
-    title: g.title,
-    brief: g.brief,
-    status: g.status,
-    weight: g.weight,
-  })));
+  const refreshGoals = () => {
+    setGoals(store.listGoals().map((g) => ({
+      id: g.id,
+      title: g.title,
+      brief: g.brief,
+      status: g.status,
+      weight: g.weight,
+    })));
+    requestRunNow();
+  };
 
   if (API_TOKEN) {
     app.use("/api", (req: Request, res: Response, next: NextFunction) => {

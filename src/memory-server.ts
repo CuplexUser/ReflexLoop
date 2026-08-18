@@ -1145,10 +1145,21 @@ export class MemoryStore {
     this.db.prepare(`UPDATE proposals SET act_status = 'running', act_problems = NULL WHERE id = ?`).run(id);
   }
 
-  /** Records what `verifyAct` concluded once the act phase returned. */
+  /**
+   * Records what `verifyAct` concluded once the act phase returned.
+   *
+   * Also clears `review_status` back to null (Unreviewed): that column is the human's verdict
+   * on the deliverable as it stood after the *previous* act phase, and a rerun -- from the
+   * Deliverables page's Retry button or a recurring proposal coming due again -- just replaced
+   * that deliverable with a new attempt. Leaving a stale "Needs refinement" (or "MVP done") tag
+   * sitting on it would describe a build that no longer exists rather than prompting the fresh
+   * look the new one deserves. Runs whether the new attempt completed or not: either way it's a
+   * different state than what earned the old verdict. A no-op for a first-time build, which is
+   * already null.
+   */
   recordActVerdict(id: number, verdict: { complete: boolean; problems: string[] }) {
     this.db
-      .prepare(`UPDATE proposals SET act_status = ?, act_problems = ? WHERE id = ?`)
+      .prepare(`UPDATE proposals SET act_status = ?, act_problems = ?, review_status = NULL WHERE id = ?`)
       .run(verdict.complete ? "complete" : "incomplete", verdict.problems.length ? JSON.stringify(verdict.problems) : null, id);
   }
 

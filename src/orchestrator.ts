@@ -967,6 +967,12 @@ function isQueuedOrRunning(id: number): boolean {
 function enqueueDue(proposal: ProposalRow, wasScheduled: boolean): void {
   if (isQueuedOrRunning(proposal.id)) return;
   runQueue.push({ proposal, wasScheduled });
+  // Reported here, not just when the worker picks something up: `drainQueue` returns
+  // immediately (a no-op) whenever the worker is already busy, so without this a proposal
+  // queued behind a running build sat in `runQueue` for the build's whole 8-32 minutes
+  // without ever showing in `/api/queue`'s "queued" list -- the console's Build queue page
+  // looked like it never held more than the one thing already running.
+  reportExecutionState(runningProposalId, runQueue.map((r) => r.proposal.id));
   void drainQueue();
 }
 
