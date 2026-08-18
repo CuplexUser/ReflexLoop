@@ -919,7 +919,23 @@ async function reflectPhase(proposal: ProposalRow, verdict?: ActVerdict): Promis
         ]
       : [];
 
-  await runPhase({
+  const result = await runPhase({
+    // Reflect's own counterpart to act's nudge: a turn that ends before `lesson_search` has
+    // run once isn't "nothing worth recording", it's the phase never having looked. Proposal
+    // #30's reflect pass did exactly this -- zero tool calls, 3.3 seconds, $0 -- because its act
+    // phase had already logged the relevant lesson itself (act keeps the same memory-tool grant
+    // reflect does) and the model apparently took that as license to skip its own turn entirely.
+    // Unlike act's nudge this doesn't name outstanding steps -- reflect has no plan to check
+    // against -- so it just insists on the one call the prompt already requires before ending is
+    // allowed. Search-then-decide-nothing-more-is-needed still counts as done: this only catches
+    // the phase skipping the search itself.
+    nudge: ({ calls }) => {
+      if (calls.some((c) => c.name === "mcp__memory__lesson_search")) return null;
+      return [
+        `Stop. You have not called lesson_search yet, and this reflect pass does not end until you have.`,
+        `Call lesson_search for this domain now. If it turns up a lesson this outcome confirmed or contradicted, call lesson_reinforce on it; otherwise call lesson_add exactly once.`,
+      ].join("\n");
+    },
     phase: "reflect",
     proposalId: proposal.id,
     prompt: [
@@ -935,6 +951,16 @@ async function reflectPhase(proposal: ProposalRow, verdict?: ActVerdict): Promis
     maxTurns: REFLECT_MAX_TURNS,
     signal: shutdownController.signal,
   });
+
+  // The nudge above gives the model two chances to search before the phase is allowed to end;
+  // if it still never did, that's the same "phase completed without doing its job" failure
+  // research (`no_proposal`) and act (`act_incomplete`) both surface as an event rather than
+  // leaving it visible only in stdout. Not raised on the nudge itself, only on the phase
+  // actually ending having never searched -- a nudged phase that recovers is not incomplete.
+  if (!result.calls.some((c) => c.name === "mcp__memory__lesson_search")) {
+    console.warn(`[reflect] proposal #${proposal.id} ended without ever calling lesson_search.`);
+    emitAgentEvent({ type: "reflect_incomplete", proposalId: proposal.id, toolCalls: result.toolCalls });
+  }
 }
 
 // ---- concurrency: parallel review, priority-ordered serialized act+reflect --

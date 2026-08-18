@@ -377,6 +377,7 @@ export type AgentEvent =
       stopReason: string
       providerStopReason?: string
     }
+  | { type: 'reflect_incomplete'; proposalId: number; toolCalls: number }
   | { type: 'cycle_idle'; nextCycleAt: string }
 
 export interface QueuedBuild {

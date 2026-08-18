@@ -12,6 +12,7 @@ function lineColor(type: AgentEvent['type']): string {
     // Not `pending` — an act phase that stopped partway through approved work is the one
     // thing in this feed the operator has to act on, and it used to look like a clean finish.
     case 'act_incomplete':
+    case 'reflect_incomplete':
       return palette.rejected
     case 'proposal_decided':
     case 'phase_done':
@@ -59,6 +60,10 @@ function renderLine(event: AgentEvent): string {
       return `✗ proposal #${event.proposalId} act phase INCOMPLETE (${event.toolCalls} tool calls, ${event.stopReason}${
         event.providerStopReason ? `/${event.providerStopReason}` : ''
       }) — ${event.problems.join(' ')}`
+    case 'reflect_incomplete':
+      // Zero tool calls here specifically means lesson_search never ran -- the reflect prompt
+      // requires it before anything else, so a phase that ended without it recorded nothing.
+      return `✗ proposal #${event.proposalId} reflect phase ended without calling lesson_search (${event.toolCalls} tool calls) — no lesson recorded`
     case 'cycle_idle':
       return `… idle until ${new Date(event.nextCycleAt).toLocaleTimeString()}`
     default:

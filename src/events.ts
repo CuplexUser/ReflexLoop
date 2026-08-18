@@ -41,6 +41,13 @@ export type AgentEvent =
       stopReason: string;
       providerStopReason?: string;
     }
+  // The reflect-phase counterpart to `no_proposal`/`act_incomplete`: a reflect pass that ended
+  // without ever calling lesson_search recorded nothing and looked exactly like one that
+  // finished normally -- proposal #30's reflect phase did this in 3.3 seconds for $0, with no
+  // signal anywhere that it hadn't done its job. `orchestrator.ts`'s reflect nudge gives it two
+  // chances to search before this fires, so this means the phase genuinely never looked, not
+  // that it looked and decided there was nothing to add.
+  | { type: "reflect_incomplete"; proposalId: number; toolCalls: number }
   // The agent pointing at a lane it isn't allowed to enter. Surfaced live because a suggestion
   // sits inert until a human accepts it -- an operator who never sees it is a suggestion that
   // silently does nothing, which is the same as not having the tool.
