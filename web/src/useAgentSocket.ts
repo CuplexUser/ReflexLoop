@@ -30,6 +30,7 @@ const HISTORY_CHANGING_EVENTS = new Set<AgentEvent['type']>([
   'outcome_recorded',
   'lesson_saved',
   'phase_done',
+  'domains_changed',
 ])
 
 type Action =
@@ -49,6 +50,7 @@ function applyEvent(state: SocketState, event: AgentEvent): SocketState {
 
   switch (event.type) {
     case 'run_started':
+    case 'domains_changed':
       return { ...next, domains: event.domains }
     case 'phase_start':
       return { ...next, runningPhase: { phase: event.phase, proposalId: event.proposalId } }

@@ -10,6 +10,11 @@ import type { ProposalRow } from "./memory-server.js";
 
 export type AgentEvent =
   | { type: "run_started"; domains: string[] }
+  // `run_started` fires exactly once, at process startup -- it is not "a cycle began". A goal
+  // added/paused/reactivated from the console changes `getControlState().domains` immediately
+  // (see server.ts's `refreshGoals`), but with no event for that the console's own lane badge had
+  // no way to learn about it short of a restart. This is that signal.
+  | { type: "domains_changed"; domains: string[] }
   | { type: "phase_start"; phase: string; proposalId: number | null }
   | { type: "tool_call"; phase: string; proposalId: number | null; toolName: string; input: unknown }
   | { type: "model_text"; phase: string; proposalId: number | null; text: string }

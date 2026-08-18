@@ -109,6 +109,7 @@ export function startServer(
       status: g.status,
       weight: g.weight,
     })));
+    emitAgentEvent({ type: "domains_changed", domains: getControlState().domains });
     requestRunNow();
   };
 

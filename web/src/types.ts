@@ -358,6 +358,7 @@ export type Phase = 'research_plan' | 'act' | 'reflect'
 
 export type AgentEvent =
   | { type: 'run_started'; domains: string[] }
+  | { type: 'domains_changed'; domains: string[] }
   | { type: 'phase_start'; phase: string; proposalId: number | null }
   | { type: 'tool_call'; phase: string; proposalId: number | null; toolName: string; input: unknown }
   | { type: 'model_text'; phase: string; proposalId: number | null; text: string }
