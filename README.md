@@ -156,6 +156,10 @@ there.
   done" or "needs refinement" — a human verdict independent of the model's
   self-reported outcome, and the trigger for the reactive research pass
   above. Talks to `src/server.ts` over REST + WebSocket.
+- `src/mcp-server.ts` — an MCP server exposing the agent's research notes and
+  lessons to Claude Desktop, read-only. See "Reading the memory from Claude
+  Desktop" below. `src/mcp-env.ts` is its `.env` loader, split out because the
+  import order is load-bearing.
 - `src/memory-server.test.ts` — Vitest unit tests for `MemoryStore` against an
   in-memory SQLite DB, with `qdrant.ts` mocked out. The real test suite.
 - `src/smoke-test.ts` — quick end-to-end sanity check against a throwaway DB
@@ -289,6 +293,64 @@ for "VS Code extension for productivity" can still surface for a proposal in
 both fall back to the original `LIKE`-based search, so nothing breaks if you
 skip it. `MemoryStore.syncToQdrant()` runs once at startup to backfill any
 rows that were written before Qdrant was configured.
+
+## Reading the memory from Claude Desktop
+
+`npm run mcp` starts an MCP server (`src/mcp-server.ts`) that gives Claude
+Desktop — or any MCP client — four read-only tools over the agent's memory:
+
+| Tool | What it answers |
+| --- | --- |
+| `research_notes_search` | "What did it find out about X?" |
+| `research_notes_list` | The most recent notes, newest first |
+| `lessons_search` | "What has it learned about X?" |
+| `lessons_list` | The most recently updated lessons |
+
+All four take a `limit` (default 10, max 100); the note tools also take a
+`goal` and a `kind` (`gap` / `saturated` / `competitor` / …). `goal` is a goal
+*title*, matched case-insensitively on a substring, and a name that matches
+nothing answers with the list of goals that exist — so there's no fifth tool
+just to look ids up.
+
+It reads `data/agent.db` directly, opened read-only the same way console-only
+mode opens it, so it works whether or not `npm start` is running and needs no
+port and no `AGENT_API_TOKEN`. There is deliberately no tool that writes: no
+adding, editing, muting or deleting. Curating this memory is a human act
+performed in the console, and muted lessons are excluded here exactly as they
+are for the agent itself — a lesson taken out of the agent's reasoning must not
+come back through a second door.
+
+Searches use Qdrant when it's configured (see below) and fall back to `LIKE`
+otherwise, so a hit carries a `relevance:` score in the first case and not in
+the second.
+
+Register it with Claude Desktop in `claude_desktop_config.json` — on Windows
+`%APPDATA%\Claude\claude_desktop_config.json`, on macOS
+`~/Library/Application Support/Claude/claude_desktop_config.json` — using
+absolute paths, since the client launches the server with an arbitrary working
+directory:
+
+```json
+{
+  "mcpServers": {
+    "reflexloop-memory": {
+      "command": "D:\\Code\\Claude\\ReflexLoop\\node_modules\\.bin\\tsx.cmd",
+      "args": ["D:\\Code\\Claude\\ReflexLoop\\src\\mcp-server.ts"]
+    }
+  }
+}
+```
+
+Point `command` at the repo's own `tsx`, not at `npx`. The client launches the
+server from an arbitrary directory, and `npx tsx` from outside the repo doesn't
+find the local copy — it downloads its own into the npx cache, which makes
+startup slow and needs the network. On macOS/Linux the same entry is
+`node_modules/.bin/tsx` with a `/src/mcp-server.ts` argument.
+
+Nothing else needs configuring: the server finds `.env` and `data/agent.db`
+relative to its own location, not to wherever it was launched from. Restart
+Claude Desktop after editing the file — it spawns the server at startup and
+kills it on exit, so config changes only take effect on a full restart.
 
 ## Multiple domains, multiple proposals
 
