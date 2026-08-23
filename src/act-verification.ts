@@ -31,6 +31,21 @@ export interface ActAttempt {
   stopReason: AgentStopReason;
   /** The provider's verbatim finish reason, used only in the human-readable problem text. */
   providerStopReason?: string;
+  /**
+   * Tools that already ran successfully in an *earlier* act phase on this same proposal
+   * (`store.succeededActTools`). A step they cover counts as done.
+   *
+   * Without this a re-run is judged as though the proposal had never been acted on, which is
+   * how #40 -- six files committed, read back, outcome recorded -- was filed `incomplete`: the
+   * operator re-ran it, the model correctly saw the repo already existed and skipped step 1,
+   * and the verifier called the finished build unfinished. The nudge then pushed it to run
+   * `github_create_repo` again, which answers 422 on an existing repo *forever*, so the step
+   * was unsatisfiable by construction -- and the retry it did manage was a duplicate commit.
+   *
+   * Left empty for a **recurring** proposal, where each occurrence is supposed to do the work
+   * again and a previous occurrence proves nothing about this one; `actPhase` decides that.
+   */
+  priorSuccessfulTools?: string[];
 }
 
 /** An approved agent-owned step whose declared tool never ran. */
@@ -74,16 +89,28 @@ export interface ActVerdict {
  *
  * Human-owned steps are never counted against the agent -- it has no tool for them by
  * construction, which is why `approvedPlanBrief` marks them as not its to do.
+ *
+ * A step whose tool succeeded in an earlier act phase on the same proposal counts as done --
+ * see `priorSuccessfulTools`. "This attempt did not call it" is not the same as "the work does
+ * not exist", and a re-run is the case where those two come apart.
  */
 export function verifyAct(steps: ProposalStep[], attempt: ActAttempt): ActVerdict {
-  const ranSuccessfully = new Set(attempt.toolCalls.filter((c) => !c.isError).map((c) => c.name));
+  const ranThisAttempt = new Set(attempt.toolCalls.filter((c) => !c.isError).map((c) => c.name));
+  // A step is done if its tool succeeded in this run *or* in an earlier one on this proposal.
+  // The question the plan asks is whether the work exists, not which process invocation did it.
+  const stepDone = new Set([...ranThisAttempt, ...(attempt.priorSuccessfulTools ?? [])]);
 
   const unrunSteps: UnrunStep[] = steps.flatMap((step, index) =>
-    step.owner === "agent" && step.tool && !ranSuccessfully.has(step.tool)
+    step.owner === "agent" && step.tool && !stepDone.has(step.tool)
       ? [{ position: index + 1, title: step.title, tool: step.tool }]
       : []
   );
-  const outcomeRecorded = ranSuccessfully.has(OUTCOME_TOOL);
+  // Deliberately *not* credited from a prior run, unlike the steps above: an outcome describes
+  // the run that wrote it, and a re-run that found everything already built still has to say so.
+  // Asking for it again is free -- outcome_record writes to the agent's own memory and has no
+  // side effect to repeat, which is the whole reason the steps need the carve-out and this
+  // doesn't.
+  const outcomeRecorded = ranThisAttempt.has(OUTCOME_TOOL);
 
   const problems: string[] = [];
   if (attempt.stopReason === "truncated") {

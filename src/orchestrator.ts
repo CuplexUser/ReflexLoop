@@ -808,6 +808,24 @@ async function actPhase(proposal: ProposalRow): Promise<ActVerdict> {
 
   const steps = parseSteps(proposal);
 
+  // Snapshotted before the model is called, so it means "done by an earlier run" and never
+  // shadows this one's own calls. This is what makes a re-run judgeable: without it every step
+  // the previous attempt completed reads as unrun, the phase is filed `incomplete` however well
+  // it went, and the nudge below orders side effects that already happened to happen again --
+  // which for `github_create_repo` is a 422 that can never clear, and for `github_commit_files`
+  // is a duplicate commit. Both landed on #40.
+  //
+  // Empty for a **recurring** proposal on purpose: there each occurrence is meant to do the work
+  // again, so a previous occurrence's success says nothing about this one, and crediting it would
+  // let every occurrence after the first pass having done nothing.
+  const priorSuccessfulTools =
+    proposal.recurrence_ms === null
+      ? store.succeededActTools(
+          proposal.id,
+          steps.flatMap((s) => (s.owner === "agent" && s.tool ? [s.tool] : []))
+        )
+      : [];
+
   const result = await runPhase({
     // Consulted when the model stops calling tools, before the run is allowed to end. Twice the
     // act phase has read everything it needed, announced "now I'll write the full prototype and
@@ -820,7 +838,7 @@ async function actPhase(proposal: ProposalRow): Promise<ActVerdict> {
     // granted. Nor can it cause a repeat -- a step whose tool already ran successfully isn't
     // mentioned.
     nudge: ({ calls, stopReason: providerStop }) => {
-      const check = verifyAct(steps, { toolCalls: calls, stopReason: "end_turn" });
+      const check = verifyAct(steps, { toolCalls: calls, stopReason: "end_turn", priorSuccessfulTools });
       if (check.unrunSteps.length === 0 && check.outcomeRecorded) return null;
 
       const outstanding = check.unrunSteps.map((s) => `  - step ${s.position}: ${s.title} -- call ${unqualified(s.tool)}`);
@@ -846,6 +864,17 @@ async function actPhase(proposal: ProposalRow): Promise<ActVerdict> {
       // never saw the steps at all -- it re-derived an approach from the description and
       // could diverge from the one that got a yes.
       ...approvedPlanBrief(proposal),
+      // Told, not left to be rediscovered. In the re-run that produced #40's wrong verdict the
+      // model worked this out for itself by reading the repo back, which cost turns and still
+      // ended with it re-attempting a create. Naming what already landed is also what makes
+      // "don't repeat a side effect" an instruction rather than a hope.
+      ...(priorSuccessfulTools.length > 0
+        ? [
+            `This proposal has been acted on before. These steps already ran successfully in an earlier attempt: ${priorSuccessfulTools
+              .map(unqualified)
+              .join(", ")}. Do not run them again -- confirm the real state with the read-only tools instead, and re-run one only if the read-back shows it did not actually land.`,
+          ]
+        : []),
       `The only tools that can change anything real are the ones this proposal was approved for: ${requiredTools.join(", ")}. On top of those you always have memory tools for logging/recall, the read-only integration tools (${readOnlyTools.map(unqualified).join(", ")}) for checking real state, and WebSearch/WebFetch.`,
       `Use WebSearch/WebFetch while you build, not just before: check a library's current API, a package's real export names, or a config format rather than writing what you half-remember. You have no build step to catch a wrong import.`,
       `This is a real deliverable, not a stub -- fully implement the scope described above. Do not leave placeholder/TODO files, an empty repo, or a README-only scaffold standing in for the actual code.`,
@@ -866,6 +895,7 @@ async function actPhase(proposal: ProposalRow): Promise<ActVerdict> {
     toolCalls: result.calls,
     stopReason: result.stopReason,
     providerStopReason: result.providerStopReason,
+    priorSuccessfulTools,
   });
   store.recordActVerdict(proposal.id, verdict);
   if (verdict.complete) return verdict;

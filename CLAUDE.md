@@ -595,6 +595,18 @@ on). A directive is consumed — injected into one research prompt, then cleared
   reported separately, because they call for different responses. `act-verification.test.ts` runs the
   real #27 step list and tool calls through it.
 
+  **"This attempt didn't call it" is not "the work doesn't exist" — a re-run is where those come
+  apart.** `actPhase` snapshots `store.succeededActTools(id, planTools)` before the model runs and
+  passes it as `priorSuccessfulTools`; a step whose tool succeeded in an earlier act phase on the
+  same proposal counts as done. Without it #40 — repo created, six files committed and read back —
+  came back `incomplete` when the operator re-ran it, and the nudge ordered `github_create_repo`
+  again, which answers **422 on an existing repo forever**, so the step was unsatisfiable by
+  construction and the retry that did land was a duplicate commit. The act prompt also names those
+  tools, so not repeating a side effect is an instruction rather than something the model has to
+  re-derive by reading the repo back. Two carve-outs: `outcome_record` is **never** credited from a
+  prior run (it describes the run that wrote it, and it has no side effect to repeat), and the list
+  is empty for a **recurring** proposal, where each occurrence is meant to do the work again.
+
   The verdict persists to `proposals.act_status` / `act_problems` (`ActStatus`:
   `running` → `interrupted` | `complete` | `incomplete`). **Stored rather than derived from
   `actions` the way `deliverables.ts` is**, for two reasons: the verdict depends on the model's

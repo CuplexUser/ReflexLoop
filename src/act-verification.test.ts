@@ -153,6 +153,93 @@ describe("verifyAct", () => {
     expect(verifyAct([], attempt({ toolCalls: [ok("WebSearch")] })).complete).toBe(false);
   });
 
+  /**
+   * Proposal #40, the re-run case. The dossier repo was created, six files committed and read
+   * back on the first act phase; the operator re-ran it, and the second phase correctly did
+   * not create the repo again -- `github_create_repo` answers 422 on a repo that exists, so
+   * that step was unsatisfiable no matter how many times it was retried.
+   */
+  const DOSSIER_STEPS: ProposalStep[] = [
+    {
+      title: "Create the pre-revenue funding dossier repo",
+      owner: "agent",
+      tool: "mcp__integrations__github_create_repo",
+      doneWhen: "Repo CuplexUser/pre-revenue-funding-dossier exists",
+    },
+    {
+      title: "Write the dossier files and commit them",
+      owner: "agent",
+      tool: "mcp__integrations__github_commit_files",
+      doneWhen: "All 6 files committed to the default branch",
+    },
+    {
+      title: "Read the files back to verify them",
+      owner: "agent",
+      tool: "mcp__integrations__github_read_file",
+      doneWhen: "All files verified present and complete",
+    },
+    { title: "Human: submit the applications", owner: "human", doneWhen: "operator confirms" },
+  ];
+
+  it("credits proposal #40's steps to the earlier run that actually did them", () => {
+    const rerun = attempt({
+      toolCalls: [
+        failed("mcp__integrations__github_create_repo"),
+        ok("mcp__integrations__github_read_file"),
+        ok("mcp__memory__outcome_record"),
+      ],
+      priorSuccessfulTools: [
+        "mcp__integrations__github_create_repo",
+        "mcp__integrations__github_commit_files",
+        "mcp__integrations__github_read_file",
+      ],
+      providerStopReason: "stop",
+    });
+
+    expect(verifyAct(DOSSIER_STEPS, rerun)).toMatchObject({ complete: true, problems: [] });
+    // And without the credit it is the wrong verdict the live DB actually holds.
+    expect(verifyAct(DOSSIER_STEPS, { ...rerun, priorSuccessfulTools: [] }).unrunSteps).toEqual([
+      {
+        position: 1,
+        title: "Create the pre-revenue funding dossier repo",
+        tool: "mcp__integrations__github_create_repo",
+      },
+      {
+        position: 2,
+        title: "Write the dossier files and commit them",
+        tool: "mcp__integrations__github_commit_files",
+      },
+    ]);
+  });
+
+  it("still requires the steps an earlier run never got to", () => {
+    // #27's re-run shape: the repo was created before, nothing else was.
+    const verdict = verifyAct(
+      MACHWATCH_STEPS,
+      attempt({
+        toolCalls: [ok("mcp__memory__outcome_record")],
+        priorSuccessfulTools: ["mcp__integrations__github_create_repo"],
+      })
+    );
+    expect(verdict.unrunSteps.map((s) => s.tool)).toEqual([
+      "mcp__integrations__github_commit_files",
+      "mcp__integrations__vercel_deploy",
+      "WebFetch",
+    ]);
+  });
+
+  it("does not let an earlier run's outcome_record stand in for this one's", () => {
+    const verdict = verifyAct(
+      [],
+      attempt({
+        toolCalls: [ok("mcp__integrations__github_read_file")],
+        priorSuccessfulTools: ["mcp__memory__outcome_record"],
+      })
+    );
+    expect(verdict.outcomeRecorded).toBe(false);
+    expect(verdict.complete).toBe(false);
+  });
+
   it("ignores human-owned steps and agent steps that declared no tool", () => {
     const steps: ProposalStep[] = [
       { title: "human thing", owner: "human", tool: "mcp__integrations__vercel_deploy", doneWhen: "done" },

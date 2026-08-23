@@ -797,6 +797,40 @@ describe("action history reach", () => {
   });
 });
 
+describe("succeededActTools", () => {
+  it("credits only successful act-phase calls, and only the tools asked about", () => {
+    const id = store.createProposal({
+      domain: "sweden-funding",
+      description: "dossier",
+      expectedCost: 1,
+      expectedTimeHours: 1,
+      expectedUpside: 1,
+      requiredTools: ["mcp__integrations__github_create_repo"],
+    });
+    store.decideProposal(id, "approved");
+
+    // Proposal #40's real first run: a 422 on the over-long description, then a create that
+    // worked, then the commit. The error is stored exactly as the handler returned it.
+    store.logAction(id, "act", "mcp__integrations__github_create_repo", {}, "Error: GitHub API POST /user/repos -> 422");
+    store.logAction(id, "act", "mcp__integrations__github_create_repo", {}, { url: "https://github.com/x/y" });
+    store.logAction(id, "act", "mcp__integrations__github_commit_files", {}, { commitSha: "abc" });
+    store.logAction(id, "act", "mcp__integrations__vercel_deploy", {}, "Error: no VERCEL_TOKEN");
+    store.logAction(id, "reflect", "mcp__memory__lesson_add", {}, "Saved lesson #1");
+
+    const asked = [
+      "mcp__integrations__github_create_repo",
+      "mcp__integrations__github_commit_files",
+      "mcp__integrations__vercel_deploy",
+      "mcp__memory__lesson_add",
+    ];
+    expect(store.succeededActTools(id, asked).sort()).toEqual([
+      "mcp__integrations__github_commit_files",
+      "mcp__integrations__github_create_repo",
+    ]);
+    expect(store.succeededActTools(id, [])).toEqual([]);
+  });
+});
+
 describe("unified search", () => {
   it("returns hits across proposals, lessons, and notes", async () => {
     store.createProposal({

@@ -24,6 +24,32 @@ export function canRerun(proposal: Pick<ProposalRow, 'status' | 'act_status'>): 
 }
 
 /**
+ * The confirmation a re-run has to pass first, or null when it needs none.
+ *
+ * Only a **finished** build gets one, and it isn't caution for its own sake: re-running act on
+ * work that already landed repeats real side effects. The dossier build was re-run this way and
+ * the act phase committed the same six files a second time, on top of a repo whose `create` step
+ * could no longer succeed at all. The verifier now credits what an earlier run did, so a re-run
+ * is judged honestly — but the commit still happens twice, and only the operator knows whether
+ * that's what they meant.
+ *
+ * `interrupted` / `incomplete` / never-run deliberately pass straight through: there the whole
+ * point of the button is that the work is missing, and a dialog between the operator and the
+ * fix is friction with nothing behind it.
+ */
+export function rerunConfirm(
+  actStatus: ActStatus | null
+): { title: string; content: string; okText: string } | null {
+  if (actStatus !== 'complete') return null
+  return {
+    title: 'Run this finished build again?',
+    content:
+      'This build already completed. Running it again re-executes the approved plan, so anything it does a second time — another commit, another deployment, another email — actually happens a second time.',
+    okText: 'Run it again',
+  }
+}
+
+/**
  * What the "run build now" button should say. An unfinished build is a retry; a finished one is
  * a deliberate re-execution, and the label shouldn't pretend those are the same thing.
  */

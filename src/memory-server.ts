@@ -34,7 +34,7 @@ import {
 } from "./qdrant.js";
 // tool_output has carried two storage shapes across this project's life and both are
 // still in the DB; tool-output.ts is the single place that knows how to read either.
-import { extractResultUrl } from "./tool-output.js";
+import { extractResultUrl, isErrorResult, parseToolResult } from "./tool-output.js";
 import { DELIVERABLE_TOOLS, type DeliverableActionRow } from "./deliverables.js";
 import { findNearDuplicate, similarity, terms } from "./proposal-similarity.js";
 
@@ -1264,6 +1264,35 @@ export class MemoryStore {
       .prepare(`SELECT 1 AS found FROM actions WHERE proposal_id = ? AND phase = 'act' LIMIT 1`)
       .get(id) as { found: number } | undefined;
     return Boolean(row);
+  }
+
+  /**
+   * Which of `toolNames` have already run *successfully* in an act phase on this proposal.
+   *
+   * This is what keeps a second act run on the same proposal from being judged as though the
+   * first one never happened. `verifyAct` asks "did each approved step's tool run?", and a
+   * re-run answers no for every step the previous run already did -- so a finished build came
+   * back `incomplete`, and the nudge told the model to redo work that was already on disk.
+   * Worse, several of those calls cannot succeed twice: `github_create_repo` on an existing
+   * repo is a 422 forever, so the step could never be satisfied no matter how often it ran.
+   *
+   * Success is read the same way `deliverables.ts` reads it -- a stored output that decodes to
+   * an "Error: ..." string is the handler's own in-band failure and does not count. Narrowed to
+   * the caller's tool names in SQL because the rows this skips are the fat ones (a WebFetch of
+   * a whole page), exactly as in `listDeliverableActions`.
+   */
+  succeededActTools(id: number, toolNames: string[]): string[] {
+    if (toolNames.length === 0) return [];
+    const placeholders = toolNames.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `SELECT tool_name, tool_output FROM actions
+         WHERE proposal_id = ? AND phase = 'act' AND tool_name IN (${placeholders})`
+      )
+      .all(id, ...toolNames) as unknown as { tool_name: string; tool_output: string | null }[];
+    return [
+      ...new Set(rows.filter((r) => !isErrorResult(parseToolResult(r.tool_output))).map((r) => r.tool_name)),
+    ];
   }
 
   applyProposalEdits(id: number, edits: { description?: string; requiredTools?: string[] }) {

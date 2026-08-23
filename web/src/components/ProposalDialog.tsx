@@ -4,7 +4,7 @@ import { ClockCircleOutlined, EditOutlined, PlayCircleOutlined } from '@ant-desi
 import type { ActionRow, OutcomeRow, ProposalRow, RunRow } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
-import { UNFINISHED_ACT, canRerun, rerunLabel } from '../actStatus'
+import { UNFINISHED_ACT, canRerun, rerunConfirm, rerunLabel } from '../actStatus'
 import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, preview, recurrenceLabel, timeAgo } from '../format'
 import { palette } from '../theme'
 import { MarkdownLite } from './MarkdownLite'
@@ -29,7 +29,7 @@ export function ProposalDialog({
   open: boolean
   onClose: () => void
 }) {
-  const { message } = App.useApp()
+  const { message, modal } = App.useApp()
   const readOnly = useConsoleOnly()
   const [actions, setActions] = useState<ActionRow[] | null>(null)
   const [runs, setRuns] = useState<RunRow[]>([])
@@ -91,7 +91,20 @@ export function ProposalDialog({
     }
   }
 
-  async function rerunBuild() {
+  function rerunBuild() {
+    if (!proposal) return
+    // A finished build is re-run deliberately or not at all -- see rerunConfirm. The dialog is
+    // the same one the Deliverables card raises, from the same helper, because the two buttons
+    // dispatch the same act phase.
+    const confirm = rerunConfirm(proposal.act_status)
+    if (confirm) {
+      modal.confirm({ ...confirm, onOk: () => dispatchRerun() })
+      return
+    }
+    void dispatchRerun()
+  }
+
+  async function dispatchRerun() {
     if (!proposal) return
     setRerunning(true)
     try {

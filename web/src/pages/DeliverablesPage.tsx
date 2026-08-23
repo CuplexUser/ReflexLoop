@@ -13,7 +13,7 @@ import { Alert, App, Button, Card, Empty, Input, Segmented, Select, Space, Spin,
 import type { Deliverable, DeliverableArtifact, ProposalRow } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
-import { UNFINISHED_ACT, rerunLabel } from '../actStatus'
+import { UNFINISHED_ACT, rerunConfirm, rerunLabel } from '../actStatus'
 import { markdownPreview, money, timeAgo } from '../format'
 import { MarkdownLite } from '../components/MarkdownLite'
 import { palette } from '../theme'
@@ -34,8 +34,9 @@ const REVIEW_OPTIONS = [
   { value: 'needs_refinement', label: '⚠ Needs refinement' },
 ]
 
-// UNFINISHED_ACT / canRerun / rerunLabel live in ../actStatus so this page and ProposalDialog
-// agree on what "unfinished" means and offer the same control for it.
+// UNFINISHED_ACT / canRerun / rerunLabel / rerunConfirm live in ../actStatus so this page and
+// ProposalDialog agree on what "unfinished" means, offer the same control for it, and ask the
+// same question before re-running something that already finished.
 
 function artifactIcon(artifact: DeliverableArtifact) {
   if (artifact.kind === 'payment_link') return <CreditCardOutlined />
@@ -122,7 +123,7 @@ function DeliverableCard({
   onSetReview: (id: number, reviewStatus: ProposalRow['review_status']) => void
   onOpenTrail: (proposalId: number) => void
   onOpenProposal: (proposalId: number) => void
-  onRerun?: (proposalId: number) => void
+  onRerun?: (proposalId: number, actStatus: Deliverable['actStatus']) => void
 }) {
   const readOnly = useConsoleOnly()
   const { outcome } = deliverable
@@ -227,7 +228,7 @@ function DeliverableCard({
                 ghost
                 icon={<PlayCircleOutlined />}
                 disabled={readOnly}
-                onClick={() => onRerun(deliverable.proposalId)}
+                onClick={() => onRerun(deliverable.proposalId, deliverable.actStatus)}
               >
                 {rerunLabel(deliverable.actStatus)}
               </Button>
@@ -257,14 +258,24 @@ export function DeliverablesPage({
   onSetReview: (id: number, reviewStatus: ProposalRow['review_status']) => void
 }) {
   const navigate = useNavigate()
-  const { message } = App.useApp()
+  const { message, modal } = App.useApp()
   const [deliverables, setDeliverables] = useState<Deliverable[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState<Filter>('all')
   const [search, setSearch] = useState('')
 
-  async function rerun(proposalId: number) {
+  async function rerun(proposalId: number, actStatus: Deliverable['actStatus']) {
+    // A finished build is re-run deliberately or not at all -- see rerunConfirm.
+    const confirm = rerunConfirm(actStatus)
+    if (confirm) {
+      modal.confirm({ ...confirm, onOk: () => dispatchRerun(proposalId) })
+      return
+    }
+    await dispatchRerun(proposalId)
+  }
+
+  async function dispatchRerun(proposalId: number) {
     try {
       await api.rerunBuild(proposalId)
       // "Queued", not "started" -- the scheduler picks it up on its own tick, and saying it's
