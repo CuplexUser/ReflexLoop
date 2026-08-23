@@ -200,7 +200,7 @@ inference (free-tier models, no token limit) in the same request, so there's no
 separate rate-limited embeddings API in the loop anymore. Same fail-soft contract as
 before -- falls back to `LIKE` search if `QDRANT_URL` / `QDRANT_API_KEY` /
 `QDRANT_EMBEDDING_MODEL` / `QDRANT_EMBEDDING_DIM` aren't all set. See `.env.example`
-and the Semantic search section of `README.md`.
+and `docs/semantic-search.md`.
 ## Per-goal research fan-out
 
 One `researchAndPlanPhase` run per active goal, executing concurrently instead of a
