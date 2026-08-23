@@ -2138,6 +2138,12 @@ export interface ProposalStep {
 export interface ProposalRow {
   id: number;
   domain: string;
+  /**
+   * The goal this was filed under, or NULL. Nullable and never backfilled, like every other
+   * `goal_id`: `domain` above is the free-text snapshot the model wrote, this is the lane
+   * resolveGoalId mapped it onto, and pre-goals rows have only the former.
+   */
+  goal_id: number | null;
   description: string;
   expected_cost: number;
   expected_time_hours: number;

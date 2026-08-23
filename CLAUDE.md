@@ -62,7 +62,7 @@ npm test              # vitest run — unit tests over src/**/*.test.ts, no API 
 npm run typecheck     # tsc --noEmit over src/
 npm start             # tsx src/orchestrator.ts — runs the agent loop + web console together (one process, one SQLite connection)
 npm run start:console # console-only: serves the real DB read-only, runs no loop, calls no model API
-npm run mcp           # MCP server over stdio: read-only access to notes + lessons for Claude Desktop
+npm run mcp           # MCP server over stdio: read-only access to the record for Claude Desktop
 ```
 
 **`start:console`** (equivalently `AGENT_CONSOLE_ONLY=1`; the CLI flag exists because `VAR=1 npm start`
@@ -740,25 +740,50 @@ on). A directive is consumed — injected into one research prompt, then cleared
   rebroadcasts it over WebSocket with the same `{id, occurredAt}` the DB assigned, and serves the REST API
   (proposal/action/event history), and in production also serves the built `web/dist` static files;
   `review-gateway.ts` resolves a proposal's pending approval promise when a decision comes in via the API.
-- `mcp-server.ts` — an MCP server (stdio) giving Claude Desktop four read-only tools over the
-  agent's memory: `research_notes_search` / `research_notes_list` / `lessons_search` /
-  `lessons_list`. It opens `data/agent.db` with `new MemoryStore(path, { readOnly: true })`
-  rather than going through `server.ts`'s REST API, so it needs no port, no `AGENT_API_TOKEN`
-  and no running loop. **There is deliberately no write tool** — not adding, not editing, not
-  muting: curating this memory is a human act performed in the console, and a second, unaudited
-  path into the record the loop reasons from is exactly what muting exists to prevent. For the
-  same reason `lessons_list` filters muted rows itself, since the `listAllLessons` it calls is
-  the console's *curation* listing and deliberately includes them.
+- `mcp-server.ts` + `mcp/` — an MCP server (stdio) giving Claude Desktop eight read-only tools
+  over the agent's record. `mcp-server.ts` is wiring only; the tools live one subject per module
+  in `mcp/`: `goals_list` (goals.ts, goal + health merged as `GET /api/goals` does),
+  `research_notes_search`/`_list` (notes.ts), `lessons_search`/`_list` (lessons.ts),
+  `proposals_list`/`proposal_get` (proposals.ts), `deliverables_list` (deliverables.ts). It opens
+  `data/agent.db` with `new MemoryStore(path, { readOnly: true })` rather than going through
+  `server.ts`'s REST API, so it needs no port, no `AGENT_API_TOKEN` and no running loop.
+
+  **There is deliberately no write tool** — not adding, not editing, not muting, not approving a
+  proposal, not accepting a suggested goal: curating this record is a human act performed in the
+  console, and a second, unaudited path into what the loop reasons from is exactly what muting
+  exists to prevent. For the same reason `lessons_list` filters muted rows itself, since the
+  `listAllLessons` it calls is the console's *curation* listing and deliberately includes them.
+
+  **There is also no live status or queue tool**, and that's the same call as excluding run-now
+  from console-only mode: `/api/queue`'s `running`/`queued` come from `getControlState()`, which
+  is process-local memory in `agent-control.ts` and would read as uninitialised defaults here. A
+  tool answering "nothing running" mid-deploy is worse than no tool. The DB-derivable half is
+  `proposals_list` with `status: "stalled"`, which calls `store.listStalledBuilds()` rather than
+  re-deriving it — its `act_status IS NULL` rule is load-bearing (see the Build queue note).
+
+  Reuse over reimplementation is the rule throughout: `deliverables_list` runs the same four-call
+  `buildDeliverables(...)` composition as `GET /api/deliverables`, and `proposal_get` renders
+  `parseMonetization`/`parseSteps`/`toolRisk` rather than parsing those columns itself.
+  `mcp/render.ts` is the pure half — rows in, Markdown out, **no store import**, which is what
+  lets `mcp/render.test.ts` cover it with no DB file and no API key. Two rules run through the
+  renderers: a column that is null on legacy rows renders *nothing* rather than a dash (most of
+  them were added to a live DB and never backfilled, so absent is the common case), and whether
+  work *finished* is printed before what it produced (an unfinished build with a real repo URL
+  must not read as shipped).
 
   **Three things here are ordering or environment traps, not style.** (1) `mcp-env.ts` is a
   separate module *because* `qdrant.ts` reads `QDRANT_*` into module-level consts at load time
   and ESM evaluates imports before the importing file's first statement — a `loadEnv()` call in
-  `mcp-server.ts`'s body runs too late, and the symptom is not an error but every search
-  silently degrading to `LIKE`. Keep that import first. (2) On a stdio transport **stdout is the
-  protocol channel**, so the top of the file repoints `console.log`/`info`/`debug`/`warn` at
-  stderr — `qdrant.ts` and `memory-server.ts` carry ~20 `console.*` calls between them and one
-  landing mid-frame kills the session. (3) A desktop client launches the server with an
-  arbitrary cwd, so both `.env` and the `AGENT_DB_PATH` default resolve against the repo root
+  a server file's body runs too late, and the symptom is not an error but every search silently
+  degrading to `LIKE`. `mcp/store.ts` is what makes that structural rather than a property of one
+  file's import order: it imports `../mcp-env.js` above `../memory-server.js` and owns the single
+  store handle, so whichever tool module gets evaluated first reaches the store through it.
+  (2) On a stdio transport **stdout is the protocol channel**, so `mcp-env.ts` repoints
+  `console.log`/`info`/`debug`/`warn` at stderr. It lives *there* rather than at the top of
+  `mcp-server.ts` because a statement in a file's body runs after every import has already been
+  evaluated — it cannot cover what a module says on the way in, and the graph now reaches
+  `connectors/load.ts`, which logs while loading. (3) A desktop client launches the server with
+  an arbitrary cwd, so both `.env` and the `AGENT_DB_PATH` default resolve against the repo root
   via `import.meta.url`, never against cwd.
 - `smoke-test.ts` — exercises `MemoryStore` directly against a throwaway DB, no API key needed.
 
