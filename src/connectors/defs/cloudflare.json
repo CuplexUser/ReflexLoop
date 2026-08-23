@@ -45,6 +45,46 @@
       }
     },
     {
+      "name": "cloudflare_list_web_analytics_sites",
+      "risk": "read",
+      "description": "List the Web Analytics (RUM) sites on an account, with the site_tag each one is identified by. Call this first: cloudflare_web_analytics needs a site_tag and there is nowhere else to get one. Read-only.",
+      "method": "GET",
+      "path": "/accounts/{accountId}/rum/site_info/list",
+      "params": {
+        "accountId": { "type": "string", "in": "path", "required": true, "describe": "Cloudflare account id" },
+        "perPage": { "type": "integer", "in": "query", "as": "per_page", "default": 25 }
+      },
+      "resultList": {
+        "path": "result",
+        "fields": ["site_tag", "site_token", "created", "auto_install", "ruleset.zone_name", "ruleset.zone_tag"],
+        "limit": 25
+      }
+    },
+    {
+      "name": "cloudflare_web_analytics",
+      "risk": "read",
+      "description": "Real traffic for a site running Cloudflare Web Analytics: total pageviews and visits over a window, the top 20 paths, and the top 10 referrer hosts, in one call. Free and script-based, so it works on any host including Vercel -- the site needs the Web Analytics beacon in its HTML and a site_tag from cloudflare_list_web_analytics_sites. Roughly six months of data is kept and a window longer than 30 days is refused. Read-only.",
+      "method": "POST",
+      "path": "/graphql",
+      "params": {
+        "query": {
+          "type": "string",
+          "in": "body",
+          "default": "query($accountTag: string!, $siteTag: string!, $since: Time!, $until: Time!) { viewer { accounts(filter: {accountTag: $accountTag}) { totals: rumPageloadEventsAdaptiveGroups(limit: 1, filter: {siteTag: $siteTag, datetime_geq: $since, datetime_leq: $until}) { count sum { visits } } byPath: rumPageloadEventsAdaptiveGroups(limit: 20, orderBy: [count_DESC], filter: {siteTag: $siteTag, datetime_geq: $since, datetime_leq: $until}) { count sum { visits } dimensions { requestPath } } byReferer: rumPageloadEventsAdaptiveGroups(limit: 10, orderBy: [count_DESC], filter: {siteTag: $siteTag, datetime_geq: $since, datetime_leq: $until}) { count dimensions { refererHost } } } } }",
+          "describe": "GraphQL query. The default answers totals + top paths + top referrers; only override it to ask something else, and if you do, declare exactly the same four variables ($accountTag, $siteTag, $since, $until) because those are what this tool sends"
+        },
+        "accountTag": { "type": "string", "in": "body", "as": "variables.accountTag", "required": true, "describe": "Cloudflare account id" },
+        "siteTag": { "type": "string", "in": "body", "as": "variables.siteTag", "required": true, "describe": "site_tag from cloudflare_list_web_analytics_sites" },
+        "since": { "type": "string", "in": "body", "as": "variables.since", "required": true, "describe": "Start of the window, ISO-8601 UTC, e.g. '2026-08-01T00:00:00Z'. At most 30 days before `until`" },
+        "until": { "type": "string", "in": "body", "as": "variables.until", "required": true, "describe": "End of the window, ISO-8601 UTC" }
+      },
+      "result": {
+        "totals": "data.viewer.accounts.0.totals",
+        "topPages": "data.viewer.accounts.0.byPath",
+        "topReferrers": "data.viewer.accounts.0.byReferer"
+      }
+    },
+    {
       "name": "cloudflare_create_dns_record",
       "risk": "write",
       "description": "Create a DNS record in a zone -- how a domain gets pointed at something that was just deployed. Only usable when a proposal listing this tool has been approved.",

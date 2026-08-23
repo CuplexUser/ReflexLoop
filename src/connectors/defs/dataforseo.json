@@ -1,0 +1,58 @@
+{
+  "id": "dataforseo",
+  "label": "DataForSEO",
+  "baseUrl": "https://api.dataforseo.com/v3",
+  "docsUrl": "https://docs.dataforseo.com/v3/keywords_data/google_ads/search_volume/live/",
+  "auth": { "type": "basic", "envVar": "DATAFORSEO_AUTH" },
+  "operations": [
+    {
+      "name": "dataforseo_search_volume",
+      "risk": "read",
+      "description": "Real Google Ads monthly search volume, competition and cost-per-click for up to 1000 keywords in one call. This is the number every comparison-site, directory and free-tool proposal is otherwise guessing at from the wording of search results -- get it before estimating traffic, not after. COSTS MONEY per call, billed to the DataForSEO account; the response carries the exact charge in `cost`, so put it in the outcome. Batch every keyword into a SINGLE call rather than calling once per keyword -- the per-call overhead is most of the price. Read-only: it changes nothing outside this process.",
+      "method": "POST",
+      "path": "/keywords_data/google_ads/search_volume/live",
+      "bodyStyle": "array",
+      "params": {
+        "keywords": {
+          "type": "string[]",
+          "in": "body",
+          "required": true,
+          "describe": "Keywords to look up. Max 1000 per call, 80 characters each. Batch them"
+        },
+        "locationName": {
+          "type": "string",
+          "in": "body",
+          "as": "location_name",
+          "describe": "Full location name, e.g. United States or Sweden. Omitting it returns worldwide volume, which is rarely the number you want"
+        },
+        "languageName": {
+          "type": "string",
+          "in": "body",
+          "as": "language_name",
+          "describe": "Full language name, e.g. English or Swedish"
+        },
+        "searchPartners": {
+          "type": "boolean",
+          "in": "body",
+          "as": "search_partners",
+          "default": false,
+          "describe": "Include Google search partner sites. Leave false for a figure comparable to what SEO tools report"
+        },
+        "sortBy": {
+          "type": "enum",
+          "in": "body",
+          "as": "sort_by",
+          "values": ["relevance", "search_volume", "competition_index", "low_top_of_page_bid", "high_top_of_page_bid"],
+          "default": "search_volume",
+          "describe": "Ordering of the returned keywords"
+        }
+      },
+      "result": { "cost": "cost", "statusMessage": "status_message" },
+      "resultList": {
+        "path": "tasks.0.result",
+        "fields": ["keyword", "search_volume", "competition", "competition_index", "cpc", "low_top_of_page_bid", "high_top_of_page_bid"],
+        "limit": 200
+      }
+    }
+  ]
+}

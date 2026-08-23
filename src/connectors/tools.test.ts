@@ -120,6 +120,140 @@ describe("request building", () => {
   });
 });
 
+describe("body shaping", () => {
+  // A dotted `as` is what lets a GraphQL body -- always {query, variables} -- be driven by
+  // a flat tool signature. Without it the alternative was an object-typed param, i.e. the
+  // model hand-writing the nested payload on every call.
+  it("nests JSON body params along a dotted wire name", async () => {
+    respondWith = { status: 200, body: JSON.stringify({ data: { viewer: { accounts: [{}] } } }) };
+    await call("cloudflare_web_analytics", {
+      accountTag: "acct_1",
+      siteTag: "site_1",
+      since: "2026-08-01T00:00:00Z",
+      until: "2026-08-08T00:00:00Z",
+    });
+    const body = JSON.parse(captured[0].body as string);
+    expect(body.variables).toEqual({
+      accountTag: "acct_1",
+      siteTag: "site_1",
+      since: "2026-08-01T00:00:00Z",
+      until: "2026-08-08T00:00:00Z",
+    });
+    // The canned query rides along as a default, so the model does not have to know the
+    // schema to ask the ordinary question.
+    expect(body.query).toContain("rumPageloadEventsAdaptiveGroups");
+  });
+
+  it("wraps the body in an array when the operation asks for it", async () => {
+    process.env.DATAFORSEO_AUTH = "login:password";
+    respondWith = { status: 200, body: JSON.stringify({ cost: 0.05, tasks: [{ result: [] }] }) };
+    await call("dataforseo_search_volume", { keywords: ["a", "b"], locationName: "Sweden" });
+    const body = JSON.parse(captured[0].body as string);
+    expect(Array.isArray(body)).toBe(true);
+    expect(body[0]).toMatchObject({ keywords: ["a", "b"], location_name: "Sweden" });
+  });
+
+  it("sends IndexNow its key in the body -- there is no header credential to get wrong", async () => {
+    respondWith = { status: 200, body: "" };
+    await call("indexnow_submit_urls", {
+      host: "example.com",
+      key: "abc123",
+      urlList: ["https://example.com/a", "https://example.com/b"],
+    });
+    expect(JSON.parse(captured[0].body as string)).toEqual({
+      host: "example.com",
+      key: "abc123",
+      urlList: ["https://example.com/a", "https://example.com/b"],
+    });
+    expect(captured[0].headers.authorization).toBeUndefined();
+  });
+
+  it("base64-encodes a basic credential so the operator never has to", async () => {
+    process.env.DATAFORSEO_AUTH = "login:password";
+    respondWith = { status: 200, body: JSON.stringify({ tasks: [{ result: [] }] }) };
+    await call("dataforseo_search_volume", { keywords: ["a"] });
+    expect(captured[0].headers.authorization).toBe(
+      `Basic ${Buffer.from("login:password", "utf8").toString("base64")}`
+    );
+  });
+});
+
+describe("list projection", () => {
+  // Not cosmetic: a tool result is rendered into the transcript and the model pays for
+  // every character of it, against a hard cap. An unprojected listing spends that cap on
+  // metadata and truncates away the part that was worth asking for.
+  it("projects a list down to the declared fields and reports the pre-cap count", async () => {
+    respondWith = {
+      status: 200,
+      body: JSON.stringify({
+        nbHits: 34,
+        hits: [
+          { title: "Show HN: a thing", url: "https://x", points: 9, num_comments: 3, _tags: ["story"], _highlightResult: { title: { value: "..." } } },
+          { title: "another", url: "https://y", points: 2, num_comments: 0, _tags: ["story"] },
+        ],
+      }),
+    };
+    const result = await call("hn_search", { query: "invoicing" });
+    const parsed = JSON.parse(result.text) as {
+      totalHits: number;
+      count: number;
+      items: Record<string, unknown>[];
+    };
+    expect(parsed.totalHits).toBe(34);
+    expect(parsed.count).toBe(2);
+    expect(parsed.items[0]).toEqual({ title: "Show HN: a thing", url: "https://x", points: 9, num_comments: 3 });
+    expect(result.text).not.toContain("_highlightResult");
+  });
+
+  it("keys a projected field by its last path segment, so a nested field flattens", async () => {
+    respondWith = {
+      status: 200,
+      body: JSON.stringify({
+        result: [{ site_tag: "abc", ruleset: { zone_name: "example.com" }, rules: [1, 2, 3] }],
+      }),
+    };
+    const result = await call("cloudflare_list_web_analytics_sites", { accountId: "acct_1" });
+    const parsed = JSON.parse(result.text) as { items: Record<string, unknown>[] };
+    expect(parsed.items[0]).toMatchObject({ site_tag: "abc", zone_name: "example.com" });
+  });
+
+  it("falls back to the raw body when the declared path is not an array", async () => {
+    respondWith = { status: 200, body: JSON.stringify({ message: "no hits key here" }) };
+    const result = await call("hn_search", { query: "x" });
+    expect(result.text).toContain("no hits key here");
+  });
+});
+
+describe("graphql-style errors", () => {
+  // GraphQL reports failure with a 200 and an `errors` array, so without this a failed
+  // query came back as a successful call that happened to return nothing.
+  it("turns a 200 carrying errors into in-band error text", async () => {
+    respondWith = {
+      status: 200,
+      body: JSON.stringify({ data: null, errors: [{ message: "unknown field requestPath" }] }),
+    };
+    const result = await call("cloudflare_web_analytics", {
+      accountTag: "a",
+      siteTag: "s",
+      since: "2026-08-01T00:00:00Z",
+      until: "2026-08-08T00:00:00Z",
+    });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("unknown field requestPath");
+  });
+
+  it("leaves an empty errors array alone -- that is what success looks like on Cloudflare REST", async () => {
+    respondWith = { status: 200, body: JSON.stringify({ success: true, errors: [], result: { id: "dns_1" } }) };
+    const result = await call("cloudflare_create_dns_record", {
+      zoneId: "z1",
+      type: "CNAME",
+      name: "www",
+      content: "example.vercel.app",
+    });
+    expect(result.isError).toBeFalsy();
+  });
+});
+
 describe("responses", () => {
   it("shapes a nested response into the flat keys the manifest declares", async () => {
     respondWith = {

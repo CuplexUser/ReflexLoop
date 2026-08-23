@@ -94,6 +94,28 @@ describe("manifest schema", () => {
     // no complaint.
     expect(errorsFor({ opperations: [] })).not.toBe("");
   });
+
+  it("refuses an array body on a form-encoded connector -- the two cannot both be true", () => {
+    const errors = errorsFor({
+      encoding: "form",
+      operations: [{ ...validOperation, method: "POST", bodyStyle: "array" }],
+    });
+    expect(errors).toContain('bodyStyle "array" needs encoding "json"');
+  });
+
+  it("refuses a resultList with an empty fields list rather than silently keeping everything", () => {
+    const errors = errorsFor({
+      operations: [{ ...validOperation, resultList: { path: "hits", fields: [] } }],
+    });
+    expect(errors).toContain("fields");
+  });
+
+  it("accepts basic auth, which needs only the env var holding login:password", () => {
+    expect(connectorManifest.safeParse({ ...validManifest, auth: { type: "basic", envVar: "X_AUTH" } }).success).toBe(
+      true
+    );
+    expect(errorsFor({ auth: { type: "basic" } })).toContain("needs an envVar");
+  });
 });
 
 describe("bundled connectors", () => {

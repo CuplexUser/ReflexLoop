@@ -1,0 +1,57 @@
+{
+  "id": "hackernews",
+  "label": "Hacker News (Algolia)",
+  "baseUrl": "https://hn.algolia.com/api/v1",
+  "docsUrl": "https://hn.algolia.com/api",
+  "auth": { "type": "none" },
+  "operations": [
+    {
+      "name": "hn_search",
+      "risk": "read",
+      "description": "Full-text search over Hacker News stories and comments, ranked by relevance. A demand signal with dates and vote counts attached, which a web search result summary is not: use it to check whether people are actually asking for a thing, what they already use, and what they complain about. No API key and no meaningful rate limit. Read-only.",
+      "method": "GET",
+      "path": "/search",
+      "params": {
+        "query": { "type": "string", "in": "query", "required": true, "describe": "Search terms" },
+        "tags": {
+          "type": "string",
+          "in": "query",
+          "default": "story",
+          "describe": "Filter by type: story, comment, ask_hn, show_hn, or a combination written as (story,comment)"
+        },
+        "numericFilters": {
+          "type": "string",
+          "in": "query",
+          "describe": "Numeric conditions, comma-separated: points>50, created_at_i>1750000000 (unix seconds), num_comments>10"
+        },
+        "hitsPerPage": { "type": "integer", "in": "query", "default": 20, "describe": "Results per page, max 1000" },
+        "page": { "type": "integer", "in": "query", "describe": "Zero-based page number" }
+      },
+      "result": { "totalHits": "nbHits" },
+      "resultList": {
+        "path": "hits",
+        "fields": ["title", "url", "points", "num_comments", "author", "created_at", "objectID", "story_title", "comment_text"],
+        "limit": 20
+      }
+    },
+    {
+      "name": "hn_search_recent",
+      "risk": "read",
+      "description": "The same Hacker News search ordered newest-first instead of by relevance. Use it when the question is whether something is still happening rather than what the canonical thread was -- a two-year-old top-ranked thread and a discussion from last week are very different evidence for a market. Read-only.",
+      "method": "GET",
+      "path": "/search_by_date",
+      "params": {
+        "query": { "type": "string", "in": "query", "required": true, "describe": "Search terms" },
+        "tags": { "type": "string", "in": "query", "default": "story", "describe": "Filter by type, as in hn_search" },
+        "numericFilters": { "type": "string", "in": "query", "describe": "Numeric conditions, as in hn_search" },
+        "hitsPerPage": { "type": "integer", "in": "query", "default": 20, "describe": "Results per page" }
+      },
+      "result": { "totalHits": "nbHits" },
+      "resultList": {
+        "path": "hits",
+        "fields": ["title", "url", "points", "num_comments", "author", "created_at", "objectID", "story_title", "comment_text"],
+        "limit": 20
+      }
+    }
+  ]
+}

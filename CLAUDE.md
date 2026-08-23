@@ -168,11 +168,11 @@ provider's key (`OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / 
 `MOONSHOT_API_KEY`). Then `AGENT_DOMAINS`, `AGENT_DB_PATH`, `AGENT_CYCLE_INTERVAL_MS`,
 `AGENT_MAX_PENDING_PROPOSALS`, `AGENT_SERVER_PORT`, `AGENT_API_TOKEN`, `AGENT_BIND_HOST`; optional
 search keys `TAVILY_API_KEY` / `BRAVE_API_KEY` (see below); optional integration keys `GITHUB_TOKEN` /
-`VERCEL_TOKEN` / `NETLIFY_AUTH_TOKEN` / `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
+`VERCEL_TOKEN` / `NETLIFY_AUTH_TOKEN` / `AGENT_NOTIFY_URL` (see `notify.ts`) / `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
 `QDRANT_EMBEDDING_DIM` (all four required together for semantic search) — each integration or feature
 is simply unavailable, not a startup error, when its keys are missing. Connector keys
-(`STRIPE_API_KEY` / `RESEND_API_KEY` / `PLAUSIBLE_API_KEY` / `CLOUDFLARE_API_TOKEN`, plus
-`AGENT_CONNECTORS_DIR`) work the same way, except that they're read per call rather than at startup,
+(`STRIPE_API_KEY` / `RESEND_API_KEY` / `PLAUSIBLE_API_KEY` / `CLOUDFLARE_API_TOKEN` /
+`BING_WEBMASTER_API_KEY` / `DATAFORSEO_AUTH`, plus `AGENT_CONNECTORS_DIR`) work the same way, except that they're read per call rather than at startup,
 so filling one in takes effect on the next cycle without a restart.
 
 **`AGENT_MODEL` has no default on purpose.** Providers rename and retire models constantly; a model id
@@ -652,18 +652,44 @@ on). A directive is consumed — injected into one research prompt, then cleared
   manifest (`connectors/defs/*.json`) describing a REST API: base URL, auth, and a list of operations
   with typed params. `manifest.ts` is the zod meta-schema, `load.ts` reads and validates the bundled
   dir plus `AGENT_CONNECTORS_DIR` at module load, `tools.ts` turns each operation into an ordinary
-  `ToolDefinition`. Shipped: Stripe, Resend, Plausible, Cloudflare.
+  `ToolDefinition`. Shipped: Stripe, Resend, Plausible, Cloudflare, Bing Webmaster Tools, IndexNow,
+  Hacker News, DataForSEO.
+
+  **Four of those exist to close the outcome loop**, which was the largest hole in the record: the
+  agent shipped repos and deployments and then reported how they were doing from prose. Cloudflare
+  Web Analytics (free, script-based, so it works on Vercel) answers pageviews/top paths/referrers,
+  Bing Webmaster Tools answers impressions and whether anything is indexed at all, IndexNow pushes
+  new URLs so there is something to measure within hours instead of weeks, and DataForSEO answers
+  real Google search volume — the number every comparison-site proposal used to guess from the
+  wording of search results. Google Search Console is the one that got away: it needs a consent
+  flow or a signed service-account JWT, so Bing is the 80% that fits in a manifest.
 
   The point is that adding a connector stopped being a nine-file change — a client module, two
   hand-maintained risk lists, a `deliverables.ts` switch case, a frontend label map — and became one
   file. Each operation declares its own `risk` next to itself, and `tool-catalog.ts` folds those
   declarations into the same lists everything already reads.
 
+  **Three things it can express that aren't obvious**, each added for exactly one API and then
+  reusable. A dotted `as` (`"variables.siteTag"`) nests a JSON body, which is what lets a flat,
+  model-friendly signature drive a GraphQL request — the alternative was an object-typed param, i.e.
+  the model hand-writing `{query, variables}` on every call. `bodyStyle: "array"` sends `[{...}]`,
+  which DataForSEO's live endpoints require and reject an object for. And `resultList` projects a
+  list response down to declared fields: **not cosmetic** — results are rendered into the transcript
+  against a hard character cap, so an unprojected listing spends that cap on `_highlightResult` and
+  thumbnail metadata and truncates away the part worth asking for. It returns `count` (before the
+  cap) alongside `items`, so "that was all of them" stays distinguishable from "there was more".
+  A 200 carrying a non-empty `errors` array is now an in-band error, because that is how GraphQL
+  reports failure and it was otherwise a successful call that returned nothing.
+
   **What it deliberately can't express**: file-upload deploys (Netlify's sha1 digest manifest,
   Vercel's file payload — those stay native TS in `integrations/`, and both kinds of tool look
-  identical to the model) and OAuth refresh flows, which is why the distribution category is email
-  and webhooks only. Manifests are operator-authored files at the same trust level as `.env`; the
-  agent never writes one.
+  identical to the model) and OAuth token round trips, which is why the distribution category is
+  email and webhooks only. That second one is a real limit, not a theoretical one: **Reddit's
+  keyless `.json` endpoints now answer 403 to every request**, browser user-agent and
+  `old.reddit.com` included, so a Reddit connector needs app credentials and a token exchange and
+  was dropped rather than shipped broken. Check an API actually answers before writing a manifest
+  for it. Manifests are operator-authored files at the same trust level as `.env`; the agent never
+  writes one.
 
   **Credentials are read at call time, never captured at module load** — the opposite of what
   `integrations/*.ts` do. That's what lets a key filled in while the loop runs work on the next call
@@ -729,6 +755,26 @@ on). A directive is consumed — injected into one research prompt, then cleared
   the bind host and `AGENT_API_TOKEN` can't move at all — you need the database before you can read
   settings out of it, and the token gates the console that would edit it. Adding a setting is one entry
   in `SETTINGS`; the API, the source reporting and the page are all driven off it.
+- `notify.ts` — pushes a message to the operator when a proposal starts waiting for review, and
+  nothing else. `humanReviewPhase` blocks on a promise until somebody clicks Approve or Reject, so
+  this is the only place the loop stops indefinitely: a cycle finishing at 03:00 sat there until the
+  next time a browser was opened. Subscribed on the event bus in `orchestrator.ts`, one level above
+  anything the model can reach — it is deliberately **not a tool**, since a "message the operator"
+  tool would open a channel out of the process that isn't the review flow, and the design rests on
+  the review flow being the only one.
+
+  The webhook flavour is **detected from the URL host** (Slack / Discord / ntfy / generic JSON)
+  rather than configured, because the URL already says which it is and a second env var that can
+  disagree with the first is a support question waiting to happen. `AGENT_NOTIFY_URL` lives in
+  `.env` with the provider keys — a Slack or Discord webhook URL is bearer-equivalent — and is read
+  per event, so filling it in mid-run works on the next proposal.
+
+  **Only `proposal_pending` is wired, on purpose.** Everything else either needs nothing from the
+  operator or is on screen by the time they arrive, and a channel that fires on everything is one
+  people mute — which would cost the loop the single signal that actually blocks it. Nothing here
+  throws: a webhook that is down costs a log line, never a phase, and `notify.test.ts` covers that
+  along with the per-service payload shapes (it needs no network — `buildRequest` is pure and
+  `sendNotification` takes an injected `fetch`).
 - `shutdown.ts` — `createShutdown`, the Ctrl-C path. Without it Ctrl-C was indistinguishable from
   `kill -9`, and **every `finally` in this process is load-bearing**: `runPhase` writes the run's
   cost to the ledger in one (so a killed research cycle's spend simply vanished), `drainQueue`

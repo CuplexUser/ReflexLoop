@@ -15,8 +15,9 @@
 //     aren't a JSON request shape, and pretending otherwise would mean a manifest
 //     format that's really a programming language. Those stay native TS in
 //     src/integrations/; both kinds of tool look identical to the model.
-//   - OAuth refresh flows (Reddit, X, LinkedIn). They need a token round trip before
-//     the call. Adding `auth.type: "oauth2_refresh"` later is contained to tools.ts.
+//   - OAuth token round trips (Reddit, X, LinkedIn, Google Search Console). They need a
+//     token fetched before the call, and the user-delegated ones a consent screen on top.
+//     Adding `auth.type: "oauth2_refresh"` later is contained to tools.ts.
 //
 // Manifests are operator-authored files on disk, at the same trust level as .env.
 // The agent never writes one -- "declarative" invites the opposite assumption, so
@@ -50,6 +51,13 @@ const paramSpec = z
     /**
      * The provider's own name for this field, when it differs from the tool argument.
      * Lets a manifest expose `priceId` while sending `line_items[0][price]`.
+     *
+     * On a JSON-encoded body a dotted name nests: `as: "variables.siteTag"` sends
+     * `{"variables": {"siteTag": ...}}`. That is what lets a flat, model-friendly tool
+     * signature drive a GraphQL request, whose body is always `{query, variables}` --
+     * the alternative was an `object` param type, i.e. asking the model to hand-write
+     * the nested payload. Form encoding is unaffected (Stripe's bracket syntax has no
+     * dots) and a name without a dot behaves exactly as before.
      */
     as: z.string().min(1).optional(),
     required: z.boolean().default(false),
@@ -80,6 +88,13 @@ const operationSpec = z
     path: z.string().startsWith("/"),
     params: z.record(z.string().regex(/^[A-Za-z][A-Za-z0-9]*$/), paramSpec).default({}),
     /**
+     * How the assembled body params are wrapped. "array" sends `[{...}]` instead of
+     * `{...}` -- DataForSEO's live endpoints take a JSON array of task objects and
+     * reject an object outright, so without this the connector layer simply cannot
+     * call them. JSON encoding only.
+     */
+    bodyStyle: z.enum(["object", "array"]).default("object"),
+    /**
      * Output key -> dot-path into the JSON response. This is how an API that nests its
      * link (Cloudflare wraps everything in `{result: ...}`) still satisfies the codebase
      * convention that a write tool returns a top-level `url` -- see tool-output.ts's
@@ -87,6 +102,28 @@ const operationSpec = z
      * Omit it and the whole response body comes back.
      */
     result: z.record(z.string().min(1), z.string().min(1)).optional(),
+    /**
+     * Projects a list response down to the fields worth paying for.
+     *
+     * This is not cosmetic. A tool result is rendered into the transcript and the model
+     * pays for every character; connector results are hard-capped at MAX_RESULT_CHARS.
+     * A Reddit listing of ten posts is ~80 KB of thumbnails, award metadata and flair,
+     * so without projection the useful part is *what gets truncated away* -- the tool
+     * would be worse than not having it. `path` is a dot-path to the array (numeric
+     * segments index it), `item` a dot-path into each element, `fields` the dot-paths
+     * to keep from each item, `limit` a cap on how many items come back. Returns
+     * `{count, items}` -- `count` is the length before the cap, so the model can tell
+     * "that was everything" from "there was more".
+     */
+    resultList: z
+      .object({
+        path: z.string().min(1),
+        item: z.string().min(1).optional(),
+        fields: z.array(z.string().min(1)).min(1).optional(),
+        limit: z.number().int().positive().optional(),
+      })
+      .strict()
+      .optional(),
     /** Declares that this operation produces something browsable, for the Deliverables page. */
     deliverable: z
       .object({
@@ -103,7 +140,13 @@ export type OperationSpec = z.infer<typeof operationSpec>;
 
 const authSpec = z
   .object({
-    type: z.enum(["bearer", "header", "query", "none"]),
+    /**
+     * "basic" holds `login:password` in the env var and base64-encodes it per call.
+     * DataForSEO (and most older REST APIs) want that, and the alternative -- `header`
+     * with an env var the operator has to remember to pre-encode *and* prefix with
+     * "Basic " -- fails as a silent 401 when they don't.
+     */
+    type: z.enum(["bearer", "basic", "header", "query", "none"]),
     /** Env var holding the credential. Also what decides whether the connector is configured. */
     envVar: z.string().min(1).optional(),
     /** Header name, for `type: "header"` (e.g. "X-Auth-Token"). */
@@ -139,6 +182,14 @@ export const connectorManifest = z
     }
     if (manifest.auth.type === "query" && !manifest.auth.queryName) {
       at(["auth", "queryName"], 'auth.type "query" needs a queryName');
+    }
+
+    if (manifest.encoding === "form") {
+      manifest.operations.forEach((op, i) => {
+        if (op.bodyStyle === "array") {
+          at(["operations", i, "bodyStyle"], 'bodyStyle "array" needs encoding "json"');
+        }
+      });
     }
 
     const seen = new Set<string>();

@@ -1,0 +1,42 @@
+{
+  "id": "indexnow",
+  "label": "IndexNow",
+  "baseUrl": "https://api.indexnow.org",
+  "docsUrl": "https://www.indexnow.org/documentation",
+  "auth": { "type": "none" },
+  "operations": [
+    {
+      "name": "indexnow_submit_urls",
+      "risk": "write",
+      "description": "Tell Bing, Yandex, Seznam and Naver that these URLs are new or changed, so they crawl in hours instead of weeks. There is no API key: ownership is proven by a plain-text file at https://<host>/<key>.txt whose only content is the key itself -- commit that file to the site first (any 8-128 char hex string works as a key), then call this with the same key. HTTP 200 means accepted, 403 means the key file is missing or does not match. Max 10000 URLs per call. Only usable when a proposal listing this tool has been approved.",
+      "method": "POST",
+      "path": "/indexnow",
+      "params": {
+        "host": {
+          "type": "string",
+          "in": "body",
+          "required": true,
+          "describe": "Bare hostname of the site, no scheme and no path, e.g. 'pms-compare.vercel.app'"
+        },
+        "key": {
+          "type": "string",
+          "in": "body",
+          "required": true,
+          "describe": "The key already hosted at https://<host>/<key>.txt"
+        },
+        "keyLocation": {
+          "type": "string",
+          "in": "body",
+          "as": "keyLocation",
+          "describe": "Full URL of the key file. Only needed when it is not at the host root, e.g. a subdirectory deploy"
+        },
+        "urlList": {
+          "type": "string[]",
+          "in": "body",
+          "required": true,
+          "describe": "Absolute URLs to submit. Every one must be on `host` or the whole request is rejected with 422"
+        }
+      }
+    }
+  ]
+}

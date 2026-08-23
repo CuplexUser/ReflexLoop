@@ -1,0 +1,57 @@
+{
+  "id": "bing_webmaster",
+  "label": "Bing Webmaster Tools",
+  "baseUrl": "https://ssl.bing.com/webmaster/api.svc/json",
+  "docsUrl": "https://learn.microsoft.com/en-us/dotnet/api/microsoft.bing.webmaster.api.interfaces.iwebmasterapi",
+  "auth": { "type": "query", "envVar": "BING_WEBMASTER_API_KEY", "queryName": "apikey" },
+  "operations": [
+    {
+      "name": "bing_rank_and_traffic",
+      "risk": "read",
+      "description": "Per-day impressions, clicks and indexed-page count for a site verified in Bing Webmaster Tools. The measured answer to 'did anything we shipped get indexed and seen', as opposed to an estimate. The site must already be added and verified in Bing Webmaster Tools; an unverified site answers with an empty list, not an error. Read-only.",
+      "method": "GET",
+      "path": "/GetRankAndTrafficStats",
+      "params": {
+        "siteUrl": {
+          "type": "string",
+          "in": "query",
+          "required": true,
+          "describe": "Site as registered in Bing Webmaster Tools, including scheme, e.g. 'https://example.com'"
+        }
+      },
+      "resultList": { "path": "d", "limit": 60 }
+    },
+    {
+      "name": "bing_query_stats",
+      "risk": "read",
+      "description": "The search queries a verified site actually appeared for, with impressions, clicks and average position. This is the closest thing available without Google Search Console's OAuth, and it answers whether the pages rank for the terms they were written for. Read-only.",
+      "method": "GET",
+      "path": "/GetQueryStats",
+      "params": {
+        "siteUrl": {
+          "type": "string",
+          "in": "query",
+          "required": true,
+          "describe": "Site as registered in Bing Webmaster Tools, including scheme"
+        }
+      },
+      "resultList": {
+        "path": "d",
+        "fields": ["Query", "Impressions", "Clicks", "AvgImpressionPosition", "AvgClickPosition", "Date"],
+        "limit": 50
+      }
+    },
+    {
+      "name": "bing_url_traffic_info",
+      "risk": "read",
+      "description": "Impressions, clicks and index status for one specific page of a verified site -- use it to check whether a single new page landed, rather than pulling the whole site's stats. Read-only.",
+      "method": "GET",
+      "path": "/GetUrlTrafficInfo",
+      "params": {
+        "siteUrl": { "type": "string", "in": "query", "required": true, "describe": "Site as registered in Bing Webmaster Tools" },
+        "url": { "type": "string", "in": "query", "required": true, "describe": "Absolute URL of the page to look up" }
+      },
+      "result": { "info": "d" }
+    }
+  ]
+}

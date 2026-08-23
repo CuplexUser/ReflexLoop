@@ -20,7 +20,7 @@ import { z } from "zod";
 import { defineTool, type ToolDefinition, type ToolHandlerResult } from "../tools/registry.js";
 import { assertPublicHttpUrl } from "../tools/web.js";
 import { CONNECTOR_OPERATIONS, type LoadedOperation } from "./load.js";
-import type { ConnectorManifest, ParamSpec } from "./manifest.js";
+import type { ConnectorManifest, OperationSpec, ParamSpec } from "./manifest.js";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 /** A read op can return a very long list; the model pays for every character of it. */
@@ -75,6 +75,12 @@ function authHeaders(manifest: ConnectorManifest): Record<string, string> {
   const token = auth.envVar ? process.env[auth.envVar] : undefined;
   if (!token) throw new Error(`${auth.envVar} is not set`);
   if (auth.type === "bearer") return { Authorization: `Bearer ${token}` };
+  // The env var holds `login:password`; encoding it here is what keeps the operator
+  // from having to base64 it by hand, which fails as a 401 rather than as an error
+  // saying what is wrong.
+  if (auth.type === "basic") {
+    return { Authorization: `Basic ${Buffer.from(token, "utf8").toString("base64")}` };
+  }
   if (auth.type === "header") return { [auth.headerName as string]: token };
   return {};
 }
@@ -93,6 +99,46 @@ function authQuery(manifest: ConnectorManifest): [string, string] | null {
  */
 function wireName(name: string, param: ParamSpec): string {
   return param.as ?? name;
+}
+
+/**
+ * Assigns into a nested object along a dot-path, creating the intermediate objects.
+ * `as: "variables.siteTag"` is what turns a flat tool signature into a GraphQL body.
+ * A path with no dot is a plain assignment, which is every pre-existing manifest.
+ */
+function setPath(target: Record<string, unknown>, path: string, value: unknown): void {
+  const keys = path.split(".");
+  let node = target;
+  for (const key of keys.slice(0, -1)) {
+    const next = node[key];
+    if (next === null || typeof next !== "object") node[key] = {};
+    node = node[key] as Record<string, unknown>;
+  }
+  node[keys[keys.length - 1]] = value;
+}
+
+/**
+ * The list projection declared by `resultList`. Kept separate from the scalar `result`
+ * shaping because the failure mode differs: a scalar map that resolves nothing means the
+ * API changed shape, while a `path` that isn't an array usually means the request itself
+ * failed in a way the provider reported with a 200.
+ */
+function projectList(parsed: unknown, spec: NonNullable<OperationSpec["resultList"]>): unknown {
+  const raw = pick(parsed, spec.path);
+  if (!Array.isArray(raw)) return null;
+  const items = raw.slice(0, spec.limit ?? raw.length).map((element) => {
+    const item = spec.item ? pick(element, spec.item) : element;
+    if (!spec.fields) return item;
+    const projected: Record<string, unknown> = {};
+    for (const field of spec.fields) {
+      const value = pick(item, field);
+      if (value !== undefined) projected[field.split(".").pop() as string] = value;
+    }
+    return projected;
+  });
+  // `count` is the length before the cap, so "that was all of them" is distinguishable
+  // from "there was more and you only got the top N".
+  return { count: raw.length, items };
 }
 
 function appendValue(target: URLSearchParams, key: string, value: unknown): void {
@@ -144,7 +190,9 @@ async function callOperation(op: LoadedOperation, args: Record<string, unknown>)
       body = form.toString();
       headers["content-type"] ??= "application/x-www-form-urlencoded";
     } else {
-      body = JSON.stringify(Object.fromEntries(bodyParams));
+      const payload: Record<string, unknown> = {};
+      for (const [key, value] of bodyParams) setPath(payload, key, value);
+      body = JSON.stringify(spec.bodyStyle === "array" ? [payload] : payload);
       headers["content-type"] ??= "application/json";
     }
   }
@@ -170,13 +218,28 @@ async function callOperation(op: LoadedOperation, args: Record<string, unknown>)
     parsed = text;
   }
 
-  if (!spec.result) return parsed;
+  // GraphQL reports failure with a 200 and an `errors` array, and Cloudflare's REST
+  // wrapper uses the same key (empty on success). Without this a failed query would be
+  // handed back as a successful call returning nothing.
+  if (parsed && typeof parsed === "object") {
+    const errors = (parsed as Record<string, unknown>).errors;
+    if (Array.isArray(errors) && errors.length > 0) {
+      throw new Error(
+        `${connector.label} ${spec.method} ${spec.path} -> ${JSON.stringify(errors).slice(0, MAX_ERROR_BODY_CHARS)}`
+      );
+    }
+  }
+
+  const list = spec.resultList ? projectList(parsed, spec.resultList) : null;
+
+  if (!spec.result) return list ?? parsed;
 
   const shaped: Record<string, unknown> = {};
   for (const [key, dotPath] of Object.entries(spec.result)) {
     const value = pick(parsed, dotPath);
     if (value !== undefined) shaped[key] = value;
   }
+  if (list) Object.assign(shaped, list);
   // A shaping map that resolved nothing usually means the API changed its response
   // shape. Handing back `{}` would report success with no information; the raw body
   // at least lets the model (and the action log) see what actually came back.

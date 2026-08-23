@@ -61,6 +61,7 @@ import {
   onRunNow,
   reportExecutionState,
 } from "./agent-control.js";
+import { startNotifier } from "./notify.js";
 import { startServer } from "./server.js";
 import { createShutdown, SHUTDOWN_SIGNALS } from "./shutdown.js";
 import { ControlSettingsWriter } from "./control-settings-writer.js";
@@ -1244,6 +1245,10 @@ async function mainLoop() {
   });
   persistSettings = (patch) => store.saveSettings(patch);
   const server = startServer(store, SERVER_PORT);
+  // Subscribed here rather than in server.ts because it is a property of the *loop* --
+  // console-only mode blocks on nothing and has nothing to announce. Registered before the
+  // first cycle so a proposal from that cycle is announced like any other.
+  extraClosers.push(startNotifier());
   // Caught rather than voided: this runs a research phase under the shutdown signal, so a
   // Ctrl-C during one rejected a floating promise and took the process down as an unhandled
   // rejection -- mid-shutdown, before the handles were closed.
@@ -1369,7 +1374,8 @@ let shuttingDown = false;
 /** In-flight `runPhase` calls -- what a shutdown waits on before closing the database. */
 let phasesInFlight = 0;
 let schedulerTimer: NodeJS.Timeout | null = null;
-/** Anything else holding a database handle -- console-only mode's second, narrow connection. */
+/** Anything else to release on the way out: the second, narrow DB connection console-only
+ * mode opens, and the notifier's subscription to the event bus. */
 const extraClosers: (() => void)[] = [];
 
 function installSignalHandlers(server?: { close(): unknown }): void {
