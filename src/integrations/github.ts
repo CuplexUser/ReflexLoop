@@ -102,10 +102,14 @@ export async function searchRepos(query: string, limit = 10) {
 
 // ---- write (act-phase, requires an approved proposal) ----------------------
 
-export async function createRepo(name: string, description: string, isPrivate: boolean) {
+// Always private, and deliberately not a parameter: publishing is the
+// operator's call, made in GitHub's own UI after looking at what was built.
+// A `isPrivate` argument would be one the model could set to false, so the
+// visibility decision is taken out of its reach entirely rather than defaulted.
+export async function createRepo(name: string, description: string) {
   const data = await gh<GithubRepo>(`/user/repos`, {
     method: "POST",
-    body: JSON.stringify({ name, description, private: isPrivate }),
+    body: JSON.stringify({ name, description, private: true }),
   });
   return { fullName: data.full_name, url: data.html_url, defaultBranch: data.default_branch };
 }

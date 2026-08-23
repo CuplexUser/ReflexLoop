@@ -113,7 +113,10 @@ to grant the permission, so it's never requested automatically.
   as a single commit (Git Data API: blob → tree → commit → ref update) and
   is preferred over the older one-file-per-call `github_commit_file`;
   `github_merge_pr` exists so a proposal that opens a PR can also land it
-  instead of leaving the default branch empty.
+  instead of leaving the default branch empty. **`github_create_repo` always
+  creates a private repo** — visibility isn't a parameter it can set, so
+  publishing stays a deliberate act you perform in GitHub's own UI after
+  looking at what was built.
 - `src/connectors/` — **connectors declared as JSON, not code.** A manifest in
   `src/connectors/defs/` describes a REST API (base URL, auth, and a list of
   operations with typed params); the loader turns each operation into a normal

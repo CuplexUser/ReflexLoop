@@ -70,9 +70,9 @@ export function buildIntegrationsTools(): ToolDefinition[] {
 
   const githubCreateRepo = defineTool(
     "github_create_repo",
-    "Create a new GitHub repo under the authenticated account. Only usable when a proposal listing this tool has been approved.",
-    { name: z.string(), description: z.string(), isPrivate: z.boolean().default(false) },
-    ({ name, description, isPrivate }) => toResult(() => github.createRepo(name, description, isPrivate))
+    "Create a new GitHub repo under the authenticated account. Always created private -- the operator makes it public later if they decide to. Only usable when a proposal listing this tool has been approved.",
+    { name: z.string(), description: z.string() },
+    ({ name, description }) => toResult(() => github.createRepo(name, description))
   );
 
   const githubCreateBranch = defineTool(

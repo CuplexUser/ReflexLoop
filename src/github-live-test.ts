@@ -61,7 +61,7 @@ async function expectRejection(label: string, fn: () => Promise<unknown>, patter
 
 async function makeRepo(suffix: string) {
   const name = `reflexloop-github-check-${Date.now()}-${suffix}`;
-  const repo = await createRepo(name, "Throwaway repo from npm run test:github. Safe to delete.", true);
+  const repo = await createRepo(name, "Throwaway repo from npm run test:github. Safe to delete.");
   created.push(repo.fullName);
   console.log(`  repo  ${repo.url}`);
   return name;

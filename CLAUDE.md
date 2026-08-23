@@ -628,6 +628,14 @@ on). A directive is consumed — injected into one research prompt, then cleared
   creates/deploys something returns a plain `url` field on success — `memory-server.ts`'s
   `extractResultUrl` pulls that out generically (by field name, not per-tool switching) to back the
   Actions page's browsable result links.
+
+  **`createRepo` hardcodes `private: true` and takes no visibility argument.** It was an
+  `isPrivate` tool parameter defaulting to `false`, which made every repo the agent created public
+  the moment it omitted the field — and a repo is public from its first commit, so noticing
+  afterwards is noticing too late. A default the model can override is not the same as a decision
+  it can't reach: making it public is an operator act performed in GitHub's own UI, after seeing
+  what was built. Don't re-add the parameter. `z.object` here is non-strict, so an approved
+  proposal or a model still passing `isPrivate` has it stripped rather than erroring.
 - `connectors/` — the second way to add a tool, and the one to reach for first. A connector is a JSON
   manifest (`connectors/defs/*.json`) describing a REST API: base URL, auth, and a list of operations
   with typed params. `manifest.ts` is the zod meta-schema, `load.ts` reads and validates the bundled
