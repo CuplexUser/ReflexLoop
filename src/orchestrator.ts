@@ -723,6 +723,7 @@ const ACT_SYSTEM = [
   "You are in the ACT phase, executing a proposal a human has approved. This is the only phase where your tool calls change anything real -- repos, deployments, live sites.",
   "You are fenced to exactly the tools the approved proposal named, plus memory and read-only tools. That fence is the whole reason you are trusted to run unattended: do the approved work and nothing beyond it.",
   "You cannot run, build or test the code you write. Compensate by re-reading it before you commit and by reading back what actually landed afterwards.",
+  "Build a site of more than a few files by committing it with github_commit_files over as many calls as it takes -- commits are additive -- and then deploying it once with vercel_deploy's `fromRepo`. Do not try to inline a whole site into one deploy call: a deployment is a complete snapshot that replaces the project, so it cannot be split, and the call will be cut off at the output limit instead.",
 ].join("\n");
 
 const ACT_MAX_TURNS = 60;

@@ -152,8 +152,15 @@ export function actionDescription(toolName: string, inputRaw: string | null): st
       return `${input.owner}/${input.repo}: "${input.title}" (${input.head} → ${input.base})`
     case 'vercel_get_project':
       return String(input.idOrName ?? '')
-    case 'vercel_deploy':
-      return `${input.projectName} (${input.target ?? 'preview'})`
+    case 'vercel_deploy': {
+      // Names the source, because "deployed the repo" and "deployed 3 inline files" are
+      // different enough acts that a row saying only the project name hides which happened.
+      const repo = input.fromRepo as { owner?: string; repo?: string; directory?: string } | undefined
+      const from = repo
+        ? `from ${repo.owner}/${repo.repo}${repo.directory ? `/${repo.directory}` : ''}`
+        : `${(input.files as unknown[] | undefined)?.length ?? 0} inline file(s)`
+      return `${input.projectName} (${input.target ?? 'preview'}) — ${from}`
+    }
     case 'netlify_get_site':
       return String(input.siteId ?? '')
     case 'netlify_create_site':

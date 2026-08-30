@@ -87,6 +87,96 @@ export async function readFile(owner: string, repo: string, path: string, ref?: 
   return { path: data.path, sha: data.sha, content: Buffer.from(data.content, "base64").toString("utf8") };
 }
 
+export interface TreeEntry {
+  path: string;
+  type: string;
+  sha: string;
+  size?: number;
+}
+
+/** One file to be read out of a repo, as `selectTreeFiles` resolved it. */
+export interface RepoFile {
+  /** Path as it should appear at the destination -- `directory` already stripped. */
+  path: string;
+  /** Blob sha, for `readBlob`. */
+  sha: string;
+  size: number;
+}
+
+/**
+ * The blobs in a tree listing, scoped to a subdirectory.
+ *
+ * Pure, and exported for that reason: everything interesting about reading a repo for
+ * deployment is this filter, and testing it needs neither a token nor a mock of GitHub's
+ * wire format. Non-blob entries (subtrees, submodule commit pointers) are dropped rather
+ * than errored -- a submodule is a legitimate thing for a repo to contain and simply has
+ * no content of its own to deploy.
+ *
+ * `directory` scopes to a subtree *and strips its prefix*, so a repo whose site lives in
+ * `public/` deploys `public/index.html` as `index.html`. Without the strip the site would
+ * deploy one level down and serve a 404 at the root -- live, reachable, and wrong.
+ */
+export function selectTreeFiles(entries: TreeEntry[], directory?: string): RepoFile[] {
+  const prefix = normalizeDirectory(directory);
+  const files: RepoFile[] = [];
+  for (const e of entries) {
+    if (e.type !== "blob") continue;
+    if (prefix && !e.path.startsWith(prefix)) continue;
+    const path = prefix ? e.path.slice(prefix.length) : e.path;
+    if (path === "") continue;
+    files.push({ path, sha: e.sha, size: e.size ?? 0 });
+  }
+  return files;
+}
+
+/** "", "/", "public", "public/", "/public" all mean the same subtree; normalize to "public/". */
+function normalizeDirectory(directory?: string): string {
+  const trimmed = (directory ?? "").replace(/^\/+|\/+$/g, "");
+  return trimmed === "" ? "" : `${trimmed}/`;
+}
+
+/**
+ * Every file in a repo at `ref`, as paths plus blob shas. Read-only.
+ *
+ * `truncated` is checked and thrown on rather than reported: GitHub answers 200 with a
+ * *partial* tree once the listing exceeds its response cap, so ignoring the flag would
+ * deploy part of a site and call it a success -- the same "reported fine, nothing there"
+ * failure the 404 branch in `resolveBase` refuses to create, one API over.
+ */
+export async function readTree(owner: string, repo: string, ref: string, directory?: string): Promise<RepoFile[]> {
+  const data = await gh<{ tree: TreeEntry[]; truncated?: boolean }>(
+    `/repos/${owner}/${repo}/git/trees/${encodeURIComponent(ref)}?recursive=1`
+  );
+  if (data.truncated) {
+    throw new Error(
+      `${owner}/${repo}@${ref} is too large to list in one request (GitHub returned a truncated tree), so only part of it could be read. Deploy a subdirectory with 'directory', or deploy from a smaller repo.`
+    );
+  }
+  const files = selectTreeFiles(data.tree ?? [], directory);
+  if (files.length === 0) {
+    const where = directory ? ` under '${directory}'` : "";
+    throw new Error(`${owner}/${repo}@${ref} has no files${where} to deploy.`);
+  }
+  return files;
+}
+
+/**
+ * One blob's raw bytes.
+ *
+ * Uses the default JSON response and decodes the base64 rather than asking for
+ * `application/vnd.github.raw`: GitHub's own reference is ambiguous about whether the raw
+ * media type returns bytes or base64 on *this* endpoint, and the only cost of the
+ * unambiguous path is server-side bandwidth nobody is billed tokens for. `Buffer.from`
+ * ignores the newlines GitHub inserts into the encoded content.
+ */
+export async function readBlob(owner: string, repo: string, sha: string): Promise<Buffer> {
+  const data = await gh<{ content: string; encoding: string }>(`/repos/${owner}/${repo}/git/blobs/${sha}`);
+  if (data.encoding !== "base64") {
+    throw new Error(`Blob ${sha} in ${owner}/${repo} came back as '${data.encoding}', which is not readable here.`);
+  }
+  return Buffer.from(data.content, "base64");
+}
+
 export async function searchRepos(query: string, limit = 10) {
   const data = await gh<{
     items: { full_name: string; description: string | null; stargazers_count: number; html_url: string; updated_at: string }[];

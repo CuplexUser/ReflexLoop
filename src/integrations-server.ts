@@ -147,13 +147,50 @@ export function buildIntegrationsTools(): ToolDefinition[] {
 
   const vercelDeploy = defineTool(
     "vercel_deploy",
-    "Deploy a small set of files to Vercel, wait for the build to finish, and delete the older deployments of the same project and target that this one replaces. Only usable when a proposal listing this tool has been approved. Files are inline text (no binaries).",
+    "Deploy to Vercel, wait for the build to finish, and delete the older deployments of the same project and target that this one replaces. Only usable when a proposal listing this tool has been approved. " +
+      "Give the files ONE of two ways. `fromRepo` deploys everything already committed to a GitHub repo -- prefer this for anything beyond a couple of small files, and for every real site. " +
+      "`files` inlines the content in this call, which is only workable for a handful of small text files: a deployment is a complete snapshot, so each call REPLACES the whole project and you cannot build a site up over several calls. " +
+      "The way to ship a large site is therefore github_commit_files as many times as it takes (commits are additive), then one vercel_deploy with fromRepo.",
     {
       projectName: z.string(),
-      files: z.array(z.object({ path: z.string(), content: z.string() })).min(1),
+      files: z
+        .array(z.object({ path: z.string(), content: z.string() }))
+        .min(1)
+        .optional()
+        .describe("Inline file contents. Only for a few small files; use fromRepo otherwise."),
+      fromRepo: z
+        .object({
+          owner: z.string(),
+          repo: z.string(),
+          ref: z.string().optional().describe("Branch, tag or commit sha. Defaults to the repo's default branch."),
+          directory: z
+            .string()
+            .optional()
+            .describe("Deploy only this subdirectory, served at the site root (e.g. 'public')."),
+        })
+        .optional()
+        .describe("Deploy the files already committed to this GitHub repo. Nothing is sent through this call."),
       target: z.enum(["production", "preview"]).default("preview"),
     },
-    ({ projectName, files, target }) => toResult(() => vercel.deploy(projectName, files, target))
+    ({ projectName, files, fromRepo, target }) => {
+      // Checked here rather than as a zod refinement: defineTool takes a shape, not a
+      // z.object, and an in-band message naming what to do next is the pattern the memory
+      // tools already use -- it costs the model a turn instead of the phase.
+      if (files && fromRepo) {
+        return Promise.resolve({
+          text: "Error: pass either `files` or `fromRepo`, not both. A deployment is one complete snapshot, so the two cannot be combined -- commit the inline files to the repo first, then deploy with `fromRepo` alone.",
+          isError: true,
+        });
+      }
+      if (!files && !fromRepo) {
+        return Promise.resolve({
+          text: "Error: vercel_deploy needs either `files` (a few small inline files) or `fromRepo` (everything committed to a GitHub repo). If this call was cut off at the output limit, that is the sign to commit the site with github_commit_files and deploy it with `fromRepo` instead.",
+          isError: true,
+        });
+      }
+      const source = fromRepo ? { repo: fromRepo } : { files: files! };
+      return toResult(() => vercel.deploy(projectName, source, target));
+    }
   );
 
   // ---- Netlify ----------------------------------------------------------------

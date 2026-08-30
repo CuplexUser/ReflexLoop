@@ -58,6 +58,7 @@ back — that refusal is deliberate, not a bug.
 npm install
 npm run smoke-test    # sanity-checks the DB + tool wiring directly, no API key needed — run this first
 npm run test:github   # opt-in live check of the GitHub write path; needs a real GITHUB_TOKEN, creates throwaway repos
+npm run test:vercel   # opt-in live check of deploy-from-repo; needs GITHUB_TOKEN + VERCEL_TOKEN, creates a throwaway repo + project
 npm test              # vitest run — unit tests over src/**/*.test.ts, no API key needed
 npm run typecheck     # tsc --noEmit over src/
 npm start             # tsx src/orchestrator.ts — runs the agent loop + web console together (one process, one SQLite connection)
@@ -648,6 +649,44 @@ on). A directive is consumed — injected into one research prompt, then cleared
   it can't reach: making it public is an operator act performed in GitHub's own UI, after seeing
   what was built. Don't re-add the parameter. `z.object` here is non-strict, so an approved
   proposal or a model still passing `isPrivate` has it stripped rather than erroring.
+
+  **`vercel_deploy` takes its files from a GitHub repo, not from the model's output.** A Vercel
+  deployment is an immutable, *complete* snapshot: every deploy replaces the project, so a site
+  cannot be built up over several calls, and the whole thing therefore had to fit inside one tool
+  call's arguments. A 21-file static site is past any output-token budget, so the turn truncated
+  mid-file and the agent wrote the limit down as "for sites of this size, the human must deploy via
+  the Vercel CLI" — the loop handing real work back to the operator. The limit was ours, not
+  Vercel's: `files[]` also accepts `{file, sha, size}` referencing blobs uploaded first to
+  `POST /v2/files` (sha1 in `x-vercel-digest`, octet-stream body), which is how the Vercel CLI
+  works. `deploy` now takes a `DeploySource` — inline `files` as before, or `{repo}`, which reads
+  the tree with `GITHUB_TOKEN` and streams each blob straight to Vercel. Paired with `commitFiles`,
+  which commits on `base_tree` and so **is** additive across calls, the pipeline is: commit over as
+  many calls as it takes, then deploy once from the repo.
+
+  **It is the same tool name on purpose.** `required_tools` is the act-phase fence and `verifyAct`
+  matches steps by exact tool name, so extending `vercel_deploy` rather than adding a
+  `vercel_deploy_repo` means every already-approved proposal and every step list keeps working with
+  no scope edit. It grants nothing new either: the act phase already reaches `GITHUB_TOKEN` through
+  the auto-granted read-only `github_read_file`, and this can still only deploy to Vercel. Passing
+  both sources, or neither, is an in-band error naming what to do next — the second one says that a
+  call cut off at the output limit is itself the signal to use `fromRepo`.
+
+  Three details that are load-bearing rather than incidental. `readTree` **throws on GitHub's
+  `truncated` flag**, because a partial tree comes back as a 200 and would otherwise deploy half a
+  site and report success. `selectTreeFiles` strips the `directory` prefix, so `public/index.html`
+  serves at the root — without that the site is live, reachable and 404s at its own front door;
+  it's pure and is what `vercel.test.ts` covers. And the deployment POST carries
+  `?skipAutoDetectionConfirmation=1`: a whole repo tree is far likelier than a hand-picked file
+  list to contain a `package.json`, and Vercel answers **400 asking you to confirm** when the
+  framework it detects differs from the project's setting, with nobody there to confirm it.
+
+  `npm run test:vercel` (`src/vercel-live-test.ts`) is the other half of the same
+  unit-tests-plus-live-script pair `test:github` established, and for the same reason — this is a
+  write path across *two* APIs, and every belief in it is a belief about somebody else's service.
+  It commits a 17-file site over three calls, deploys the `public/` subtree, **fetches the live URL
+  and asserts the committed bytes come back out of it**, then re-deploys to check the supersede
+  path. That last check is the one that separates "deployed" from "shipped". `netlify_deploy` still
+  carries the original inline-only limit.
 - `connectors/` — the second way to add a tool, and the one to reach for first. A connector is a JSON
   manifest (`connectors/defs/*.json`) describing a REST API: base URL, auth, and a list of operations
   with typed params. `manifest.ts` is the zod meta-schema, `load.ts` reads and validates the bundled
