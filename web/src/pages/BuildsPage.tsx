@@ -325,6 +325,9 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
         <TableToolbar view={queuedView.view} />
         <Table
           {...queuedView.tableProps}
+          columns={queuedView.columns}
+          components={queuedView.components}
+          scroll={queuedView.scroll}
           rowKey="proposalId"
           dataSource={queued}
           size="small"
@@ -345,6 +348,9 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
         <TableToolbar view={scheduledView.view} />
         <Table
           {...scheduledView.tableProps}
+          columns={scheduledView.columns}
+          components={scheduledView.components}
+          scroll={scheduledView.scroll}
           rowKey="proposalId"
           dataSource={scheduled}
           size="small"
@@ -365,6 +371,9 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
         </Space>
         <Table
           {...stalledView.tableProps}
+          columns={stalledView.columns}
+          components={stalledView.components}
+          scroll={stalledView.scroll}
           rowKey="proposalId"
           dataSource={stalled}
           size="small"
