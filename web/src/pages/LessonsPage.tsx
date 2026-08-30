@@ -3,7 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { Input, Progress, Space, Switch, Table, Tag, Tooltip, Typography } from 'antd'
 import type { LessonRow } from '../types'
 import { api } from '../api'
-import { timeAgo } from '../format'
+import { matchesQuery, timeAgo } from '../format'
 import { palette } from '../theme'
 import { LessonDialog } from '../components/LessonDialog'
 import { TableToolbar } from '../components/TableToolbar'
@@ -37,13 +37,14 @@ export function LessonsPage({ historyVersion }: { historyVersion: number }) {
     [lessons],
   )
 
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase()
-    return lessons.filter((l) => {
-      if (!showMuted && l.muted === 1) return false
-      return !q || `${l.domain} ${l.lesson}`.toLowerCase().includes(q)
-    })
-  }, [lessons, search, showMuted])
+  const filtered = useMemo(
+    () =>
+      lessons.filter((l) => {
+        if (!showMuted && l.muted === 1) return false
+        return matchesQuery(search, l.id, l.domain, l.lesson)
+      }),
+    [lessons, search, showMuted],
+  )
 
   const { rowClassName } = useTableKeyboardNav<LessonRow>({
     rows: filtered,
@@ -53,6 +54,16 @@ export function LessonsPage({ historyVersion }: { historyVersion: number }) {
 
   const baseColumns = useMemo(
     () => [
+      // The id is how a lesson is named everywhere it is talked about -- an outcome citing it,
+      // a dedup refusal answering "lesson #12 already says this", a note in this repo -- so it
+      // has to be visible here, not only in the CSV export. Hideable like any other column.
+      {
+        title: '#',
+        dataIndex: 'id',
+        width: 70,
+        sorter: (a: LessonRow, b: LessonRow) => a.id - b.id,
+        render: (v: number) => <span className="mono">#{v}</span>,
+      },
       {
         title: 'Domain',
         dataIndex: 'domain',
@@ -128,7 +139,7 @@ export function LessonsPage({ historyVersion }: { historyVersion: number }) {
         <Space size={16} wrap>
           <Input.Search
             allowClear
-            placeholder="Search domain or lesson…"
+            placeholder="Search domain or lesson, or #12 for an id…"
             style={{ width: 320 }}
             value={search}
             onChange={(e) => setSearch(e.target.value)}

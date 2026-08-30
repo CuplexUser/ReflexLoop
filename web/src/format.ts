@@ -184,3 +184,24 @@ export function actionDescription(toolName: string, inputRaw: string | null): st
     }
   }
 }
+
+/**
+ * Does a row match a free-text filter, where the filter may name the row's id?
+ *
+ * Lessons and research notes are referred to by id everywhere the id is not actually
+ * visible: `lesson_reinforce({id: 12})` in the action log, "already says this (73% similar)"
+ * dedup refusals naming `#12`, an outcome citing a lesson, this project's own notes. The
+ * only way to open one was to already know the `/lessons/12` deep link, because the search
+ * box matched body text alone.
+ *
+ * `#12` is treated as an id and nothing else -- the `#` is how someone says "I mean the id",
+ * and letting it also match prose would bury the one row asked for. A bare `12` matches the
+ * id *or* the text, since a number in a lesson body is a legitimate thing to search for.
+ */
+export function matchesQuery(query: string, id: number, ...text: (string | null | undefined)[]): boolean {
+  const q = query.trim().toLowerCase()
+  if (!q) return true
+  if (q.startsWith('#')) return String(id) === q.slice(1).trim()
+  if (/^\d+$/.test(q) && String(id) === q) return true
+  return text.join(' ').toLowerCase().includes(q)
+}

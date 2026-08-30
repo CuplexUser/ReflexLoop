@@ -5,7 +5,7 @@ import { MergeCellsOutlined } from '@ant-design/icons'
 import type { DuplicateNotePair, ResearchNoteRow } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
-import { markdownPreview, timeAgo } from '../format'
+import { markdownPreview, matchesQuery, timeAgo } from '../format'
 import { palette } from '../theme'
 import { ResearchNoteDialog } from '../components/ResearchNoteDialog'
 import { TableToolbar } from '../components/TableToolbar'
@@ -139,11 +139,10 @@ export function ResearchPage({ historyVersion }: { historyVersion: number }) {
   const openNote = useCallback((n: ResearchNoteRow) => navigate(`/research/${n.id}`), [navigate])
   const closeNote = useCallback(() => navigate('/research'), [navigate])
 
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase()
-    if (!q) return notes
-    return notes.filter((n) => `${n.topic} ${n.finding} ${n.source ?? ''}`.toLowerCase().includes(q))
-  }, [notes, search])
+  const filtered = useMemo(
+    () => notes.filter((n) => matchesQuery(search, n.id, n.topic, n.finding, n.source)),
+    [notes, search],
+  )
 
   const { rowClassName } = useTableKeyboardNav<ResearchNoteRow>({
     rows: filtered,
@@ -153,6 +152,15 @@ export function ResearchPage({ historyVersion }: { historyVersion: number }) {
 
   const baseColumns = useMemo(
     () => [
+      // Same reason as the Lessons table: the merge dialog, the dedup refusals and every
+      // reference to a note name it by id, which was visible nowhere on this page.
+      {
+        title: '#',
+        dataIndex: 'id',
+        width: 70,
+        sorter: (a: ResearchNoteRow, b: ResearchNoteRow) => a.id - b.id,
+        render: (v: number) => <span className="mono">#{v}</span>,
+      },
       {
         title: 'Topic',
         dataIndex: 'topic',
@@ -213,7 +221,7 @@ export function ResearchPage({ historyVersion }: { historyVersion: number }) {
       <Space size={12} wrap style={{ width: '100%', justifyContent: 'space-between' }}>
         <Input.Search
           allowClear
-          placeholder="Search topic, finding, or source…"
+          placeholder="Search topic, finding, source, or #145 for an id…"
           style={{ width: 360 }}
           value={search}
           onChange={(e) => setSearch(e.target.value)}
