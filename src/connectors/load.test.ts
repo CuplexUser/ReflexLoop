@@ -110,6 +110,31 @@ describe("manifest schema", () => {
     expect(errors).toContain("fields");
   });
 
+  // A default that doesn't match its param's type loads fine and then fails on the first
+  // call, when zod rejects the value we supplied ourselves -- a tool that exists and
+  // cannot be used. TED needs the list form: its search rejects a request whose `fields`
+  // is absent or empty, so the default is what keeps that off the model's plate.
+  it("accepts a list default on a string[] param and refuses a scalar one", () => {
+    const listParam = (def: unknown) => ({
+      operations: [
+        {
+          ...validOperation,
+          method: "POST",
+          params: { fields: { type: "string[]", in: "body", default: def } },
+        },
+      ],
+    });
+    expect(connectorManifest.safeParse({ ...validManifest, ...listParam(["a", "b"]) }).success).toBe(true);
+    expect(errorsFor(listParam("a,b"))).toContain('a "string[]" param needs a list default');
+    expect(
+      errorsFor({
+        operations: [
+          { ...validOperation, method: "POST", params: { n: { type: "integer", in: "body", default: ["x"] } } },
+        ],
+      })
+    ).toContain('a "integer" param needs a scalar default');
+  });
+
   it("accepts basic auth, which needs only the env var holding login:password", () => {
     expect(connectorManifest.safeParse({ ...validManifest, auth: { type: "basic", envVar: "X_AUTH" } }).success).toBe(
       true

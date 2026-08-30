@@ -61,7 +61,13 @@ const paramSpec = z
      */
     as: z.string().min(1).optional(),
     required: z.boolean().default(false),
-    default: z.union([z.string(), z.number(), z.boolean()]).optional(),
+    /**
+     * A list default is what lets an API that *requires* an array still be driven by a
+     * tool signature the model can ignore: TED's search rejects a request whose `fields`
+     * is absent or empty, so without this the model would have to retype the same nine
+     * field names on every call, and a typo in one of them is a 400.
+     */
+    default: z.union([z.string(), z.number(), z.boolean(), z.array(z.string().min(1)).min(1)]).optional(),
     describe: z.string().optional(),
     /** Allowed values, for `type: "enum"`. */
     values: z.array(z.string().min(1)).min(1).optional(),
@@ -222,6 +228,12 @@ export const connectorManifest = z
         }
         if (param.required && param.default !== undefined) {
           at([...p, "default"], "a required param cannot also have a default");
+        }
+        // A default that doesn't match its param's type reaches zod as a value it will
+        // reject on the first call, i.e. a manifest that loads and a tool that cannot be
+        // used -- which is exactly the failure the meta-schema exists to catch at load.
+        if (Array.isArray(param.default) !== (param.type === "string[]") && param.default !== undefined) {
+          at([...p, "default"], `a "${param.type}" param needs a ${param.type === "string[]" ? "list" : "scalar"} default`);
         }
         if (op.method === "GET" && param.in === "body") {
           at([...p, "in"], "GET requests have no body -- use \"query\"");

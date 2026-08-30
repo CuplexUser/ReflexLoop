@@ -118,6 +118,24 @@ function setPath(target: Record<string, unknown>, path: string, value: unknown):
 }
 
 /**
+ * The key each declared field is projected under: its last dot segment, which is what
+ * flattens `ruleset.zone_name` to `zone_name`. Two fields can collapse to the same one --
+ * TED returns `notice-title` and `buyer-name` as per-language maps, so `notice-title.swe`
+ * and `buyer-name.swe` both end in `swe` -- and whichever came second used to overwrite
+ * the first silently, i.e. the manifest looked like it asked for both and one was simply
+ * missing. Colliding fields keep their full path as the key instead.
+ *
+ * Computed once per projection rather than per item, so a field that happens to be absent
+ * from one element can't change the keys the other elements come back under.
+ */
+function projectionKeys(fields: string[]): string[] {
+  const short = fields.map((field) => field.split(".").pop() as string);
+  return fields.map((field, i) =>
+    short.some((name, j) => j !== i && name === short[i]) ? field : short[i]
+  );
+}
+
+/**
  * The list projection declared by `resultList`. Kept separate from the scalar `result`
  * shaping because the failure mode differs: a scalar map that resolves nothing means the
  * API changed shape, while a `path` that isn't an array usually means the request itself
@@ -126,14 +144,15 @@ function setPath(target: Record<string, unknown>, path: string, value: unknown):
 function projectList(parsed: unknown, spec: NonNullable<OperationSpec["resultList"]>): unknown {
   const raw = pick(parsed, spec.path);
   if (!Array.isArray(raw)) return null;
+  const keys = spec.fields ? projectionKeys(spec.fields) : [];
   const items = raw.slice(0, spec.limit ?? raw.length).map((element) => {
     const item = spec.item ? pick(element, spec.item) : element;
     if (!spec.fields) return item;
     const projected: Record<string, unknown> = {};
-    for (const field of spec.fields) {
+    spec.fields.forEach((field, i) => {
       const value = pick(item, field);
-      if (value !== undefined) projected[field.split(".").pop() as string] = value;
-    }
+      if (value !== undefined) projected[keys[i]] = value;
+    });
     return projected;
   });
   // `count` is the length before the cap, so "that was all of them" is distinguishable

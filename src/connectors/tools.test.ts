@@ -217,6 +217,47 @@ describe("list projection", () => {
     expect(parsed.items[0]).toMatchObject({ site_tag: "abc", zone_name: "example.com" });
   });
 
+  // TED returns notice-title and buyer-name as per-language maps, so both declared fields
+  // end in `swe`. Keying purely by the last segment made the second overwrite the first --
+  // the manifest asked for both and one silently wasn't there.
+  it("keeps the full path as the key when two fields collapse to the same last segment", async () => {
+    respondWith = {
+      status: 200,
+      body: JSON.stringify({
+        totalNoticeCount: 62,
+        notices: [
+          {
+            "publication-number": "566539-2026",
+            "notice-title": { swe: "Sverige - Datatjanster", eng: "Sweden - Data services" },
+            "buyer-name": { swe: ["Region Gavleborg"] },
+            links: { html: { SWE: "https://ted.europa.eu/sv/notice/-/detail/566539-2026" } },
+          },
+        ],
+      }),
+    };
+    const result = await call("ted_search_notices", { query: "place-of-performance IN (SWE)" });
+    const parsed = JSON.parse(result.text) as { totalNoticeCount: number; items: Record<string, unknown>[] };
+    expect(parsed.totalNoticeCount).toBe(62);
+    expect(parsed.items[0]).toMatchObject({
+      "publication-number": "566539-2026",
+      "notice-title.swe": "Sverige - Datatjanster",
+      "buyer-name.swe": ["Region Gavleborg"],
+    });
+    // Uncontested names still flatten -- this is a tie-break, not a change of convention.
+    expect(Object.keys(parsed.items[0])).toContain("publication-number");
+    expect(result.text).not.toContain("links");
+  });
+
+  it("sends the declared list default when the model leaves the param out", async () => {
+    respondWith = { status: 200, body: JSON.stringify({ notices: [] }) };
+    await call("ted_search_notices", { query: "*" });
+    const body = JSON.parse(captured[0].body as string) as { fields: string[]; scope: string; limit: number };
+    // TED answers 400 to a request with no fields, so the default is load-bearing, not polish.
+    expect(body.fields).toContain("notice-title");
+    expect(body.scope).toBe("ACTIVE");
+    expect(body.limit).toBe(12);
+  });
+
   it("falls back to the raw body when the declared path is not an array", async () => {
     respondWith = { status: 200, body: JSON.stringify({ message: "no hits key here" }) };
     const result = await call("hn_search", { query: "x" });

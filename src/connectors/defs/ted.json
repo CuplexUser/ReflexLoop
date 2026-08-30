@@ -1,0 +1,80 @@
+{
+  "id": "ted",
+  "label": "TED (Tenders Electronic Daily)",
+  "baseUrl": "https://api.ted.europa.eu",
+  "docsUrl": "https://docs.ted.europa.eu/api/latest/search.html",
+  "auth": {
+    "type": "none"
+  },
+  "operations": [
+    {
+      "name": "ted_search_notices",
+      "risk": "read",
+      "description": "Search EU public-procurement notices published on TED. Free, no API key, no account. The endpoint is POST-only (a GET answers 405), which is why this exists as a connector rather than being reachable with WebFetch. `query` takes TED expert-search syntax, e.g. `classification-cpv IN (72000000) AND place-of-performance IN (SWE) AND publication-date>=today(-7)` for IT-services tenders published in Sweden in the last week. Each result carries its publication number; the public notice page is https://ted.europa.eu/sv/notice/-/detail/{publication-number} (swap sv for another language code), which WebFetch can read for the full text. Results come back as the Swedish title, buyer, CPV codes, submission deadline and contract value per notice; the lot descriptions are deliberately not included, since they run to thousands of characters and the notice page has them in full. Covers above-threshold notices only -- Swedish below-threshold tenders live in commercial ad databases and are not in here. Read-only.",
+      "method": "POST",
+      "path": "/v3/notices/search",
+      "params": {
+        "query": {
+          "type": "string",
+          "in": "body",
+          "required": true,
+          "describe": "TED expert-search expression. Fields are hyphenated (classification-cpv, place-of-performance, publication-date, buyer-name, notice-type), combined with AND/OR, sets written as IN (a, b), dates as publication-date>=today(-30) or an ISO date. Match everything with *."
+        },
+        "fields": {
+          "type": "string[]",
+          "in": "body",
+          "default": [
+            "publication-number",
+            "publication-date",
+            "notice-type",
+            "notice-title",
+            "buyer-name",
+            "classification-cpv",
+            "deadline-receipt-request",
+            "total-value"
+          ],
+          "describe": "Advanced; leave unset and the default list is sent. TED rejects a request with no fields. The response is projected down to this same set before you see it, so a name added here is fetched and then dropped."
+        },
+        "scope": {
+          "type": "enum",
+          "in": "body",
+          "values": [
+            "ACTIVE",
+            "ALL",
+            "LATEST"
+          ],
+          "default": "ACTIVE",
+          "describe": "ACTIVE is the default and what a subscriber wants: notices still live. ALL adds the ones that are no longer active (measured: 375 vs 366 on the same 90-day Swedish IT query). LATEST is a far narrower slice (7 on that query) -- don't reach for it expecting 'most recent'."
+        },
+        "page": {
+          "type": "integer",
+          "in": "body",
+          "describe": "1-based page number"
+        },
+        "limit": {
+          "type": "integer",
+          "in": "body",
+          "default": 12,
+          "describe": "Notices per page, and 12 is also how many are rendered back to you -- raise it and the extra ones are fetched and dropped, so page through instead. `totalNoticeCount` says how many matched in total."
+        }
+      },
+      "result": {
+        "totalNoticeCount": "totalNoticeCount"
+      },
+      "resultList": {
+        "path": "notices",
+        "fields": [
+          "publication-number",
+          "publication-date",
+          "notice-type",
+          "notice-title.swe",
+          "buyer-name.swe",
+          "classification-cpv",
+          "deadline-receipt-request",
+          "total-value"
+        ],
+        "limit": 12
+      }
+    }
+  ]
+}
