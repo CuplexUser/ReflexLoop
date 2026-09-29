@@ -1,12 +1,14 @@
 # Semantic search
 
-`research_note_search` and `lesson_search` embed with Qdrant Cloud Inference
-and rank by vector similarity when Qdrant is configured, so a lesson written
-for "VS Code extension for productivity" can still surface for a proposal in
-"VS Code extensions" — wording doesn't have to match. Without it configured,
-both fall back to the original `LIKE`-based search, so nothing breaks if you
-skip it. `MemoryStore.syncToQdrant()` runs once at startup to backfill any
-rows that were written before Qdrant was configured.
+When Qdrant is configured, `research_note_search` and `lesson_search` find results by meaning
+rather than exact wording. A lesson written about "VS Code extension for productivity" can still
+turn up for a proposal about "VS Code extensions".
 
-Configuration is four env vars, all required together — see
-[Setup and configuration](configuration.md#environment).
+The search is hybrid: it combines meaning-based matching with keyword matching, which catches
+rare exact terms such as product or competitor names.
+
+Qdrant is optional. Without it, both tools fall back to plain text matching, and nothing breaks.
+At startup the agent copies any rows that are not yet in Qdrant, so you can add it at any time.
+
+Setup takes four environment variables, all required together. See
+[Setup and configuration](configuration.md#optional).

@@ -1,61 +1,61 @@
 # agent-runner
 
-An autonomous agent with persistent memory, run outside any chat UI, with a web
-console (React + Ant Design) to watch it work, approve or reject what it wants
-to do, and set priority/scheduling on approved work. No sub-agents: nothing in
-the tool registry can spawn one.
+An autonomous agent that looks for ways to make money, proposes concrete plans, and acts on
+them only after you approve. It keeps a persistent memory of what it has tried and learned, and
+it comes with a web console where you can watch it work and make the decisions.
 
-**Bring your own model.** It calls model APIs directly over HTTP — no Claude
-Code, no Agent SDK, no vendor SDK. Set `AGENT_PROVIDER` to `openrouter`,
-`openai`, `anthropic`, `xai` (Grok) or `moonshot` (Kimi), set that provider's
-key, and name a model in `AGENT_MODEL`. Different phases can use different
-models: cheap and wide for research, your best model for writing the code.
+## How it works
 
-**No proposal, no action, ever.** Each cycle is **research + plan → your
-approval → act → record outcome → reflect into a lesson**. Nothing with
-real-world effect runs without a proposal a human explicitly approved, and the
-act phase is fenced to exactly the tools that proposal named. Don't wire
-anything to auto-approve "to save time" — that deletes the one safeguard the
-rest of the design assumes is there.
+Each cycle has four steps:
 
-Every proposal has to state how it makes money: a revenue model, who pays, at
-what price, how the *first* dollar is actually collected, and an ordered step
-list to get there — so the review decision isn't made on a headline number and
-a paragraph of prose.
+1. **Research and plan.** The agent researches the goals you gave it and files proposals.
+2. **Review.** You approve or reject each proposal in the web console.
+3. **Act.** The agent carries out an approved proposal, using only the tools that proposal named.
+4. **Reflect.** It records the real outcome and writes down a lesson for next time.
+
+## Design principles
+
+**No proposal, no action.** Nothing with a real-world effect runs unless a person has approved
+a proposal for it. The act phase is limited to exactly the tools that proposal asked for. Please
+don't add anything that approves proposals automatically, since every other safeguard depends
+on this one.
+
+**Every proposal explains how it makes money.** A proposal must name a revenue model, who pays,
+the price, how the first payment actually gets collected, and an ordered list of steps to get
+there. You decide on a plan, not on a headline number.
+
+**Bring your own model.** The agent calls model APIs directly over HTTP, with no vendor SDK.
+Supported providers are OpenRouter, OpenAI, Anthropic, xAI (Grok) and Moonshot (Kimi). Each
+phase can use a different model, for example a cheap one for research and your strongest one
+for writing code.
+
+**No sub-agents.** Nothing in the tool registry can start another agent.
 
 ## Quickstart
 
 ```bash
 npm install
-npm run smoke-test   # sanity-checks the DB and tool wiring, no API calls
-cp .env.example .env # then set AGENT_PROVIDER, AGENT_MODEL and that provider's key
-npm start            # agent loop + web console, one process
+npm run smoke-test    # checks the database and tool wiring, no API calls
+cp .env.example .env  # then set AGENT_PROVIDER, AGENT_MODEL and that provider's key
+npm start             # runs the agent loop and the web console together
 ```
 
-Open `http://localhost:4001` (or your `AGENT_SERVER_PORT`) to watch it
-research, review proposals as they come in, and browse
-history/lessons/research notes.
+Then open `http://localhost:4001`, or whichever port you set in `AGENT_SERVER_PORT`.
 
-Everything else — search keys, GitHub/Vercel/Netlify tokens, connector keys,
-Qdrant — is optional, and each is simply unavailable rather than a startup
-error when its key is missing. Read [Running it](docs/operations.md) before
-leaving it unattended.
+Everything beyond the model key is optional: search keys, GitHub, Vercel and Netlify tokens,
+connector keys, and Qdrant. If a key is missing, that feature is simply unavailable. Please read
+[Running it safely](docs/operations.md) before you leave the agent running unattended.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — the four-phase cycle, scheduling and
-  priority, and what every module in `src/` is for.
-- [Setup and configuration](docs/configuration.md) — install, the `.env` vars,
-  and the frontend dev workflow.
-- [The web console](docs/web-console.md) — every page, and what Settings can
-  change without a restart.
-- [Semantic search](docs/semantic-search.md) — what Qdrant adds, and what
-  happens without it.
-- [Reading the record from Claude Desktop](docs/mcp-server.md) — the read-only
-  MCP server and how to register it.
-- [Running it](docs/operations.md) — multiple lanes, the tool fence, and the
-  unattended checklist.
+| Guide | What it covers |
+| --- | --- |
+| [Architecture](docs/architecture.md) | The cycle, scheduling, and what each module does |
+| [Setup and configuration](docs/configuration.md) | Installing, environment variables, frontend development |
+| [The web console](docs/web-console.md) | Each page, and what the Settings page can change |
+| [Semantic search](docs/semantic-search.md) | What Qdrant adds, and what happens without it |
+| [Claude Desktop access](docs/mcp-server.md) | The read-only MCP server and how to register it |
+| [Running it safely](docs/operations.md) | Goals, the tool fence, and a checklist for unattended runs |
 
-`CLAUDE.md` is the working brief for agents editing this codebase — the *why*
-behind these decisions. `TODO.md` has known follow-ups (moving large blobs off
-SQLite, switching to npm workspaces).
+`CLAUDE.md` is the working brief for AI agents that edit this codebase. It explains the reasoning
+behind the design. `TODO.md` lists known follow-up work.

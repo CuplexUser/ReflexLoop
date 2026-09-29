@@ -1,64 +1,60 @@
-# Reading the record from Claude Desktop
+# Claude Desktop access
 
-`npm run mcp` starts an MCP server (`src/mcp-server.ts`) that gives Claude
-Desktop — or any MCP client — eight read-only tools over the agent's record:
+`npm run mcp` starts an MCP server (`src/mcp-server.ts`) that gives Claude Desktop, or any other
+MCP client, read-only access to the agent's record.
+
+## Tools
 
 | Tool | What it answers |
 | --- | --- |
-| `goals_list` | "What is it pointed at, and is each lane still producing?" |
-| `research_notes_search` | "What did it find out about X?" |
-| `research_notes_list` | The most recent notes, newest first |
-| `lessons_search` | "What has it learned about X?" |
+| `goals_list` | What is the agent working on, and is each goal still producing? |
+| `research_notes_search` | What did it find out about a topic? |
+| `research_notes_list` | The most recent research notes |
+| `lessons_search` | What has it learned about a topic? |
 | `lessons_list` | The most recently updated lessons |
-| `proposals_list` | "What is waiting on my decision?" — also `stalled` builds |
-| `proposal_get` | One proposal in full: fence, money path, steps, verdict |
-| `deliverables_list` | "What exists now, and where do I click?" |
+| `proposals_list` | What is waiting for my decision? Also lists stalled builds. |
+| `proposal_get` | One proposal in full: tools, money path, steps and result |
+| `deliverables_list` | What exists now, and where can I find it? |
 
-They all take a `limit` (default 10, max 100 — `goals_list` shows every goal by
-default, since there are only a handful and they're the point). The note and
-lesson tools take a `goal`, and the note tools a `kind` (`gap` / `saturated` /
-`competitor` / …). `goal` is a goal *title*, matched case-insensitively on a
-substring; a name that matches nothing answers with the list of goals that
-exist, so a wrong guess teaches you the vocabulary in the same turn.
+### Parameters
 
-`goals_list` merges each goal with its health — proposals, approved, shipped,
-spend, and the empty cycles since it last produced anything, which is the "is
-this lane dead?" number. A `suggested` goal is one the agent proposed and it
-says so plainly: it is inert until a human accepts it in the console.
+- Every tool takes a `limit`, which defaults to 10 with a maximum of 100. `goals_list` shows all
+  goals by default, since there are only a few.
+- The note and lesson tools accept a `goal`, matched against goal titles without regard to case.
+  If nothing matches, the answer lists the goals that do exist.
+- The note tools also accept a `kind`, such as `gap`, `saturated` or `competitor`.
 
-`proposal_get` is where the things a review decision actually turns on live and
-which were unreachable before: the act-phase fence (`required_tools`, each
-badged write / read / memory), the monetization block the research phase had to
-state before it could file the proposal, the ordered steps and who owns each,
-whether the approved work finished, and what the proposal cost in model API
-spend to produce.
+### What the answers include
 
-It reads `data/agent.db` directly, opened read-only the same way console-only
-mode opens it, so it works whether or not `npm start` is running and needs no
-port and no `AGENT_API_TOKEN`.
+- **`goals_list`** shows each goal's health: proposals, approvals, shipped work, spend, and the
+  number of empty cycles since it last produced anything. A goal with the status `suggested` was
+  proposed by the agent and has no effect until you accept it in the console.
+- **`proposal_get`** shows the approved tools (each labeled as write, read or memory), the
+  monetization details, the ordered steps and who owns each one, whether the work finished, and
+  how much the proposal cost in model API spend.
+- **Search results** carry a relevance score when [Qdrant](semantic-search.md) is configured. Without
+  it, search uses plain text matching and no score is shown.
 
-**There is deliberately no tool that writes** — no adding, editing, muting or
-deleting, no approving a proposal, no accepting a suggested goal. Those are
-human acts performed in the console, and muted lessons are excluded here exactly
-as they are for the agent itself: a lesson taken out of the agent's reasoning
-must not come back through a second door. There is also **no live status or
-build-queue tool**, because what is running right now lives in the
-orchestrator's memory, not in the database — a tool reporting "nothing running"
-mid-deploy would be worse than no tool. The half that *is* on record is
-`proposals_list` with `status: "stalled"`: approved work whose build stopped and
-which nothing will pick up again until someone re-runs it.
+## Deliberate limits
 
-Searches use Qdrant when it's [configured](semantic-search.md) and fall back to
-`LIKE` otherwise, so a hit carries a `relevance:` score in the first case and
-not in the second.
+- **There are no write tools.** You cannot add, edit, mute or delete anything, approve a
+  proposal, or accept a suggested goal. Those actions belong in the console. Muted lessons are
+  also hidden here, just as they are hidden from the agent.
+- **There is no live status tool.** What is running right now lives in the agent process's
+  memory, not in the database, so this server cannot see it. To find approved work that stopped
+  and needs a manual re-run, use `proposals_list` with `status: "stalled"`.
+
+The server reads `data/agent.db` directly in read-only mode. It works whether or not `npm start`
+is running, and needs no port and no `AGENT_API_TOKEN`.
 
 ## Registering it with Claude Desktop
 
-In `claude_desktop_config.json` — on Windows
-`%APPDATA%\Claude\claude_desktop_config.json`, on macOS
-`~/Library/Application Support/Claude/claude_desktop_config.json` — using
-absolute paths, since the client launches the server with an arbitrary working
-directory:
+Edit `claude_desktop_config.json`:
+
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+Use absolute paths, because Claude Desktop starts the server from an arbitrary folder:
 
 ```json
 {
@@ -71,13 +67,13 @@ directory:
 }
 ```
 
-Point `command` at the repo's own `tsx`, not at `npx`. The client launches the
-server from an arbitrary directory, and `npx tsx` from outside the repo doesn't
-find the local copy — it downloads its own into the npx cache, which makes
-startup slow and needs the network. On macOS/Linux the same entry is
-`node_modules/.bin/tsx` with a `/src/mcp-server.ts` argument.
+On macOS and Linux, use `node_modules/.bin/tsx` as the command and `/src/mcp-server.ts` as the
+argument.
 
-Nothing else needs configuring: the server finds `.env` and `data/agent.db`
-relative to its own location, not to wherever it was launched from. Restart
-Claude Desktop after editing the file — it spawns the server at startup and
-kills it on exit, so config changes only take effect on a full restart.
+Point `command` at the repository's own `tsx` rather than `npx`. Run from outside the repository,
+`npx tsx` cannot find the local copy and downloads its own, which is slow and needs a network
+connection.
+
+Nothing else needs configuring. The server finds `.env` and `data/agent.db` relative to its own
+location. Fully restart Claude Desktop after editing the file, since it only starts MCP servers
+when it launches.

@@ -1,32 +1,24 @@
-# React + TypeScript + Vite
+# Web console
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The operator console for the agent: a React, TypeScript and Ant Design app built with Vite and
+linted with oxlint. For a tour of its pages, see [The web console](../docs/web-console.md).
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+This folder is an npm workspace of the root project, so `npm install` at the root sets it up.
+Run the backend and the dev server side by side from the repository root:
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm start          # backend and API
+npm run web:dev    # Vite dev server with hot reload, forwards /api and /ws to the backend
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+## Other scripts
+
+```bash
+npm run web:build  # production build to web/dist, which the backend serves
+npm run web:lint   # oxlint over web/
+```
+
+If you change how the build is split into chunks, check a real production build, not only the
+dev server. The dev server does no chunking, so some problems only show up in production.

@@ -1,163 +1,162 @@
 # Architecture
 
-How the loop works, and what each module in `src/` is for.
+This page explains how the agent's loop works and what each part of `src/` is responsible for.
 
 ## The cycle
 
-Each cycle: **research + plan → your approval → act → record outcome →
-reflect into a lesson**, then repeat. Research can span several domains at
-once and surface more than one proposal per cycle; several proposals can sit
-pending review at the same time.
+Every cycle runs through the same steps, then starts again:
 
-**No proposal, no action, ever.** Approval happens in the web UI rather than a
-stdin prompt, but the invariant is the one this design has always been built
-around: nothing with real-world effect runs without a proposal a human
-explicitly approved. Don't wire anything to auto-approve "to save time" — that
-deletes the one safeguard the rest of the design assumes is there.
+1. **Research and plan.** The agent researches its active goals and files between zero and three
+   proposals. It can work across several goals in one cycle.
+2. **Review.** Each proposal waits for your decision in the web console. Several can be pending
+   at the same time.
+3. **Act.** An approved proposal is carried out, limited to the tools it named.
+4. **Outcome and reflection.** The result is recorded, and the agent writes or reinforces a lesson.
 
-## Every proposal has to say how it will make money
+The rule behind all of this: **no proposal, no action.** Nothing with a real-world effect happens
+without a proposal that a person explicitly approved. Please don't add anything that approves
+proposals automatically, because the rest of the design relies on that step.
 
-Alongside the cost/time/upside estimate, research has to fill in a revenue
-model, who specifically pays, at what price, through what mechanism the *first*
-payment is actually collected, how many days that takes, the one assumption
-that would kill it, and what you'd measure to know it's working — plus an
-ordered step list from approval to that first dollar, with the human-only steps
-marked as such. The console shows all of it on the review card and in the
-proposal dialog, so the decision isn't made on a headline number and a
-paragraph of prose.
+## Proposals must explain the money
 
-Steps and the tool fence are checked against each other: a step the agent is
-meant to do, naming a tool the proposal isn't asking for, is refused at creation
-time. The act phase is fenced to exactly the approved tool list, so such a step
-could never have run — and the approved steps are passed into the act phase
-verbatim, so execution follows the plan you said yes to rather than re-deriving
-one.
+Besides the usual cost, time and upside estimates, every proposal has to state:
 
-## Priority, scheduling and the act queue
+- the revenue model
+- who specifically pays, and at what price
+- how the first payment actually gets collected, and how many days that takes
+- the one assumption that would sink the idea
+- what you would measure to know it is working
+- an ordered list of steps from approval to the first dollar, with the steps only a person can
+  do marked as such
 
-At approval time you also set **priority** (low/normal/high/urgent) and,
-optionally, a **schedule** — run now, run at a future date/time, or repeat on
-a cadence until cancelled. Only one proposal's act+reflect phase ever runs at
-a time, so real-world side-effecting tool calls never overlap — but *which*
-approved proposal runs next is priority-then-due-time ordered, not just
-arrival order. A scheduler tick (`AGENT_SCHEDULER_TICK_MS`, default 15s)
-wakes up anything due; approving something for right now still runs
-immediately.
+The console shows all of this on the review card and in the proposal dialog.
+
+The steps are checked against the tool list when the proposal is created. If a step the agent
+is supposed to perform needs a tool the proposal did not ask for, the proposal is refused,
+because that step could never run. After approval, the steps are handed to the act phase exactly
+as written, so the agent follows the plan you approved instead of inventing a new one.
+
+## Priority and scheduling
+
+When you approve a proposal you can also set:
+
+- a **priority**: low, normal, high or urgent
+- an optional **schedule**: run now, run at a later date and time, or repeat on a fixed cadence
+  until cancelled
+
+Only one proposal is ever in its act phase at a time, so real-world actions never overlap. The
+next one to run is chosen by priority, then by due time. A scheduler checks for due work every
+15 seconds by default (`AGENT_SCHEDULER_TICK_MS`). Anything approved to run now starts right away.
+
+## Checking the work
+
+When the act phase finishes, the agent's tool calls are compared with the approved step list. If
+a step's tool never ran successfully, the build is marked **incomplete**, the reflection step is
+told what went wrong, and the console flags it. The act phase is never retried automatically,
+since that could repeat side effects such as a second commit or a second email. You can re-run it
+yourself from the Deliverables page or the proposal dialog.
 
 ## Reactive refinement
 
-Marking an approved proposal's shipped deliverable **"needs refinement"**
-(Actions page) kicks off a focused, out-of-cycle research+plan pass aimed at
-exactly that proposal instead of waiting for the next scheduled cycle — it
-can still only ever produce a new proposal for you to review, never an
-action, and repeat toggling is cooldown-limited so it can't spam the API.
+If you mark a shipped deliverable as **needs refinement**, the agent immediately runs a focused
+research and planning pass on that one proposal instead of waiting for the next cycle. That pass
+can only produce a new proposal for you to review, never an action. Repeated toggling is rate
+limited so it cannot run up API costs.
 
-## Browser notifications
+## Notifications
 
-No email, no push service — they fire only while the tab is open, when a
-proposal is newly pending review and when a scheduled/recurring run is about to
-start. Opt in via the bell icon in the console; browsers require a user gesture
-to grant the permission, so it's never requested automatically.
+The review step is the one place where the loop waits indefinitely, so there are two ways to be
+told when a proposal needs you:
+
+- **Webhook.** Set `AGENT_NOTIFY_URL` to a Slack, Discord or ntfy URL (or any endpoint that
+  accepts a JSON POST). A message is sent each time a proposal starts waiting for review.
+- **Browser notifications.** Turn these on with the bell icon in the console. They only fire
+  while the console tab is open, and browsers require a click to grant permission, so they are
+  never requested automatically.
 
 ## Module map
 
-- `src/memory-server.ts` — SQLite-backed memory (`data/agent.db`) plus the
-  memory tools the agent can call: `research_note_add`, `research_note_search`,
-  `lesson_search`, `lesson_add`, `lesson_reinforce`, `proposal_create`,
-  `proposal_status`, `outcome_record`, `action_history_search`. Approving
-  proposals, setting priority/schedule, logging actions, and marking a run
-  successful are deliberately *not* tools the model has — those stay with
-  the orchestrator and with you. Research notes and lessons are embedded (see
-  [Semantic search](semantic-search.md)) and ranked by similarity instead of
-  exact/`LIKE` text matching, when Qdrant is configured.
-  `action_history_search` lets research/plan see what's already been
-  built/deployed/committed on approved proposals so it doesn't propose
-  duplicate work.
-- `src/orchestrator.ts` — the main loop, its four phases, and a priority
-  queue + scheduler tick that decides which approved proposal's act+reflect
-  runs next. Every tool call is logged, and every phase's model API cost is
-  recorded so spend counts against profit — computed from token usage, or
-  taken from the provider when it reports a real per-call charge.
-- `src/settings.ts` — operator settings stored in the database and editable
-  from the console's Settings page, so they no longer need a `.env` edit and
-  a restart. `.env` still seeds them; a value set in the console then wins.
-  Adding a setting is one entry in the registry — the API and the page are
-  driven off it. Secrets and bootstrap values are excluded on purpose.
-- `src/agent-loop.ts` — the agentic loop itself: ask the model, run the tools
-  it asked for, feed the results back, repeat. This is also where each phase's
-  tool fence is enforced — a tool outside the phase's grant is never described
-  to the model, and is refused if the model names it anyway.
-- `src/llm/` — the only provider-specific code in the project. One adapter
-  covers every provider that speaks OpenAI's `/chat/completions` (OpenRouter,
-  OpenAI, xAI, Moonshot); a second covers Anthropic's Messages API natively.
-  Also holds the pricing table that turns tokens into the dollar figures on
-  the Economics page.
-- `src/tools/` — the tool registry (name + description + zod schema + handler,
-  converted to JSON Schema for the wire) and `web.ts`, which implements
-  `WebSearch` and `WebFetch`.
-- `src/search/` — pluggable search behind `WebSearch`: Tavily, Brave, or the
-  model provider's own server-side search, chosen with
-  `AGENT_SEARCH_PROVIDER`. Whichever you pick, `WebSearch` stays one tool name
-  in a proposal and one badge in the console.
-- `src/reactive-triggers.ts` — a small fire-and-forget bridge: marking a
-  proposal "needs refinement" in the UI wakes a targeted research+plan pass
-  for that one proposal, independent of the hourly cycle.
-- `src/integrations/{github,vercel,netlify}.ts` + `src/integrations-server.ts`
-  — thin API wrappers and the tools built on them. Read-only tools
-  (`github_read_repo`, `vercel_list_projects`, etc.) are free for research to
-  call, same as `WebSearch`. Write tools (`github_create_repo`,
-  `github_commit_files`, `github_merge_pr`, `vercel_deploy`,
-  `netlify_deploy`, etc.) only work when an approved proposal's
-  `required_tools` names them — enforced by the fence in `agent-loop.ts`,
-  not by convention. `github_commit_files` writes any number of files
-  as a single commit (Git Data API: blob → tree → commit → ref update) and
-  is preferred over the older one-file-per-call `github_commit_file`;
-  `github_merge_pr` exists so a proposal that opens a PR can also land it
-  instead of leaving the default branch empty. **`github_create_repo` always
-  creates a private repo** — visibility isn't a parameter it can set, so
-  publishing stays a deliberate act you perform in GitHub's own UI after
-  looking at what was built.
-- `src/connectors/` — **connectors declared as JSON, not code.** A manifest in
-  `src/connectors/defs/` describes a REST API (base URL, auth, and a list of
-  operations with typed params); the loader turns each operation into a normal
-  tool, with the same read/write risk split and the same fence. Shipped:
-  **Stripe** (products, prices, hosted payment links, plus balance and charge
-  reads), **Resend** (email), **Plausible** (traffic stats), **Cloudflare**
-  (zones, Pages, DNS). Add your own by dropping a file in that directory, or
-  point `AGENT_CONNECTORS_DIR` somewhere outside the repo.
+### The loop
 
-  Stripe is the one that changes what the loop can do: a payment link is a
-  real path from an approved proposal to a first dollar, and the balance/charge
-  reads let the act phase record **measured** revenue instead of an estimate.
+- **`orchestrator.ts`** runs the main loop and its four phases, plus the priority queue and
+  scheduler that decide which approved proposal acts next. Every tool call is logged, and the
+  model API cost of every phase is recorded so that spending counts against profit.
+- **`agent-loop.ts`** is the agentic loop itself: ask the model, run the tools it requested, feed
+  back the results, and repeat. This is also where each phase's tool fence is enforced. A tool
+  outside the phase's grant is never shown to the model, and is refused if the model names it.
+- **`act-verification.ts`** decides whether an act phase finished the approved plan.
+- **`reactive-triggers.ts`** connects the "needs refinement" button to a targeted research pass.
+- **`settings.ts`** holds operator settings that live in the database and can be changed from the
+  console. `.env` supplies the starting values; a value saved in the console takes precedence.
+  Secrets and startup values are deliberately excluded.
 
-  A connector with no key set is still listed — its tools just report
-  `<KEY> is not set` if called, and research isn't told about them. Filling a
-  key in takes effect on the next cycle, with no restart. File-upload deploys
-  (Vercel, Netlify) and OAuth-refresh APIs (Reddit, X) can't be expressed this
-  way and stay hand-written.
-- `src/qdrant.ts` — Qdrant Cloud client: vector storage/search plus
-  server-side embedding inference (Cloud Inference) in the same request, so
-  there's no separate embeddings provider to rate-limit against. Fails soft:
-  without `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
-  `QDRANT_EMBEDDING_DIM` all set, everything falls back to the old
-  `LIKE`-based search.
-- `src/events.ts` / `src/review-gateway.ts` / `src/server.ts` — the live layer
-  the web UI runs on. `events.ts` is an in-process bus the orchestrator emits
-  to as it works (including `proposal_scheduled` and `scheduled_run_starting`
-  for the scheduling feature); `server.ts` persists each event and
-  rebroadcasts it over WebSocket, and serves a REST API for history;
-  `review-gateway.ts` is how a proposal's approval promise gets resolved
-  when someone clicks Approve/Reject, priority/schedule included.
-- `web/` — the console itself: React + TypeScript + Ant Design, linted with
-  oxlint. See [The web console](web-console.md).
-- `src/mcp-server.ts` — an MCP server exposing the agent's record to Claude
-  Desktop, read-only: goals, research notes, lessons, proposals and
-  deliverables. Wiring only; the tools live in `src/mcp/`, one module per
-  subject over a shared store handle and a pure rendering layer. See
-  [Reading the record from Claude Desktop](mcp-server.md). `src/mcp-env.ts` is
-  its `.env` loader and stdout guard, split out because the import order is
-  load-bearing.
-- `src/memory-server.test.ts` — Vitest unit tests for `MemoryStore` against an
-  in-memory SQLite DB, with `qdrant.ts` mocked out. The real test suite.
-- `src/smoke-test.ts` — quick end-to-end sanity check against a throwaway DB
-  file, no API key needed. Run this first.
+### Models and tools
+
+- **`llm/`** contains all provider-specific code. One adapter covers every provider that uses
+  OpenAI's `/chat/completions` format (OpenRouter, OpenAI, xAI, Moonshot). A second adapter
+  covers Anthropic's Messages API. The pricing table that converts tokens into dollars lives here.
+- **`tools/`** is the tool registry (name, description, zod schema and handler) plus `web.ts`,
+  which implements `WebSearch` and `WebFetch`.
+- **`search/`** puts Tavily, Brave, or the model provider's own search behind `WebSearch`,
+  selected with `AGENT_SEARCH_PROVIDER`. Whichever you choose, it appears as the same single tool.
+
+### Memory
+
+- **`memory-server.ts`** is the SQLite memory (`data/agent.db`) and the memory tools the agent
+  can call, such as `research_note_add`, `lesson_search`, `proposal_create`, `outcome_record`
+  and `action_history_search`. Approving proposals, setting priority, logging actions and
+  curating memory are deliberately *not* available to the model. Those stay with the
+  orchestrator and with you.
+- **`qdrant.ts`** is the Qdrant Cloud client for [semantic search](semantic-search.md). It fails
+  quietly: if Qdrant is not configured, search falls back to plain text matching.
+
+### Integrations
+
+- **`integrations/`** and **`integrations-server.ts`** wrap GitHub, Vercel and Netlify.
+  - Read-only tools such as `github_read_repo` and `vercel_list_projects` are free for research
+    to use.
+  - Write tools such as `github_create_repo`, `github_commit_files`, `github_merge_pr`,
+    `vercel_deploy` and `netlify_deploy` only work when an approved proposal names them.
+  - `github_commit_files` writes many files in a single commit.
+  - `vercel_deploy` can deploy straight from a GitHub repository, so a large site can be
+    committed over several calls and then deployed once.
+  - **`github_create_repo` always creates a private repository.** Making it public is a decision
+    you make yourself in GitHub, after looking at what was built.
+- **`connectors/`** lets you add a REST API with a JSON file instead of code. Each manifest in
+  `src/connectors/defs/` describes the base URL, the authentication and a list of operations,
+  and each operation becomes an ordinary tool behind the same fence. Shipped connectors:
+
+  | Connector | Used for |
+  | --- | --- |
+  | Stripe | Products, prices, payment links, balance and charges |
+  | Resend | Sending email |
+  | Plausible | Traffic statistics |
+  | Cloudflare | Zones, Pages, DNS, and Web Analytics |
+  | Bing Webmaster Tools | Search impressions and indexing status |
+  | IndexNow | Telling search engines about new URLs |
+  | DataForSEO | Real search volume for keywords |
+  | Hacker News | Demand signals from HN stories and comments |
+  | TED | EU public procurement notices |
+
+  To add your own, drop a file in that directory or point `AGENT_CONNECTORS_DIR` at another
+  folder. A connector without a key is still listed. Its tools answer "`<KEY>` is not set", and
+  research is not told about them. Adding a key takes effect on the next cycle without a restart.
+
+### The live layer
+
+- **`events.ts`** is an in-process event bus the orchestrator reports to as it works.
+- **`server.ts`** saves each event, broadcasts it over WebSocket, and serves the REST API and
+  the built console.
+- **`review-gateway.ts`** delivers your Approve or Reject click to the proposal waiting for it.
+- **`notify.ts`** sends the webhook notification described above.
+- **`web/`** is the console itself. See [The web console](web-console.md).
+
+### Outside access
+
+- **`mcp-server.ts`** and **`mcp/`** provide a read-only MCP server over the agent's record. See
+  [Claude Desktop access](mcp-server.md).
+
+### Tests
+
+- **`*.test.ts`** files are Vitest unit tests. None of them need an API key.
+- **`smoke-test.ts`** is a quick end-to-end check against a throwaway database. Run it first.

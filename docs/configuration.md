@@ -1,59 +1,66 @@
 # Setup and configuration
 
-## Install and sanity-check
+## Install and check
 
 ```bash
 npm install
-npm run smoke-test   # sanity-checks the DB and tool wiring, no API calls
+npm run smoke-test   # checks the database and tool wiring, no API calls
 npm test             # unit tests (Vitest)
 npm run typecheck
 ```
 
-## Environment
+## Environment variables
 
-Copy `.env.example` to `.env` and fill in what you have:
+Copy `.env.example` to `.env` and fill in what you have. Only the first group is required.
 
-- `AGENT_PROVIDER` + `AGENT_MODEL` + that provider's key — needed for
-  `npm start` to run the agent at all. `AGENT_PROVIDER` defaults to
-  `openrouter` (one key reaches Claude, GPT, Grok and Kimi, and it reports
-  real per-call cost, so the Economics page stays accurate without a pricing
-  table). `AGENT_MODEL` is **required and has no default** — model ids change
-  too often for a baked-in one to be anything but a future 404; the startup
-  error names your provider's model list. Optional per-phase overrides:
-  `AGENT_RESEARCH_MODEL`, `AGENT_ACT_MODEL`, `AGENT_REFLECT_MODEL` (and
-  `_PROVIDER` variants).
-- `TAVILY_API_KEY` or `BRAVE_API_KEY` — optional but recommended. `WebSearch`
-  was a Claude Code built-in and is now backed by whichever of these you set
-  (both have free tiers). With neither, `AGENT_SEARCH_PROVIDER` falls back to
-  `native` — the model provider's own server-side search, which varies in
-  quality by provider. `WebFetch` needs no key.
-- `AGENT_DOMAINS` — comma-separated lanes research considers each cycle
-  (default covers small-business/consumer web tools, a general-audience
-  Chrome extension, and a free web calculator/tool — not developer-only).
-  See the [tradeoff note](operations.md#multiple-domains-multiple-proposals)
-  before adding many.
-- `GITHUB_TOKEN` / `VERCEL_TOKEN` / `NETLIFY_AUTH_TOKEN` — optional; omit any
-  of them and that integration's tools simply aren't usable.
-- `STRIPE_API_KEY` / `RESEND_API_KEY` / `PLAUSIBLE_API_KEY` /
-  `CLOUDFLARE_API_TOKEN` — optional connector keys (see `src/connectors/`).
-  Unlike the three above, these are read per call rather than at startup, so
-  adding one takes effect on the next cycle without a restart. Use a Stripe
-  **test-mode** key (`sk_test_…`) until you're sure. `AGENT_CONNECTORS_DIR`
-  points at a directory of extra connector manifests, if you'd rather keep
-  them outside the repo.
-- `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
-  `QDRANT_EMBEDDING_DIM` (+ `QDRANT_EMBEDDING_DISTANCE`) — optional, but all
-  four of the first group are required together; enables
-  [semantic search](semantic-search.md). Free cluster at
-  [cloud.qdrant.io](https://cloud.qdrant.io), no credit card needed — model
-  name and dimension are listed per-cluster in the Cloud Console's Inference
-  tab.
-- `AGENT_SCHEDULER_TICK_MS` — optional, default 15000; how often the
-  scheduler checks for approved proposals whose scheduled/recurring run is
-  due.
+### Required: the model
 
-Anything that isn't a secret or a bootstrap value can also be changed from the
-console's Settings page, which then wins over `.env` — see
+| Variable | Notes |
+| --- | --- |
+| `AGENT_PROVIDER` | `openrouter` (default), `openai`, `anthropic`, `xai` or `moonshot` |
+| `AGENT_MODEL` | The model to use. There is no default. |
+| Provider key | `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `XAI_API_KEY` or `MOONSHOT_API_KEY` |
+
+OpenRouter is the default because one key reaches many model families, and it reports the real
+cost of each call, which keeps the Economics page accurate.
+
+`AGENT_MODEL` has no default on purpose. Providers rename and retire models often, and a built-in
+default would eventually fail with an unclear error. If it is missing, the startup message links
+to your provider's model list.
+
+You can give each phase its own model with `AGENT_RESEARCH_MODEL`, `AGENT_ACT_MODEL` and
+`AGENT_REFLECT_MODEL`, plus matching `_PROVIDER` variables.
+
+### Recommended: web search
+
+Set `TAVILY_API_KEY` or `BRAVE_API_KEY`. Both have free tiers. Without either, search falls back
+to the model provider's own built-in search, whose quality varies. `WebFetch` needs no key.
+
+### Optional
+
+| Variable | What it enables |
+| --- | --- |
+| `GITHUB_TOKEN`, `VERCEL_TOKEN`, `NETLIFY_AUTH_TOKEN` | The GitHub, Vercel and Netlify tools |
+| `STRIPE_API_KEY`, `RESEND_API_KEY`, `PLAUSIBLE_API_KEY`, `CLOUDFLARE_API_TOKEN`, `BING_WEBMASTER_API_KEY`, `DATAFORSEO_AUTH` | Connector tools |
+| `AGENT_CONNECTORS_DIR` | A folder of extra connector manifests outside the repository |
+| `AGENT_NOTIFY_URL` | A webhook message when a proposal needs review |
+| `AGENT_CONSOLE_URL` | The address notification links point to, if you review from another device |
+| `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_EMBEDDING_MODEL`, `QDRANT_EMBEDDING_DIM` | [Semantic search](semantic-search.md). All four are required together. |
+| `AGENT_DOMAINS` | The starting goals for a brand new database |
+| `AGENT_SCHEDULER_TICK_MS` | How often scheduled work is checked (default 15000) |
+
+A few details worth knowing:
+
+- **Connector keys are read on every call**, not at startup, so adding one takes effect on the
+  next cycle without a restart. The GitHub, Vercel and Netlify tokens need a restart.
+- **Use a Stripe test-mode key** (`sk_test_...`) until you are confident in what the agent does.
+- **`AGENT_DOMAINS` only seeds the first run.** After that, goals are managed on the console's
+  Goals page, and editing `.env` has no effect.
+- **Qdrant** has a free cluster at [cloud.qdrant.io](https://cloud.qdrant.io) that needs no
+  credit card. The model name and its dimension are listed on your cluster's Inference tab.
+
+Anything that is not a secret or a startup value can also be changed on the console's Settings
+page, and a value saved there takes precedence over `.env`. See
 [The web console](web-console.md#settings).
 
 ## Running
@@ -62,19 +69,27 @@ console's Settings page, which then wins over `.env` — see
 npm start
 ```
 
-This starts the agent loop *and* the web console together (they share one
-process and one SQLite connection — no multi-process file locking). Open
-`http://localhost:4001` (or your `AGENT_SERVER_PORT`) to watch it research,
-review proposals as they come in, and see history/lessons/research notes.
+This starts the agent loop and the web console in a single process that shares one SQLite
+connection. Open `http://localhost:4001`, or the port set in `AGENT_SERVER_PORT`.
+
+To browse the real database without running the agent, use:
+
+```bash
+npm run start:console
+```
+
+This opens the database read-only and makes no model calls, so it needs no API key. Goals,
+settings, the cycle interval and pause can still be changed, since those are what the next
+real run reads when it starts.
 
 ## Frontend development
 
 For hot reload, run the backend and the Vite dev server side by side:
 
 ```bash
-npm start           # backend + API on AGENT_SERVER_PORT
-npm run web:dev     # Vite dev server, proxies /api and /ws to the backend
+npm start          # backend and API on AGENT_SERVER_PORT
+npm run web:dev    # Vite dev server, forwards /api and /ws to the backend
 ```
 
-`npm run web:build` produces the static build `src/server.ts` serves in the
-`npm start` flow above; `npm run web:lint` runs oxlint over `web/`.
+`npm run web:build` produces the static build that `npm start` serves. `npm run web:lint` runs
+oxlint over `web/`.
