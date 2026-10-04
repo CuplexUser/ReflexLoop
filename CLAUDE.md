@@ -131,6 +131,8 @@ own history: the pairs it must catch and the follow-up pair it must not).
 `src/deep-dive.test.ts` (whether a deep dive produced a report, and the push-back when it didn't),
 `src/landscape.test.ts` (grouping a goal's notes by kind and merging the competitors its ideas named),
 `src/llm/types.test.ts` (the truncation-vocabulary list, which a new provider can quietly break),
+`src/llm/failover.test.ts` (the fallback chain: retry-then-switch, stickiness, aborts, and raw turns
+replayed only to their own model),
 `src/shutdown.test.ts` (the teardown order, the grace period, and the forced second signal),
 `src/aborted.test.ts` (that both shapes of deliberate abort are recognized and a real failure isn't),
 `src/connectors/*.test.ts` (manifest validation, including the refusal of write operations, and
@@ -296,8 +298,22 @@ the `AbortController` passed to that run (skipping reflect, since there's no rep
   natively — worth its own file rather than going through Anthropic's OpenAI-compat shim, which lags on
   tool use. `providers.ts` is the registry of base URLs / key env vars / model-list links; `http.ts` is
   one retrying JSON POST (429 and 5xx only — a 400 from a bad model id is returned immediately);
-  `pricing.ts` turns tokens into dollars; `index.ts` resolves one client per phase from the settings
-  and env.
+  `pricing.ts` turns tokens into dollars; `index.ts` resolves one *chain* of clients per phase from
+  the settings and env: the phase's own model, then up to two shared fallbacks (`fallback*`
+  settings, `AGENT_FALLBACK*` env), duplicates dropped.
+
+  **`failover.ts` is what keeps a provider failure from costing the phase.** `runPhase` wraps the
+  chain in a fresh `FailoverClient` per run (`createPhaseClient`), which switches on the turn that
+  failed, so the transcript carries over rather than the phase restarting. Everything except an
+  abort fails over, 4xx included, because out-of-credits on one account is exactly the outage a
+  backup on another exists for. An error inside a 200 (OpenRouter's "Provider returned an empty
+  response", no choices) is `LlmError.transient` and gets one retry on the same model first, since
+  `postJson` never saw it. The switch is sticky for the rest of that run, so the primary's backoff
+  isn't paid every turn, and per run, because research and a deep dive run concurrently. Its
+  `provider`/`model` are getters naming whoever served the last call, which is what pricing reads.
+  `providerRaw` is tagged with the client that produced it and replayed only to that client. Each
+  switch emits `llm_failover`; the `runs` row goes to the model with the largest share of the
+  spend (one row per run, or the queue's duration stats would count a failed-over run twice).
   Adapters must normalize `Usage.inputTokens` to *total* prompt tokens including cached ones — Anthropic
   reports the uncached remainder, so its adapter adds the cache fields back or pricing under-counts.
 - `agent-loop.ts` — the replacement for the SDK's `query()`: ask the model, run the tools it asked for,

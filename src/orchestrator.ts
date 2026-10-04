@@ -29,7 +29,7 @@ import "dotenv/config";
 import { runAgent, type AgentRunOptions, type AgentStopReason } from "./agent-loop.js";
 import { deepDiveNudge, verifyDeepDive, type DeepDiveVerdict } from "./deep-dive.js";
 import { isAbortError } from "./aborted.js";
-import { describeClients, getLlmClients } from "./llm/index.js";
+import { createPhaseClient, describeClients, getLlmClients } from "./llm/index.js";
 import { isConsoleOnlyMode } from "./console-mode.js";
 import { getSearchConfig } from "./search/index.js";
 import { ToolRegistry } from "./tools/registry.js";
@@ -228,9 +228,14 @@ async function runPhase(opts: {
   // Unreachable in console-only mode -- nothing calls a phase there -- but the check keeps
   // that a stated invariant rather than a confusing config error if something ever does.
   if (CONSOLE_ONLY) throw new Error("No model client: this process is running console-only (--console-only).");
-  // Read once, at the top: the phase runs on one model from here to the ledger row below,
-  // even if the operator changes the setting while it's in flight.
-  const client = getLlmClients()[opts.phase];
+  // Read once, at the top: the phase runs on one chain of models from here to the ledger row
+  // below, even if the operator changes the setting while it's in flight. Within that chain it
+  // can move to a fallback when a model fails (llm/failover.ts), which is announced here.
+  const client = createPhaseClient(opts.phase, (info) => {
+    emitAgentEvent({ type: "llm_failover", phase: opts.phase, proposalId: opts.proposalId, ...info });
+  });
+  // Spend per model that actually served a turn. Normally one entry; more after a failover.
+  const spendByModel = new Map<string, { provider: string; model: string; usd: number }>();
 
   emitAgentEvent({ type: "phase_start", phase: opts.phase, proposalId: opts.proposalId });
 
@@ -250,8 +255,12 @@ async function runPhase(opts: {
       nudge: opts.nudge,
       // Accumulated per turn rather than read off the result, so an abort or a crash
       // mid-phase still records what was already spent.
-      onTurnCost: (usd) => {
+      onTurnCost: (usd, provider, model) => {
         costUsd += usd;
+        const key = `${provider}/${model}`;
+        const entry = spendByModel.get(key) ?? { provider, model, usd: 0 };
+        entry.usd += usd;
+        spendByModel.set(key, entry);
       },
       onAssistantText: (text) => {
         console.log(`[${opts.phase}] model: ${preview(text, 300)}`);
@@ -290,7 +299,22 @@ async function runPhase(opts: {
     // This is also what a graceful shutdown exists to reach -- an unhandled Ctrl-C skips
     // every finally in the process, so the whole cycle's spend simply disappeared.
     console.log(`[${opts.phase}] done in ${((Date.now() - t0) / 1000).toFixed(1)}s, cost $${costUsd.toFixed(4)}`);
-    store.logRun(opts.proposalId, opts.phase, costUsd, Date.now() - t0, startedAt, client.provider, client.model);
+    // One ledger row per phase run, so a run that failed over is attributed to the model that
+    // served most of its spend (the duration stats count rows, and splitting one run in two would
+    // read as two runs). The breakdown goes to the log so the split is still recoverable.
+    let attributed = { provider: client.provider as string, model: client.model };
+    let topUsd = -1;
+    for (const entry of spendByModel.values()) {
+      if (entry.usd > topUsd) {
+        topUsd = entry.usd;
+        attributed = entry;
+      }
+    }
+    if (spendByModel.size > 1) {
+      const split = [...spendByModel].map(([key, entry]) => `${key} $${entry.usd.toFixed(4)}`).join(", ");
+      console.log(`[${opts.phase}] spend split across models after a failover: ${split}`);
+    }
+    store.logRun(opts.proposalId, opts.phase, costUsd, Date.now() - t0, startedAt, attributed.provider, attributed.model);
     emitAgentEvent({
       type: "phase_done",
       phase: opts.phase,

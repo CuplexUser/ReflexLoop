@@ -19,6 +19,10 @@ export type AgentEvent =
   | { type: "tool_call"; phase: string; proposalId: number | null; toolName: string; input: unknown }
   | { type: "model_text"; phase: string; proposalId: number | null; text: string }
   | { type: "phase_done"; phase: string; proposalId: number | null; costUsd: number; durationMs: number }
+  // A phase's model failed and the next model in its chain took over (llm/failover.ts). Surfaced
+  // because a failover that only reached stdout would hide a broken primary indefinitely: the
+  // phases would keep finishing, just on a model the Settings page doesn't lead with.
+  | { type: "llm_failover"; phase: string; proposalId: number | null; from: string; to: string; error: string }
   | { type: "proposal_pending"; proposal: ProposalRow }
   | { type: "proposal_decided"; proposal: ProposalRow }
   | { type: "proposal_scheduled"; proposal: ProposalRow }

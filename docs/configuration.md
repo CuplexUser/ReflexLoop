@@ -32,6 +32,38 @@ You can give each phase its own model with `AGENT_RESEARCH_MODEL`, `AGENT_ACT_MO
 dive, which kept its old internal name) and `AGENT_REFLECT_MODEL`, plus matching `_PROVIDER`
 variables. The deep dive is the phase where your strongest model pays off.
 
+### Recommended: fallback models
+
+Up to two backup models take over when a phase's model fails: an outage, an empty response, or
+an account out of credits. Every phase shares them.
+
+| Variable | Notes |
+| --- | --- |
+| `AGENT_FALLBACK_MODEL` | Tried first when a phase's own model fails. Empty means no fallback. |
+| `AGENT_FALLBACK_PROVIDER` | Empty uses `AGENT_PROVIDER`, for a second model on the same key. |
+| `AGENT_FALLBACK2_MODEL` | Tried when fallback 1 fails too. |
+| `AGENT_FALLBACK2_PROVIDER` | Best set to a different service, so one outage can't stop all three. |
+
+A typical setup is two models on OpenRouter and a third directly on another provider:
+
+```bash
+AGENT_PROVIDER=openrouter
+AGENT_MODEL=<your main OpenRouter model id>
+AGENT_FALLBACK_MODEL=<a second OpenRouter model id>
+AGENT_FALLBACK2_PROVIDER=anthropic
+AGENT_FALLBACK2_MODEL=<an Anthropic model id>
+```
+
+How it behaves:
+
+- The switch happens on the turn that failed. The phase keeps its transcript and carries on.
+- An error that arrives inside a successful response (OpenRouter's "Provider returned an empty
+  response") is retried once on the same model first. HTTP errors were already retried.
+- A phase stays on the fallback until it ends. The next phase tries its own model first again.
+- Each switch shows in the activity feed. The run's spend is recorded under the model that
+  served most of it, and the split is printed in the log.
+- All of these are also on the Settings page, and saving checks that each fallback's key is set.
+
 ### Recommended: web search
 
 Set `TAVILY_API_KEY` or `BRAVE_API_KEY`. Both have free tiers. Without either, search falls back

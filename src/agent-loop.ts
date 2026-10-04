@@ -49,9 +49,10 @@ export interface AgentRunOptions {
   /**
    * Fired after every model call with that call's cost. The caller accumulates from
    * here rather than from the return value, so an aborted or failed phase still lands
-   * in the ledger with the spend it actually incurred instead of a zero.
+   * in the ledger with the spend it actually incurred instead of a zero. `provider`/`model`
+   * name the model that served this turn, which a FailoverClient can change mid-run.
    */
-  onTurnCost?: (usd: number) => void;
+  onTurnCost?: (usd: number, provider: string, model: string) => void;
 }
 
 /**
@@ -208,7 +209,7 @@ export async function runAgent(opts: AgentRunOptions): Promise<AgentRunResult> {
     lastStopReason = response.stopReason;
     const turnCost = priceUsage(client.provider, client.model, response.usage, response.reportedCostUsd);
     costUsd += turnCost;
-    opts.onTurnCost?.(turnCost);
+    opts.onTurnCost?.(turnCost, client.provider, client.model);
     if (response.text.trim()) {
       finalText = response.text;
       opts.onAssistantText?.(response.text);

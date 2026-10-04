@@ -36,6 +36,13 @@ const GROUP_TITLES: Record<SettingView['group'], { title: string; blurb: string 
       'Which model each phase runs on. Changes apply from the next phase — a cycle already in flight ' +
       'finishes on the model it started with. Provider API keys stay in .env.',
   },
+  fallback: {
+    title: 'Fallback models',
+    blurb:
+      'Tried in order when a phase’s own model fails: an outage, an empty response, out of credits. ' +
+      'The phase carries on from the turn that failed and stays on the fallback until it finishes; ' +
+      'the next phase tries its own model first again. Shared by every phase. A slot with no model is off.',
+  },
 }
 
 function SourceTag({ source }: { source: SettingView['source'] }) {
@@ -60,7 +67,11 @@ function SettingField({
   providers: ProviderInfo[]
   onChange: (next: string | number) => void
 }) {
-  const isProvider = setting.key.toLowerCase().includes('provider') && setting.group === 'model'
+  const isModelGroup = setting.group === 'model' || setting.group === 'fallback'
+  const isProvider = setting.key.toLowerCase().includes('provider') && isModelGroup
+  // In a fallback slot an empty model means the slot is off, not that it inherits anything.
+  const emptyLabel =
+    setting.group === 'fallback' ? (isProvider ? 'base provider' : 'off') : 'inherit base setting'
   const providerInfo = isProvider ? providers.find((p) => p.id === value) : undefined
 
   let control
@@ -89,7 +100,7 @@ function SettingField({
         style={{ width: 280 }}
         value={value as string}
         onChange={onChange}
-        options={setting.allowsEmpty ? [{ value: '', label: 'inherit base setting' }, ...options] : options}
+        options={setting.allowsEmpty ? [{ value: '', label: emptyLabel }, ...options] : options}
       />
     )
   } else {
@@ -98,7 +109,7 @@ function SettingField({
         style={{ width: 320 }}
         className="mono"
         value={value as string}
-        placeholder={setting.allowsEmpty ? 'inherit base setting' : 'e.g. anthropic/claude-opus-5'}
+        placeholder={setting.allowsEmpty ? emptyLabel : 'e.g. anthropic/claude-opus-5'}
         onChange={(e) => onChange(e.target.value)}
       />
     )
@@ -186,7 +197,7 @@ export function SettingsPage() {
     return <Alert type="warning" message="Settings unavailable — is the agent process running?" />
   }
 
-  const groups: SettingView['group'][] = ['loop', 'search', 'model']
+  const groups: SettingView['group'][] = ['loop', 'search', 'model', 'fallback']
   const baseModelSettings = settings.filter(
     (s) => s.group === 'model' && (s.key === 'llmProvider' || s.key === 'llmModel'),
   )

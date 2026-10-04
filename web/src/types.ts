@@ -275,7 +275,7 @@ export interface SettingView {
   key: string
   label: string
   help: string
-  group: 'loop' | 'search' | 'model'
+  group: 'loop' | 'search' | 'model' | 'fallback'
   type: 'integer' | 'string' | 'enum'
   /** The env var this seeds from, and what an operator would have edited before. */
   envVar: string
@@ -383,6 +383,7 @@ export type AgentEvent =
   | { type: 'tool_call'; phase: string; proposalId: number | null; toolName: string; input: unknown }
   | { type: 'model_text'; phase: string; proposalId: number | null; text: string }
   | { type: 'phase_done'; phase: string; proposalId: number | null; costUsd: number; durationMs: number }
+  | { type: 'llm_failover'; phase: string; proposalId: number | null; from: string; to: string; error: string }
   | { type: 'proposal_pending'; proposal: ProposalRow }
   | { type: 'proposal_decided'; proposal: ProposalRow }
   | { type: 'proposal_scheduled'; proposal: ProposalRow }

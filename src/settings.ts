@@ -49,11 +49,19 @@ export interface SettingsValues {
   actModel: string;
   reflectProvider: string;
   reflectModel: string;
+  /**
+   * Backup models, tried in order when a phase's own model fails. A slot is active when its
+   * model is set; an empty provider means "the base provider". See llm/failover.ts.
+   */
+  fallbackProvider: string;
+  fallbackModel: string;
+  fallback2Provider: string;
+  fallback2Model: string;
 }
 
 export type SettingKey = keyof SettingsValues;
 
-export type SettingGroup = "loop" | "search" | "model";
+export type SettingGroup = "loop" | "search" | "model" | "fallback";
 
 export interface SettingSpec {
   key: SettingKey;
@@ -173,6 +181,48 @@ export const SETTINGS: readonly SettingSpec[] = [
     envVar: "AGENT_REFLECT_MODEL",
     allowsEmpty: true,
   },
+  {
+    key: "fallbackProvider",
+    label: "Fallback 1 provider",
+    help: "Leave empty to use the base provider -- e.g. a second model on the same OpenRouter key.",
+    group: "fallback",
+    type: "enum",
+    envVar: "AGENT_FALLBACK_PROVIDER",
+    options: PROVIDER_IDS,
+    allowsEmpty: true,
+  },
+  {
+    key: "fallbackModel",
+    label: "Fallback 1 model",
+    help:
+      "Takes over when a phase's own model fails (an outage, an empty response, out of credits). " +
+      "Empty means no fallback.",
+    group: "fallback",
+    type: "string",
+    envVar: "AGENT_FALLBACK_MODEL",
+    allowsEmpty: true,
+  },
+  {
+    key: "fallback2Provider",
+    label: "Fallback 2 provider",
+    help:
+      "Ideally a different provider from the two above, so an outage of one service can't take " +
+      "out every model at once. Empty uses the base provider.",
+    group: "fallback",
+    type: "enum",
+    envVar: "AGENT_FALLBACK2_PROVIDER",
+    options: PROVIDER_IDS,
+    allowsEmpty: true,
+  },
+  {
+    key: "fallback2Model",
+    label: "Fallback 2 model",
+    help: "Tried when fallback 1 fails too. Empty means no second fallback.",
+    group: "fallback",
+    type: "string",
+    envVar: "AGENT_FALLBACK2_MODEL",
+    allowsEmpty: true,
+  },
 ];
 
 const SPEC_BY_KEY = new Map(SETTINGS.map((s) => [s.key, s]));
@@ -192,6 +242,10 @@ const DEFAULTS: SettingsValues = {
   actModel: "",
   reflectProvider: "",
   reflectModel: "",
+  fallbackProvider: "",
+  fallbackModel: "",
+  fallback2Provider: "",
+  fallback2Model: "",
 };
 
 export type SettingSource = "database" | "environment" | "default";

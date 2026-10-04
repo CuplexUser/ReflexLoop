@@ -161,7 +161,7 @@ export class AnthropicClient implements LlmClient {
         label: "Anthropic messages",
       });
 
-      if (json.error?.message) throw new LlmError(`Anthropic: ${json.error.message}`);
+      if (json.error?.message) throw new LlmError(`Anthropic: ${json.error.message}`, undefined, undefined, true);
       const blocks = json.content ?? [];
 
       // Usage accumulates across resumes -- each leg is separately billed. input_tokens is

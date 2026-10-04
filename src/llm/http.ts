@@ -15,7 +15,8 @@ import { LlmError } from "./types.js";
 const MAX_ATTEMPTS = Number(process.env.AGENT_LLM_MAX_ATTEMPTS ?? 4);
 const BASE_BACKOFF_MS = 1000;
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+/** A delay that an abort cuts short, rejecting with AbortedError. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(new AbortedError());

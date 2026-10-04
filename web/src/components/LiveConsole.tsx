@@ -8,6 +8,7 @@ function lineColor(type: AgentEvent['type']): string {
   switch (type) {
     case 'proposal_pending':
     case 'no_proposal':
+    case 'llm_failover':
       return palette.pending
     // Not `pending` — a deep dive that ended without a report is the one thing in this feed
     // the operator has to act on, and it would otherwise look like a clean finish.
@@ -41,6 +42,8 @@ function renderLine(event: AgentEvent): string {
       return `${phaseTag}· ${preview(event.text, 220)}`
     case 'phase_done':
       return `${phaseTag}✓ done in ${(event.durationMs / 1000).toFixed(1)}s — $${event.costUsd.toFixed(4)}`
+    case 'llm_failover':
+      return `${phaseTag}⇄ ${event.from} failed, switched to ${event.to} — ${preview(event.error, 220)}`
     case 'proposal_pending':
       return `⚠ idea #${event.proposal.id} awaiting review — ${preview(event.proposal.description, 140)}`
     case 'proposal_decided':

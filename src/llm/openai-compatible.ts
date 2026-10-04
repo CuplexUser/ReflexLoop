@@ -165,9 +165,14 @@ export class OpenAiCompatibleClient implements LlmClient {
       label: `${this.spec.label} chat`,
     });
 
-    if (json.error?.message) throw new LlmError(`${this.spec.label}: ${json.error.message}`);
+    // Both arrive with HTTP 200, so postJson never retried them. OpenRouter reports an upstream
+    // provider's failure this way ("Provider returned an empty response"), and it is usually gone
+    // on the next request -- hence transient, which FailoverClient retries before moving on.
+    if (json.error?.message) {
+      throw new LlmError(`${this.spec.label}: ${json.error.message}`, undefined, undefined, true);
+    }
     const choice = json.choices?.[0];
-    if (!choice) throw new LlmError(`${this.spec.label}: response contained no choices`);
+    if (!choice) throw new LlmError(`${this.spec.label}: response contained no choices`, undefined, undefined, true);
 
     const toolCalls: ToolCall[] = (choice.message?.tool_calls ?? [])
       .filter((call) => call.function?.name)

@@ -31,9 +31,15 @@
 // move: they stay in .env, so `buildClient` still reads the environment for those.
 // `resolveLlmClients()` is therefore called again on a settings change, and its throw
 // on a missing key is what the console's save-time verification catches.
+//
+// Behind each phase's model sit up to two **fallback** models (AGENT_FALLBACK_* and
+// AGENT_FALLBACK2_*, also settings), shared by every phase. So each phase resolves to a
+// chain -- its own model, then fallback 1, then fallback 2, duplicates dropped -- and
+// `createPhaseClient` wraps that chain in a FailoverClient (failover.ts) for one phase run.
 
 import { getSetting } from "../settings.js";
 import { AnthropicClient } from "./anthropic.js";
+import { FailoverClient, type FailoverInfo } from "./failover.js";
 import { OpenAiCompatibleClient } from "./openai-compatible.js";
 import { PROVIDERS, PROVIDER_IDS, isProviderId } from "./providers.js";
 import type { LlmClient, ProviderId } from "./types.js";
@@ -41,6 +47,7 @@ import type { LlmClient, ProviderId } from "./types.js";
 export * from "./types.js";
 export { PROVIDERS, PROVIDER_IDS } from "./providers.js";
 export { priceUsage, lookupPrice } from "./pricing.js";
+export type { FailoverInfo } from "./failover.js";
 
 const DEFAULT_PROVIDER = "openrouter";
 
@@ -77,6 +84,12 @@ export const MAX_OUTPUT_TOKENS = positiveIntEnv("AGENT_MAX_TOKENS", 32768);
 /** The three phases that call a model. Matches the `phase` column in `runs`. */
 export type PhaseName = "research_plan" | "act" | "reflect";
 
+/** The fallback slots, in the order they are tried. */
+const FALLBACK_SLOTS = [
+  { provider: "fallbackProvider", model: "fallbackModel", label: "Fallback 1" },
+  { provider: "fallback2Provider", model: "fallback2Model", label: "Fallback 2" },
+] as const;
+
 /** Per-phase override settings, and the env var each one seeds from (used only in error text). */
 const PHASE_OVERRIDES: Record<PhaseName, { provider: "researchProvider" | "actProvider" | "reflectProvider"; model: "researchModel" | "actModel" | "reflectModel"; envPrefix: string }> = {
   research_plan: { provider: "researchProvider", model: "researchModel", envPrefix: "AGENT_RESEARCH" },
@@ -88,13 +101,14 @@ function env(name: string): string {
   return (process.env[name] ?? "").trim();
 }
 
-function buildClient(providerId: ProviderId, model: string, phase: PhaseName): LlmClient {
+/** `who` names what asked for this client (a phase, or a fallback slot) in the missing-key error. */
+function buildClient(providerId: ProviderId, model: string, who: string): LlmClient {
   const spec = PROVIDERS[providerId];
 
   const apiKey = env(spec.apiKeyEnv);
   if (!apiKey) {
     throw new Error(
-      `The ${phase} phase is configured to use ${spec.label}, which needs ${spec.apiKeyEnv} set in .env (see .env.example).`
+      `${who} is configured to use ${spec.label}, which needs ${spec.apiKeyEnv} set in .env (see .env.example).`
     );
   }
 
@@ -112,17 +126,46 @@ function resolveProviderId(value: string, source: string): ProviderId {
 }
 
 /**
- * One client per phase. Phases that resolve to the same provider+model share an
- * instance -- clients are stateless, and sharing keeps the startup log honest about
- * how many distinct models are actually in play.
+ * One chain of clients per phase: the phase's own model first, then the fallbacks. Phases
+ * that resolve to the same provider+model share an instance -- clients are stateless, and
+ * sharing keeps the startup log honest about how many distinct models are actually in play.
+ * Failover state lives in the per-run FailoverClient, never on these.
  */
-export function resolveLlmClients(): Record<PhaseName, LlmClient> {
+export function resolveLlmClients(): Record<PhaseName, LlmClient[]> {
   const baseProviderRaw = getSetting("llmProvider") || DEFAULT_PROVIDER;
   const baseProvider = resolveProviderId(baseProviderRaw.toLowerCase(), "Provider");
   const baseModel = getSetting("llmModel").trim();
 
   const cache = new Map<string, LlmClient>();
-  const clients = {} as Record<PhaseName, LlmClient>;
+  const clientFor = (provider: ProviderId, model: string, who: string): LlmClient => {
+    const key = `${provider}::${model}`;
+    let client = cache.get(key);
+    if (!client) {
+      client = buildClient(provider, model, who);
+      cache.set(key, client);
+    }
+    return client;
+  };
+
+  // Resolved once, outside the phase loop, so a broken slot is reported once and by its own name.
+  const fallbacks: { provider: ProviderId; model: string }[] = [];
+  for (const slot of FALLBACK_SLOTS) {
+    const providerRaw = getSetting(slot.provider).trim();
+    const model = getSetting(slot.model).trim();
+    if (!model) {
+      // A provider with no model would otherwise be silently ignored, and the operator would
+      // believe they had a backup they don't.
+      if (providerRaw) throw new Error(`${slot.label} has a provider but no model. Set its model, or clear the provider.`);
+      continue;
+    }
+    const provider = providerRaw ? resolveProviderId(providerRaw.toLowerCase(), `${slot.label} provider`) : baseProvider;
+    // Built here rather than on first use so a fallback with no API key fails at save time, not
+    // in the middle of the outage it was meant to cover.
+    clientFor(provider, model, slot.label);
+    fallbacks.push({ provider, model });
+  }
+
+  const chains = {} as Record<PhaseName, LlmClient[]>;
 
   for (const phase of Object.keys(PHASE_OVERRIDES) as PhaseName[]) {
     const override = PHASE_OVERRIDES[phase];
@@ -140,16 +183,15 @@ export function resolveLlmClients(): Record<PhaseName, LlmClient> {
       );
     }
 
-    const key = `${provider}::${model}`;
-    let client = cache.get(key);
-    if (!client) {
-      client = buildClient(provider, model, phase);
-      cache.set(key, client);
+    const chain = [clientFor(provider, model, `The ${phase} phase`)];
+    for (const fallback of fallbacks) {
+      const client = clientFor(fallback.provider, fallback.model, `The ${phase} phase`);
+      if (!chain.includes(client)) chain.push(client);
     }
-    clients[phase] = client;
+    chains[phase] = chain;
   }
 
-  return clients;
+  return chains;
 }
 
 /** Every setting `resolveLlmClients` reads, so a change to any of them invalidates the cache. */
@@ -157,9 +199,10 @@ const MODEL_SETTING_KEYS = [
   "llmProvider",
   "llmModel",
   ...Object.values(PHASE_OVERRIDES).flatMap((o) => [o.provider, o.model]),
+  ...FALLBACK_SLOTS.flatMap((slot) => [slot.provider, slot.model]),
 ] as const;
 
-let cached: { signature: string; clients: Record<PhaseName, LlmClient> } | null = null;
+let cached: { signature: string; clients: Record<PhaseName, LlmClient[]> } | null = null;
 
 /**
  * The clients a phase should run on *right now*.
@@ -174,7 +217,7 @@ let cached: { signature: string; clients: Record<PhaseName, LlmClient> } | null 
  * A phase already running keeps the client it started with -- the caller reads this once, at
  * the top of the phase. Changing model mid-phase would leave one transcript split across two.
  */
-export function getLlmClients(): Record<PhaseName, LlmClient> {
+export function getLlmClients(): Record<PhaseName, LlmClient[]> {
   const signature = MODEL_SETTING_KEYS.map((key) => getSetting(key)).join(" ");
   if (!cached || cached.signature !== signature) {
     cached = { signature, clients: resolveLlmClients() };
@@ -182,12 +225,22 @@ export function getLlmClients(): Record<PhaseName, LlmClient> {
   return cached.clients;
 }
 
-/** One line per distinct model in use, for the startup log. */
-export function describeClients(clients: Record<PhaseName, LlmClient>): string[] {
-  const byModel = new Map<string, PhaseName[]>();
-  for (const [phase, client] of Object.entries(clients) as [PhaseName, LlmClient][]) {
-    const key = `${client.provider}/${client.model}`;
-    byModel.set(key, [...(byModel.get(key) ?? []), phase]);
+/**
+ * The client one phase run talks to: its chain from the current settings, wrapped so a failing
+ * model hands over to the next. A fresh wrapper per run, because which model is active is state
+ * of *this* run -- research and a deep dive run concurrently, and one failing over must not move
+ * the other.
+ */
+export function createPhaseClient(phase: PhaseName, onFailover?: (info: FailoverInfo) => void): LlmClient {
+  return new FailoverClient(getLlmClients()[phase], onFailover);
+}
+
+/** One line per distinct chain in use, for the startup log. */
+export function describeClients(chains: Record<PhaseName, LlmClient[]>): string[] {
+  const byChain = new Map<string, PhaseName[]>();
+  for (const [phase, chain] of Object.entries(chains) as [PhaseName, LlmClient[]][]) {
+    const key = chain.map((client) => `${client.provider}/${client.model}`).join(" -> ");
+    byChain.set(key, [...(byChain.get(key) ?? []), phase]);
   }
-  return [...byModel].map(([model, phases]) => `${model} (${phases.join(", ")})`);
+  return [...byChain].map(([models, phases]) => `${models} (${phases.join(", ")})`);
 }

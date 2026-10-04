@@ -129,12 +129,19 @@ export interface LlmClient {
   handleNativeToolCall(call: ToolCall): string | null;
 }
 
-/** Thrown for a non-retryable provider error, so the phase fails with something readable. */
+/**
+ * Thrown for a provider error the HTTP layer gave up on, so the phase fails with something readable.
+ *
+ * `transient` marks a failure that arrived as a *successful* response -- OpenRouter answering 200
+ * with `{"error": "Provider returned an empty response"}`, or a body with no choices. postJson's
+ * retries never see those (the status was fine), so FailoverClient gives them one retry of their own.
+ */
 export class LlmError extends Error {
   constructor(
     message: string,
     readonly status?: number,
-    readonly body?: string
+    readonly body?: string,
+    readonly transient = false
   ) {
     super(message);
     this.name = "LlmError";
