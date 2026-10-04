@@ -3,30 +3,32 @@
 // The pure half of the MCP server: rows in, Markdown out, plus the small lookups that
 // turn a human's goal *title* into a goal. Nothing here opens or touches the database,
 // which is what lets render.test.ts exercise it without a DB file or an API key -- the
-// same stance deliverables.ts and act-verification.ts take.
+// same stance deep-dive.ts and landscape.ts take.
 //
 // Everything an MCP client sees is prose, so the formatting decisions here are the
 // interface. Two rules run through all of them:
 //
 //   - A field that is null on legacy rows renders *nothing*, never a dash. Most of these
-//     columns (monetization, steps, act_status, goal_id) were added to a live database
-//     and deliberately not backfilled, so "absent" is the common case, not an anomaly,
-//     and a row of dashes reads like a broken record instead of an older one.
-//   - Anything that says whether work actually *finished* comes before anything that
-//     says what it produced. An unfinished build with a real repo URL must not read as
-//     shipped; see the act_status note in deliverables.ts.
+//     columns (monetization, market, steps, act_status, goal_id) were added to a live
+//     database and deliberately not backfilled, so "absent" is the common case, not an
+//     anomaly, and a row of dashes reads like a broken record instead of an older one.
+//   - A verdict comes before the reasoning behind it. A report opens with pursue/maybe/drop,
+//     and an idea's detail says whether its deep dive finished before what it found.
 
 import "../mcp-env.js";
 import {
+  parseMarket,
   parseMonetization,
+  parseSources,
   parseSteps,
   preview,
   type GoalHealthRow,
   type GoalRow,
   type ProposalRow,
+  type ReportListRow,
+  type ReportRow,
+  type ReportSummary,
 } from "../memory-server.js";
-import { toolRisk } from "../tool-catalog.js";
-import type { Deliverable } from "../deliverables.js";
 
 // ---- primitives -----------------------------------------------------------
 
@@ -47,14 +49,14 @@ const money = (n: number) => `$${n.toFixed(2)}`;
 
 /**
  * Tool names keep their `mcp__memory__` / `mcp__integrations__` prefixes in the database
- * because those strings are the fence on already-approved proposals. They're noise to read,
- * so they're stripped for display only -- exactly what the console does.
+ * because those strings are persisted in actions and in legacy proposals' fences. They're
+ * noise to read, so they're stripped for display only -- exactly what the console does.
  */
 export const shortTool = (name: string) => name.replace(/^mcp__[a-z_]+__/, "");
 
 /**
- * The fence is stored comma-separated, not as JSON -- `"WebSearch,mcp__integrations__github_create_repo"`.
- * Same split `actPhase` does when it builds the grant, so what this prints is what act is allowed.
+ * The legacy build-mode fence, stored comma-separated rather than as JSON --
+ * `"WebSearch,mcp__integrations__github_create_repo"`. Empty on every research-mode idea.
  */
 function parseToolList(raw: string | null): string[] {
   return (raw ?? "")
@@ -132,8 +134,9 @@ export function renderGoal(goal: GoalRow, health?: GoalHealthRow): string {
       meta([
         `${health.proposals} proposals`,
         `${health.approved} approved`,
-        `${health.shipped} shipped`,
-        `${health.outcomes} outcomes (${health.successes} successful)`,
+        `${health.deep_dives} deep-dived`,
+        health.shipped > 0 ? `${health.shipped} built (legacy)` : false,
+        health.outcomes > 0 ? `${health.outcomes} legacy outcomes (${health.successes} successful)` : false,
         `${money(health.api_spend)} model API spend`,
         health.last_proposal_at ? `last proposal ${day(health.last_proposal_at)}` : "no proposal yet",
         // The "is this lane dead?" number: research cycles that ran and produced nothing here.
@@ -174,14 +177,22 @@ function moneyLine(row: ProposalRow): string | null {
   ]);
 }
 
-export function renderProposalSummary(row: ProposalRow, goals: Map<number, string>, goalId?: number | null): string {
+export function renderProposalSummary(
+  row: ProposalRow,
+  goals: Map<number, string>,
+  goalId?: number | null,
+  report?: ReportSummary | null
+): string {
+  const market = parseMarket(row);
   const head = meta([
     // No `#id` here -- the heading above already carries it.
     row.status,
     `${row.priority} priority`,
     `created ${day(row.created_at)}`,
-    // Only ever set once a proposal has reached the act phase; absent is the normal state.
-    row.act_status ? `act: ${row.act_status}` : false,
+    market ? `research score ${market.viabilityScore}/5` : false,
+    report ? `report: ${report.verdict} ${report.viability_score}/5` : false,
+    // Only ever set once an idea has reached its deep dive; absent is the normal state.
+    !report && row.act_status ? `deep dive: ${row.act_status}` : false,
     row.review_status ?? false,
     goalId != null ? `goal: ${goals.get(goalId) ?? goalId}` : false,
   ]);
@@ -210,13 +221,14 @@ export function renderProposalDetail(
     outcome?: OutcomeLike | null;
     spend?: ProposalSpend;
     actCalls?: number;
+    report?: ReportSummary | null;
   } = {}
 ): string {
   const out: string[] = [];
   const push = (...lines: string[]) => out.push(...lines);
 
   push(
-    `# Proposal #${row.id} · ${row.domain}`,
+    `# Idea #${row.id} · ${row.domain}`,
     meta([
       row.status,
       `${row.priority} priority`,
@@ -227,10 +239,27 @@ export function renderProposalDetail(
     ])
   );
 
-  // Whether the approved work finished comes before what it planned to do: a proposal whose
-  // act phase stopped halfway is a different thing to read than one that never ran.
+  // The verdict first: what the deep dive concluded, or whether it finished at all.
+  if (ctx.report) {
+    push(
+      "",
+      "## Latest deep-dive report",
+      meta([
+        `report #${ctx.report.id}`,
+        ctx.report.verdict,
+        `viability ${ctx.report.viability_score}/5`,
+        `${ctx.report.confidence} confidence`,
+        day(ctx.report.created_at),
+      ]),
+      "",
+      ctx.report.summary.trim(),
+      "",
+      "Read the whole report with report_get."
+    );
+  }
   if (row.act_status) {
-    push("", `## Act phase`, `Status: ${row.act_status}`);
+    const label = row.market_json === null ? "Act phase (legacy build mode)" : "Deep dive";
+    push("", `## ${label}`, `Status: ${row.act_status}`);
     const problems = parseProblems(row.act_problems);
     if (problems.length > 0) push("", "What the verifier objected to:", ...problems.map((p) => `- ${p}`));
   }
@@ -240,20 +269,41 @@ export function renderProposalDetail(
   if (row.original_description && row.original_description !== row.description) {
     push(
       "",
-      "### Before a human edited the scope",
+      "### Before a human edited it",
       "What the model originally asked for:",
       "",
       row.original_description.trim()
     );
   }
 
+  const market = parseMarket(row);
+  if (market) {
+    push(
+      "",
+      "## Market (research phase)",
+      meta([`viability ${market.viabilityScore}/5`, `${market.confidence} confidence`]),
+      `Market size: ${market.marketSize}`
+    );
+    if (market.demandEvidence.length > 0) {
+      push("", "Demand evidence:", ...market.demandEvidence.map((d) => `- ${d.claim} (${d.sourceUrl})`));
+    }
+    if (market.competitors.length > 0) {
+      push(
+        "",
+        "Competitors:",
+        ...market.competitors.map(
+          (c) => `- ${c.name}${c.url ? ` (${c.url})` : ""}${c.pricing ? ` · ${c.pricing}` : ""}${c.gap ? ` · gap: ${c.gap}` : ""}`
+        )
+      );
+    }
+    if (market.keyRisks.length > 0) push("", "Key risks:", ...market.keyRisks.map((r) => `- ${r}`));
+  }
+
+  // Only legacy build-mode proposals carry one. Printed plainly: those tool names no longer
+  // exist, so there is nothing current to classify them against.
   const tools = parseToolList(row.required_tools);
   if (tools.length > 0) {
-    push("", "## Fence (required_tools)", ...tools.map((t) => `- ${shortTool(t)} — ${toolRisk(t)}`));
-    const original = parseToolList(row.original_required_tools);
-    if (original.length > 0) {
-      push("", `Originally requested: ${original.map(shortTool).join(", ")}`);
-    }
+    push("", "## Legacy build-mode tool fence", tools.map(shortTool).join(", "));
   }
 
   const m = parseMonetization(row);
@@ -283,13 +333,14 @@ export function renderProposalDetail(
 
   const steps = parseSteps(row);
   if (steps.length > 0) {
-    push("", "## Steps");
+    // A legacy build-mode plan split steps between agent and human; a research-mode launch
+    // outline is all the human's, so it has no owner to print.
+    const legacy = steps.some((s) => s.owner);
+    push("", legacy ? "## Steps" : "## Launch outline");
     steps.forEach((s, i) => {
-      push(
-        `${i + 1}. ${s.title}`,
-        `   ${meta([`owner: ${s.owner}`, s.tool ? `tool: ${shortTool(s.tool)}` : false])}`,
-        `   done when: ${s.doneWhen}`
-      );
+      push(`${i + 1}. ${s.title}`);
+      if (s.owner) push(`   ${meta([`owner: ${s.owner}`, s.tool ? `tool: ${shortTool(s.tool)}` : false])}`);
+      push(`   done when: ${s.doneWhen}`);
     });
   }
 
@@ -305,12 +356,12 @@ export function renderProposalDetail(
     );
   }
 
-  if (row.human_notes) push("", "## Human notes", row.human_notes.trim());
+  if (row.human_notes) push("", "## Operator notes", row.human_notes.trim());
 
   if (ctx.outcome) {
     push(
       "",
-      "## Outcome",
+      "## Outcome (legacy build mode)",
       meta([
         ctx.outcome.success ? "success" : "failure",
         `revenue ${money(ctx.outcome.actual_revenue)}`,
@@ -328,7 +379,7 @@ export function renderProposalDetail(
       "## What it cost to produce",
       meta([
         ctx.spend ? `${money(ctx.spend.costUsd)} model API spend over ${ctx.spend.phases} phases` : false,
-        ctx.actCalls != null ? `${ctx.actCalls} act-phase tool calls` : false,
+        ctx.actCalls != null ? `${ctx.actCalls} deep-dive tool calls` : false,
       ])
     );
   }
@@ -336,48 +387,46 @@ export function renderProposalDetail(
   return out.join("\n").trimEnd();
 }
 
-// ---- deliverables ---------------------------------------------------------
+// ---- reports --------------------------------------------------------------
 
-export function renderDeliverable(d: Deliverable): string {
-  const lines = [
-    `## ${d.name ?? d.domain} · proposal #${d.proposalId}`,
+export function renderReportSummary(row: ReportListRow): string {
+  const headline = row.proposal_description.split("\n").find((l) => l.trim()) ?? row.proposal_description;
+  return [
+    `## Report #${row.id} · idea #${row.proposal_id}`,
     meta([
-      // First, because a card is built from whatever write tool succeeded, which is not the
-      // same as a finished build -- an empty repo would otherwise read as shipped.
-      d.actStatus ? `act: ${d.actStatus}` : false,
-      d.reviewStatus ?? false,
-      `${d.priority} priority`,
-      `${d.commits} commits`,
-      `${d.filesCommitted} files`,
-      `${d.actionCount} act calls`,
-      `last activity ${day(d.lastActivityAt)}`,
+      // The verdict leads: it is the answer, and the rest is why.
+      row.verdict,
+      `viability ${row.viability_score}/5`,
+      `${row.confidence} confidence`,
+      day(row.created_at),
+      row.goal_title ? `goal: ${row.goal_title}` : false,
     ]),
     "",
-    preview(d.description, 300),
+    preview(headline.replace(/[*_#`]/g, ""), 200),
+    "",
+    row.summary.trim(),
+  ]
+    .join("\n")
+    .trimEnd();
+}
+
+export function renderReport(row: ReportRow, ctx: { ideaHeadline?: string | null; goalTitle?: string | null } = {}): string {
+  const sources = parseSources(row);
+  const lines = [
+    `# Report #${row.id} · idea #${row.proposal_id}`,
+    meta([
+      row.verdict,
+      `viability ${row.viability_score}/5`,
+      `${row.confidence} confidence`,
+      day(row.created_at),
+      ctx.goalTitle ? `goal: ${ctx.goalTitle}` : false,
+    ]),
   ];
-
-  if (d.artifacts.length > 0) {
-    lines.push("", "Artifacts:");
-    for (const a of d.artifacts) {
-      lines.push(`- ${a.kind} · ${a.provider} · ${a.label}${a.detail ? ` (${a.detail})` : ""} — ${a.url}`);
-    }
-  } else {
-    lines.push("", "No browsable artifact — this build wrote nothing that returned a URL.");
+  if (ctx.ideaHeadline) lines.push("", `Idea: ${preview(ctx.ideaHeadline.replace(/[*_#`]/g, ""), 200)}`);
+  lines.push("", row.summary.trim(), "", row.body.trim());
+  if (sources.length > 0) {
+    lines.push("", "## Sources", ...sources.map((s) => `- ${s.title} — ${s.url}${s.note ? ` (${s.note})` : ""}`));
   }
-
-  if (d.outcome) {
-    lines.push(
-      "",
-      meta([
-        d.outcome.success ? "outcome: success" : "outcome: failure",
-        `revenue ${money(d.outcome.revenue)}`,
-        `cost ${money(d.outcome.cost)}`,
-        `recorded ${day(d.outcome.recordedAt)}`,
-      ])
-    );
-    if (d.outcome.notes) lines.push("", d.outcome.notes.trim());
-  }
-
   return lines.join("\n").trimEnd();
 }
 

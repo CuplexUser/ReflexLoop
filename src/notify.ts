@@ -1,6 +1,6 @@
 // src/notify.ts
 //
-// Push a message to the operator when a proposal starts waiting for review.
+// Push a message to the operator when an idea starts waiting for review.
 //
 // The review step is the one place the loop stops dead: humanReviewPhase emits
 // `proposal_pending` and then blocks on a promise until somebody clicks Approve or
@@ -25,7 +25,7 @@
 
 import type { AgentEvent } from "./events.js";
 import { onAgentEvent } from "./events.js";
-import type { ProposalRow } from "./memory-server.js";
+import { parseMarket, type ProposalRow } from "./memory-server.js";
 
 const TIMEOUT_MS = 10_000;
 /** Discord's hard cap is 2000 characters; the others are far more generous. Stay under all. */
@@ -95,9 +95,9 @@ export interface NotifyMessage {
 
 /**
  * What the operator needs in order to decide whether to stop what they are doing: which
- * lane, how it makes money, what it will cost, and how much real-world reach it asks for.
- * The tool list is spelled out rather than counted, because which write tools a proposal
- * wants is the part that cannot be undone once approved.
+ * lane, how it makes money, what it would cost, and how strong research thinks the market is.
+ * A legacy build-mode proposal has no market block; its tool list is shown instead, since that
+ * is what approving one used to grant.
  */
 export function formatProposalPending(proposal: ProposalRow, consoleUrl: string): NotifyMessage {
   const tools = (proposal.required_tools ?? "")
@@ -105,6 +105,7 @@ export function formatProposalPending(proposal: ProposalRow, consoleUrl: string)
     .map((t) => t.trim())
     .filter(Boolean)
     .map((t) => t.replace(/^mcp__(memory|integrations)__/, ""));
+  const market = parseMarket(proposal);
 
   // Typeof rather than truthiness: an upside of 0 is a real forecast worth showing, and
   // these columns are null on proposals written before they existed.
@@ -120,11 +121,15 @@ export function formatProposalPending(proposal: ProposalRow, consoleUrl: string)
   const lines = [
     truncate(proposal.description ?? "", MAX_DESCRIPTION_CHARS),
     money,
-    tools.length > 0 ? `tools: ${tools.join(", ")}` : "tools: none",
+    market
+      ? `market: viability ${market.viabilityScore}/5 (${market.confidence} confidence), ${market.competitors.length} competitor${market.competitors.length === 1 ? "" : "s"} named`
+      : tools.length > 0
+        ? `legacy tools: ${tools.join(", ")}`
+        : null,
   ].filter(Boolean);
 
   return {
-    title: `Proposal #${proposal.id} needs review -- ${proposal.domain}`,
+    title: `Idea #${proposal.id} needs review -- ${proposal.domain}`,
     body: hardCap(lines.join("\n"), MAX_BODY_CHARS),
     link: `${consoleUrl}/proposals/${proposal.id}`,
   };

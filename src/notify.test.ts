@@ -20,9 +20,17 @@ function proposal(overrides: Partial<ProposalRow> = {}): ProposalRow {
     expected_cost: 0,
     expected_time_hours: 4,
     expected_upside: 200,
-    required_tools: "mcp__integrations__github_create_repo,mcp__integrations__vercel_deploy",
+    required_tools: "",
     status: "pending",
     revenue_model: "affiliate",
+    market_json: JSON.stringify({
+      marketSize: "~4,000 field-service firms (estimate)",
+      demandEvidence: [{ claim: "comparison queries with paid ads", sourceUrl: "https://example.com" }],
+      competitors: [{ name: "Capterra" }, { name: "G2" }],
+      keyRisks: ["incumbent review sites"],
+      viabilityScore: 3,
+      confidence: "medium",
+    }),
     ...overrides,
   } as ProposalRow;
 }
@@ -69,14 +77,25 @@ describe("formatProposalPending", () => {
     expect(message.link).toBe("https://agent.example.com/proposals/41");
   });
 
-  it("names the lane and the money path, and strips the tool namespaces", () => {
+  it("names the lane, the money path and the market read", () => {
     const message = formatProposalPending(proposal(), "http://127.0.0.1:4317");
-    expect(message.title).toContain("#41");
+    expect(message.title).toContain("Idea #41");
     expect(message.title).toContain("affiliate comparison sites");
     expect(message.body).toContain("revenue: affiliate");
     expect(message.body).toContain("upside: $200");
     expect(message.body).toContain("~4h");
-    expect(message.body).toContain("tools: github_create_repo, vercel_deploy");
+    expect(message.body).toContain("market: viability 3/5 (medium confidence), 2 competitors named");
+  });
+
+  it("shows a legacy build-mode proposal's tools, without their namespaces", () => {
+    const message = formatProposalPending(
+      proposal({
+        market_json: null,
+        required_tools: "mcp__integrations__github_create_repo,mcp__integrations__vercel_deploy",
+      }),
+      "http://x"
+    );
+    expect(message.body).toContain("legacy tools: github_create_repo, vercel_deploy");
     expect(message.body).not.toContain("mcp__integrations__");
   });
 
@@ -85,10 +104,6 @@ describe("formatProposalPending", () => {
     expect(message.body).toContain("upside: $0");
   });
 
-  it("says so explicitly when a proposal asks for no tools at all", () => {
-    const message = formatProposalPending(proposal({ required_tools: "" }), "http://x");
-    expect(message.body).toContain("tools: none");
-  });
 
   it("renders a legacy proposal with null money columns without printing empty labels", () => {
     const message = formatProposalPending(
@@ -97,7 +112,7 @@ describe("formatProposalPending", () => {
     );
     expect(message.body).not.toContain("revenue:");
     expect(message.body).not.toContain("upside:");
-    expect(message.body).toContain("tools:");
+    expect(message.body).toContain("market:");
   });
 
   it("truncates a long description rather than sending a wall of Markdown to a phone", () => {
@@ -108,12 +123,12 @@ describe("formatProposalPending", () => {
 
   // The description is collapsed to one line, but the message's own line structure has to
   // survive -- flattening it turned three labelled lines into one unreadable paragraph.
-  it("keeps the description, the money line and the tool line on separate lines", () => {
+  it("keeps the description, the money line and the market line on separate lines", () => {
     const message = formatProposalPending(proposal({ description: "line one\n\nline two" }), "http://x");
-    const [description, money, tools] = message.body.split("\n");
+    const [description, money, market] = message.body.split("\n");
     expect(description).toBe("line one line two");
     expect(money).toContain("revenue: affiliate");
-    expect(tools).toContain("tools: github_create_repo");
+    expect(market).toContain("market: viability 3/5");
   });
 });
 

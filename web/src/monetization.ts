@@ -1,10 +1,10 @@
 // web/src/monetization.ts
 //
-// Parsing and labelling for the monetization block a proposal carries. Kept out of
-// MonetizationBlock.tsx so that file exports only components (fast refresh needs that),
-// and because the proposals table uses these without rendering the block at all.
+// Parsing and labelling for the monetization and market blocks an idea carries. Kept out of
+// MonetizationBlock.tsx / MarketBlock.tsx so those files export only components (fast refresh
+// needs that), and because the ideas table uses these without rendering either block.
 
-import type { Monetization, OutcomeRow, ProposalRow, ProposalStep, RevenueModel } from './types'
+import type { MarketAssessment, Monetization, OutcomeRow, ProposalRow, ProposalStep, RevenueModel } from './types'
 
 const REVENUE_MODEL_LABEL: Record<RevenueModel, string> = {
   affiliate: 'Affiliate',
@@ -14,6 +14,9 @@ const REVENUE_MODEL_LABEL: Record<RevenueModel, string> = {
   marketplace: 'Marketplace',
   service: 'Service',
   lead_gen: 'Lead generation',
+  sponsorship_donations: 'Sponsorship / donations',
+  open_core: 'Open core',
+  deferred: 'Audience first, charge later',
   other: 'Other',
 }
 
@@ -28,6 +31,16 @@ export function parseMonetization(proposal: Pick<ProposalRow, 'monetization_json
   if (!proposal.monetization_json) return null
   try {
     return JSON.parse(proposal.monetization_json) as Monetization
+  } catch {
+    return null
+  }
+}
+
+/** Null on a legacy build-mode proposal, which was filed before the market block existed. */
+export function parseMarket(proposal: Pick<ProposalRow, 'market_json'>): MarketAssessment | null {
+  if (!proposal.market_json) return null
+  try {
+    return JSON.parse(proposal.market_json) as MarketAssessment
   } catch {
     return null
   }

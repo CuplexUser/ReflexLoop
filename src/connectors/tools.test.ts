@@ -2,13 +2,24 @@
 // inert data until this turns it into a real HTTP call, and every way that can go
 // wrong is silent (a param sent under the wrong name, a path placeholder left
 // unsubstituted, a nested `url` never surfaced). So fetch is stubbed and the
-// resulting Request is inspected, which is the same shape integrations/github.test.ts
-// uses -- this is testing our own translation, not a mock of someone's wire format.
+// resulting Request is inspected -- this is testing our own translation, not a mock of
+// someone's wire format.
+//
+// The generic request-building features (form encoding, dotted wire names, result shaping)
+// are exercised through test-only manifests in ./test-fixtures, loaded the way an
+// operator's own manifests are, via AGENT_CONNECTORS_DIR. The bundled connectors are all
+// research reads and don't happen to use every feature, and a feature no bundled manifest
+// uses still has to keep working for the operator who writes one that does.
 
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ToolRegistry } from "../tools/registry.js";
-import { buildConnectorTools } from "./tools.js";
-import { CONNECTORS } from "./load.js";
+
+// Before load.ts is evaluated: it reads the manifest directories once, at module scope.
+process.env.AGENT_CONNECTORS_DIR = join(dirname(fileURLToPath(import.meta.url)), "test-fixtures");
+const { buildConnectorTools } = await import("./tools.js");
+const { CONNECTORS, CONNECTOR_ERRORS } = await import("./load.js");
 
 interface Captured {
   url: string;
@@ -41,10 +52,8 @@ function stubFetch() {
 beforeEach(() => {
   captured = [];
   respondWith = { status: 200, body: "{}" };
-  process.env.STRIPE_API_KEY = "sk_test_123";
-  process.env.CLOUDFLARE_API_TOKEN = "cf_token";
-  process.env.PLAUSIBLE_API_KEY = "pl_token";
-  process.env.RESEND_API_KEY = "re_token";
+  process.env.FIXTURE_FORM_TOKEN = "sk_test_123";
+  process.env.FIXTURE_JSON_TOKEN = "json_token";
   stubFetch();
 });
 
@@ -56,6 +65,10 @@ const call = (name: string, args: Record<string, unknown>) =>
   registry.invoke(`mcp__integrations__${name}`, args);
 
 describe("bundled manifests", () => {
+  it("load cleanly alongside the fixtures", () => {
+    expect(CONNECTOR_ERRORS).toEqual([]);
+  });
+
   it("every operation has a registered tool", () => {
     const declared = CONNECTORS.flatMap((c) => c.operations.map((o) => o.toolName));
     expect(declared.length).toBeGreaterThan(0);
@@ -65,14 +78,14 @@ describe("bundled manifests", () => {
 
 describe("request building", () => {
   it("form-encodes a body under the provider's own field names", async () => {
-    respondWith = { status: 200, body: JSON.stringify({ id: "plink_1", url: "https://buy.stripe.com/x" }) };
-    await call("stripe_create_payment_link", { priceId: "price_1" });
+    respondWith = { status: 200, body: JSON.stringify({ id: "order_1" }) };
+    await call("fixture_form_post", { priceId: "price_1" });
 
     const [req] = captured;
     expect(req.method).toBe("POST");
-    expect(req.url).toBe("https://api.stripe.com/v1/payment_links");
+    expect(req.url).toBe("https://api.fixture.example/v1/orders");
     expect(req.headers["content-type"]).toBe("application/x-www-form-urlencoded");
-    // `as` is what lets the tool argument read as priceId while Stripe gets its own name,
+    // `as` is what lets the tool argument read as priceId while the API gets its own name,
     // and the default quantity has to survive zod's parse to reach the wire at all.
     const form = new URLSearchParams(req.body ?? "");
     expect(form.get("line_items[0][price]")).toBe("price_1");
@@ -80,7 +93,7 @@ describe("request building", () => {
   });
 
   it("JSON-encodes a body and sends arrays as arrays", async () => {
-    await call("resend_send_email", {
+    await call("fixture_json_send", {
       from: "a@b.com",
       to: ["c@d.com", "e@f.com"],
       subject: "hi",
@@ -98,24 +111,22 @@ describe("request building", () => {
   });
 
   it("substitutes path params and never leaves a placeholder behind", async () => {
-    await call("cloudflare_get_pages_project", { accountId: "acc 1", projectName: "site" });
-    expect(captured[0].url).toBe(
-      "https://api.cloudflare.com/client/v4/accounts/acc%201/pages/projects/site"
-    );
+    await call("fixture_json_get_project", { accountId: "acc 1", projectName: "site" });
+    expect(captured[0].url).toBe("https://api.fixture.example/v4/accounts/acc%201/projects/site");
     expect(captured[0].url).not.toContain("{");
   });
 
   it("puts query params on the URL under their wire names, with defaults applied", async () => {
-    await call("plausible_aggregate", { siteId: "example.com" });
+    await call("fixture_json_aggregate", { siteId: "example.com" });
     const url = new URL(captured[0].url);
-    expect(url.pathname).toBe("/api/v1/stats/aggregate");
+    expect(url.pathname).toBe("/v4/stats/aggregate");
     expect(url.searchParams.get("site_id")).toBe("example.com");
     expect(url.searchParams.get("period")).toBe("30d");
     expect(captured[0].body).toBeNull();
   });
 
   it("sends the bearer credential from the connector's env var", async () => {
-    await call("stripe_list_products", {});
+    await call("fixture_form_list", {});
     expect(captured[0].headers.authorization).toBe("Bearer sk_test_123");
   });
 });
@@ -126,7 +137,7 @@ describe("body shaping", () => {
   // model hand-writing the nested payload on every call.
   it("nests JSON body params along a dotted wire name", async () => {
     respondWith = { status: 200, body: JSON.stringify({ data: { viewer: { accounts: [{}] } } }) };
-    await call("cloudflare_web_analytics", {
+    await call("fixture_json_graphql", {
       accountTag: "acct_1",
       siteTag: "site_1",
       since: "2026-08-01T00:00:00Z",
@@ -153,9 +164,9 @@ describe("body shaping", () => {
     expect(body[0]).toMatchObject({ keywords: ["a", "b"], location_name: "Sweden" });
   });
 
-  it("sends IndexNow its key in the body -- there is no header credential to get wrong", async () => {
+  it("sends a body-borne key in the body -- there is no header credential to get wrong", async () => {
     respondWith = { status: 200, body: "" };
-    await call("indexnow_submit_urls", {
+    await call("fixture_open_submit", {
       host: "example.com",
       key: "abc123",
       urlList: ["https://example.com/a", "https://example.com/b"],
@@ -212,7 +223,7 @@ describe("list projection", () => {
         result: [{ site_tag: "abc", ruleset: { zone_name: "example.com" }, rules: [1, 2, 3] }],
       }),
     };
-    const result = await call("cloudflare_list_web_analytics_sites", { accountId: "acct_1" });
+    const result = await call("fixture_json_list_sites", {});
     const parsed = JSON.parse(result.text) as { items: Record<string, unknown>[] };
     expect(parsed.items[0]).toMatchObject({ site_tag: "abc", zone_name: "example.com" });
   });
@@ -273,7 +284,7 @@ describe("graphql-style errors", () => {
       status: 200,
       body: JSON.stringify({ data: null, errors: [{ message: "unknown field requestPath" }] }),
     };
-    const result = await call("cloudflare_web_analytics", {
+    const result = await call("fixture_json_graphql", {
       accountTag: "a",
       siteTag: "s",
       since: "2026-08-01T00:00:00Z",
@@ -283,14 +294,9 @@ describe("graphql-style errors", () => {
     expect(result.text).toContain("unknown field requestPath");
   });
 
-  it("leaves an empty errors array alone -- that is what success looks like on Cloudflare REST", async () => {
-    respondWith = { status: 200, body: JSON.stringify({ success: true, errors: [], result: { id: "dns_1" } }) };
-    const result = await call("cloudflare_create_dns_record", {
-      zoneId: "z1",
-      type: "CNAME",
-      name: "www",
-      content: "example.vercel.app",
-    });
+  it("leaves an empty errors array alone -- that is what success looks like on many REST APIs", async () => {
+    respondWith = { status: 200, body: JSON.stringify({ success: true, errors: [], result: { id: "rec_1" } }) };
+    const result = await call("fixture_json_shaped", { name: "www" });
     expect(result.isError).toBeFalsy();
   });
 });
@@ -301,15 +307,10 @@ describe("responses", () => {
       status: 200,
       body: JSON.stringify({ result: { id: "rec_1", name: "www", type: "CNAME", extra: "ignored" } }),
     };
-    const res = await call("cloudflare_create_dns_record", {
-      zoneId: "z1",
-      type: "CNAME",
-      name: "www",
-      content: "example.pages.dev",
-    });
+    const res = await call("fixture_json_shaped", { name: "www" });
 
     expect(res.isError).toBe(false);
-    // Cloudflare's {result: ...} wrapper is exactly why `result` dot-paths exist.
+    // A {result: ...} wrapper is exactly why `result` dot-paths exist.
     expect(JSON.parse(res.text)).toEqual({ id: "rec_1", name: "www", type: "CNAME" });
   });
 
@@ -317,36 +318,36 @@ describe("responses", () => {
     // A response shape that changed under us. `{}` would report success with no
     // information; the raw body at least lands in the action log.
     respondWith = { status: 200, body: JSON.stringify({ unexpected: true }) };
-    const res = await call("cloudflare_list_zones", {});
+    const res = await call("fixture_json_list_zones", {});
     expect(JSON.parse(res.text)).toEqual({ unexpected: true });
   });
 
   it("returns a non-2xx as in-band error text rather than throwing", async () => {
     respondWith = { status: 402, body: '{"error":{"message":"card declined"}}' };
-    const res = await call("stripe_create_product", { name: "Widget" });
+    const res = await call("fixture_form_post", { priceId: "price_1" });
     expect(res.isError).toBe(true);
     expect(res.text).toContain("402");
     expect(res.text).toContain("card declined");
   });
 
   it("reports a missing credential in band, and reads it at call time", async () => {
-    delete process.env.STRIPE_API_KEY;
-    const res = await call("stripe_list_products", {});
+    delete process.env.FIXTURE_FORM_TOKEN;
+    const res = await call("fixture_form_list", {});
     expect(res.isError).toBe(true);
-    expect(res.text).toContain("STRIPE_API_KEY is not set");
+    expect(res.text).toContain("FIXTURE_FORM_TOKEN is not set");
     // Nothing was sent -- the credential is checked before the request is made.
     expect(captured).toHaveLength(0);
 
     // Same tool, same process: setting the key makes it work with no re-registration,
     // which is the property that lets a key be filled in without a restart.
-    process.env.STRIPE_API_KEY = "sk_test_456";
-    const after = await call("stripe_list_products", {});
+    process.env.FIXTURE_FORM_TOKEN = "sk_test_456";
+    const after = await call("fixture_form_list", {});
     expect(after.isError).toBe(false);
     expect(captured[0].headers.authorization).toBe("Bearer sk_test_456");
   });
 
   it("rejects arguments that don't match the manifest's param types", async () => {
-    const res = await call("stripe_create_price", {
+    const res = await call("fixture_form_typed", {
       product: "prod_1",
       unitAmount: "lots",
       currency: "usd",

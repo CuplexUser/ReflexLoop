@@ -1,0 +1,20 @@
+{
+  "id": "fixture_open",
+  "label": "Fixture (no auth)",
+  "baseUrl": "https://api.fixture.example",
+  "auth": { "type": "none" },
+  "operations": [
+    {
+      "name": "fixture_open_submit",
+      "risk": "read",
+      "description": "Test fixture: a key that travels in the body rather than a header.",
+      "method": "POST",
+      "path": "/submit",
+      "params": {
+        "host": { "type": "string", "in": "body", "required": true },
+        "key": { "type": "string", "in": "body", "required": true },
+        "urlList": { "type": "string[]", "in": "body", "required": true }
+      }
+    }
+  ]
+}

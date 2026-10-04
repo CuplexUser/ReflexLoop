@@ -21,13 +21,12 @@ import { PauseCircleOutlined, PlayCircleOutlined, StopOutlined, ThunderboltOutli
 import type { ConnectorStatus, ControlState } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
-import { ToolTag } from '../components/ToolFence'
 import { recurrenceLabel } from '../format'
 
 /**
  * Runtime knobs that used to require an env change and a restart. Everything here either
  * reduces what the agent does (pause, abort) or redirects what it researches — none of it can
- * approve a proposal or widen the act-phase fence, which stay with the review flow.
+ * approve an idea, which stays with the review flow.
  *
  * Under `start:console` this is the only page that still writes, and only in part: domains,
  * cycle interval and the running switch persist for the next real run, while the directive,
@@ -45,9 +44,9 @@ import { recurrenceLabel } from '../format'
  * real answer. Descriptions are written for the model but read fine to a person, so they're
  * shown verbatim rather than re-worded into a second thing to keep in sync.
  *
- * It earns a place here because "why did the act phase say STRIPE_API_KEY is not set" is
- * otherwise only answerable by reading the source. Tools stay catalogued when unconfigured
- * — a proposal can still name one — so the console has to say which are inert.
+ * It earns a place here because "why does research never use DataForSEO" is otherwise only
+ * answerable by reading the source: an unconfigured connector is left out of every phase's
+ * grant, so the console has to say which are inert.
  */
 function ConnectorsCard() {
   const [connectors, setConnectors] = useState<ConnectorStatus[] | null>(null)
@@ -71,16 +70,14 @@ function ConnectorsCard() {
     >
       <Space direction="vertical" size={8} style={{ width: '100%' }}>
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          External services the agent can call — payments, email, analytics, DNS — each declared as a
-          manifest in <code>src/connectors/defs/</code>. Expand one to see the tools it grants. Read-only
-          tools the research phase may call freely; side-effecting ones still run only inside an act phase,
-          and only when a proposal <em>you approved</em> named that exact tool.
+          Research data sources the agent can query — search volume, discussions, public tenders — each
+          declared as a manifest in <code>src/connectors/defs/</code>. Expand one to see the tools it grants.
+          Every connector is read-only: a manifest declaring a write operation is refused when it loads.
         </Typography.Text>
         <Collapse
           ghost
           size="small"
           items={connectors.map((c) => {
-            const writes = c.operations.filter((o) => o.risk === 'write').length
             return {
               key: c.id,
               label: (
@@ -93,7 +90,6 @@ function ConnectorsCard() {
                   )}
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                     {c.operations.length} tool{c.operations.length === 1 ? '' : 's'}
-                    {writes > 0 ? ` · ${writes} side-effecting` : ''}
                   </Typography.Text>
                 </Space>
               ),
@@ -115,13 +111,12 @@ function ConnectorsCard() {
                     <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                       Set <code>{c.envVar}</code> in <code>.env</code> to enable these. Connector credentials are
                       read per call, so a key filled in while the loop runs takes effect on the next cycle with no
-                      restart. Until then each tool answers "not set" when called, and the research phase isn't
-                      told it exists — though a proposal can still name it in its fence.
+                      restart. Until then no phase is told it exists.
                     </Typography.Text>
                   )}
                   {c.operations.map((op) => (
                     <div key={op.toolName}>
-                      <ToolTag name={op.toolName} risk={op.risk} />
+                      <Tag className="mono">{op.toolName.replace(/^mcp__[a-z_]+__/, '')}</Tag>
                       <Typography.Paragraph type="secondary" style={{ fontSize: 12, margin: '2px 0 0' }}>
                         {op.description}
                       </Typography.Paragraph>
@@ -251,11 +246,11 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
               ) : (
                 <Space direction="vertical" size={8} style={{ width: '100%' }}>
                   <Typography.Text>
-                    Act phase running for proposal <Tag color="processing">#{control.runningProposalId}</Tag>
+                    Deep dive running for idea <Tag color="processing">#{control.runningProposalId}</Tag>
                   </Typography.Text>
                   <Popconfirm
-                    title="Abort the running act phase?"
-                    description="Side effects that already landed stay landed — there is no rollback. Nothing further is attempted, and no outcome or lesson is recorded."
+                    title="Abort the running deep dive?"
+                    description="It has no side effects to undo. Notes it already saved stay; no report or lesson is recorded."
                     okButtonProps={{ danger: true }}
                     disabled={consoleOnly}
                     onConfirm={() => run('abort', () => api.abort(control.runningProposalId ?? undefined), 'Abort requested')}
@@ -316,8 +311,8 @@ export function ControlPage({ historyVersion }: { historyVersion: number }) {
       >
         <Space direction="vertical" size={8} style={{ width: '100%' }}>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            Free-text steer injected into the next research+plan prompt, then cleared — it nudges one cycle rather
-            than quietly reshaping every future one. The output is still a proposal you have to approve. A queued
+            Free-text steer injected into the next research prompt, then cleared — it nudges one cycle rather
+            than quietly reshaping every future one. The output is still an idea you have to approve. A queued
             directive survives a restart; being used clears it.
           </Typography.Text>
           {consoleOnly && (

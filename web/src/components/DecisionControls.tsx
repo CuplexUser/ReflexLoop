@@ -5,23 +5,24 @@ import type { ProposalRow } from '../types'
 import { api, type ScheduleOptions, type ScopeEdits } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { palette } from '../theme'
-import { ToolFence } from './ToolFence'
 
 /**
  * DatePicker + dayjs are by far the heaviest thing on the approve surface, and they only render
  * once the operator opens "Schedule & priority…". Loading them on demand keeps them off the
- * dashboard's first paint, which renders this card the moment a proposal is pending.
+ * dashboard's first paint, which renders this card the moment an idea is pending.
  */
 const SchedulePriorityFields = lazy(() =>
   import('./SchedulePriorityFields').then((m) => ({ default: m.SchedulePriorityFields })),
 )
 
 /**
- * The approve/reject flow, shared by the dashboard review card and the proposal dialog so the
- * two can't drift on what an operator is allowed to change at decision time.
+ * The approve/reject flow, shared by the dashboard review card and the idea dialog so the two
+ * can't drift on what an operator is allowed to change at decision time.
  *
- * Scope edits (description + required_tools) are sent with the decision and applied server-side
- * *before* the status flips, so what gets approved is exactly what the act phase is fenced to.
+ * Approving starts a deep dive. The notes field means something on both sides: on a rejection
+ * it is the reason (which the agent learns from), on an approval it is the questions the deep
+ * dive's report has to answer first. A description edit is applied server-side before the
+ * status flips, so the deep dive investigates the idea as approved.
  */
 export function DecisionControls({ proposal, onDecided }: { proposal: ProposalRow; onDecided?: () => void }) {
   const { message } = App.useApp()
@@ -32,33 +33,19 @@ export function DecisionControls({ proposal, onDecided }: { proposal: ProposalRo
   const [showSchedule, setShowSchedule] = useState(false)
   const [schedule, setSchedule] = useState<ScheduleOptions>({})
 
-  const originalTools = proposal.required_tools
-    .split(',')
-    .map((t) => t.trim())
-    .filter(Boolean)
   const [editing, setEditing] = useState(false)
-  const [tools, setTools] = useState<string[]>(originalTools)
   const [description, setDescription] = useState(proposal.description)
-
-  const toolsChanged = tools.join(',') !== originalTools.join(',')
-  const descriptionChanged = description !== proposal.description
-  const edited = toolsChanged || descriptionChanged
+  const edited = description !== proposal.description
 
   async function decide(approved: boolean) {
     setSubmitting(approved ? 'approve' : 'reject')
     try {
-      const edits: ScopeEdits | undefined =
-        approved && edited
-          ? {
-              ...(descriptionChanged ? { editedDescription: description } : {}),
-              ...(toolsChanged ? { editedRequiredTools: tools } : {}),
-            }
-          : undefined
-      await api.decide(proposal.id, approved, notes || undefined, approved ? schedule : undefined, edits)
+      const edits: ScopeEdits | undefined = approved && edited ? { editedDescription: description } : undefined
+      await api.decide(proposal.id, approved, notes.trim() || undefined, approved ? schedule : undefined, edits)
       message.success(
         approved
-          ? `Approved proposal #${proposal.id}${edited ? ' with edits' : ''}`
-          : `Rejected proposal #${proposal.id}`,
+          ? `Approved idea #${proposal.id}${edited ? ' with edits' : ''} -- deep dive queued`
+          : `Rejected idea #${proposal.id}`,
       )
       onDecided?.()
     } catch (err) {
@@ -73,7 +60,7 @@ export function DecisionControls({ proposal, onDecided }: { proposal: ProposalRo
       {editing ? (
         <div>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            SCOPE (edit before approving)
+            DESCRIPTION (edit before approving)
           </Typography.Text>
           <Input.TextArea
             style={{ marginTop: 4 }}
@@ -84,19 +71,17 @@ export function DecisionControls({ proposal, onDecided }: { proposal: ProposalRo
         </div>
       ) : null}
 
-      <ToolFence tools={tools} editable={editing} onChange={setTools} />
-
       {!rejecting && (
         <Space size={16} wrap>
           <Button type="link" size="small" style={{ padding: 0 }} icon={<EditOutlined />} onClick={() => setEditing((v) => !v)}>
-            {editing ? 'Done editing' : 'Edit scope…'}
+            {editing ? 'Done editing' : 'Edit description…'}
           </Button>
           <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setShowSchedule((v) => !v)}>
             {showSchedule ? 'Hide schedule & priority' : 'Schedule & priority…'}
           </Button>
           {edited && (
             <Typography.Text type="warning" style={{ fontSize: 12 }}>
-              Scope edited — approving saves your version, keeping the original on record.
+              Description edited — approving saves your version, keeping the original on record.
             </Typography.Text>
           )}
         </Space>
@@ -108,14 +93,16 @@ export function DecisionControls({ proposal, onDecided }: { proposal: ProposalRo
         </Suspense>
       )}
 
-      {rejecting && (
-        <Input.TextArea
-          placeholder="Reason (optional) — saved with the rejection, and used to teach the agent not to re-propose it"
-          value={notes}
-          onChange={(e) => setNotes(e.target.value)}
-          autoSize={{ minRows: 2, maxRows: 4 }}
-        />
-      )}
+      <Input.TextArea
+        placeholder={
+          rejecting
+            ? 'Reason (optional) — saved with the rejection, and used to teach the agent not to re-propose it'
+            : 'Focus questions for the deep dive (optional) — e.g. "Is there demand outside Sweden? What do agencies pay?"'
+        }
+        value={notes}
+        onChange={(e) => setNotes(e.target.value)}
+        autoSize={{ minRows: 2, maxRows: 4 }}
+      />
 
       <Divider style={{ margin: '4px 0' }} />
 
@@ -131,7 +118,7 @@ export function DecisionControls({ proposal, onDecided }: { proposal: ProposalRo
             style={consoleOnly ? undefined : { background: palette.approved, borderColor: palette.approved }}
             onClick={() => decide(true)}
           >
-            {edited ? 'Approve with edits' : 'Approve'}
+            {edited ? 'Approve with edits' : 'Approve deep dive'}
           </Button>
           {rejecting ? (
             <Button

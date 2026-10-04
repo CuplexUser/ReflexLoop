@@ -2,7 +2,7 @@
 
 When Qdrant is configured, `research_note_search` and `lesson_search` find results by meaning
 rather than exact wording. A lesson written about "VS Code extension for productivity" can still
-turn up for a proposal about "VS Code extensions".
+turn up for an idea about "VS Code extensions".
 
 The search is hybrid: it combines meaning-based matching with keyword matching, which catches
 rare exact terms such as product or competitor names.

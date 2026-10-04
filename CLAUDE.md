@@ -4,51 +4,56 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An autonomous agent that researches money-making opportunities, proposes concrete plans, and — only
-after a human approves in a web console — acts on them, records the real outcome, and distills a lesson
-for next time. No sub-agents: the tool registry contains no tool that spawns one, and `agent-loop.ts`
-only ever dispatches tools from that registry.
+An autonomous market-research agent. The operator states goals; the agent researches them, files
+business ideas (software or not) with a market assessment and a money path, and, once a human
+approves an idea in the web console, investigates it in a **deep dive** that ends in a written
+feasibility report. Reflection turns each report (and each rejection) into a lesson. No sub-agents:
+the tool registry contains no tool that spawns one, and `agent-loop.ts` only ever dispatches tools
+from that registry.
 
-**It is not tied to any one model vendor.** It talks to model APIs directly over HTTP — there is no
+This project used to build and deploy software (GitHub commits, Vercel and Netlify deploys, Stripe
+and email connectors). That write path was **removed**, not feature-flagged. Old rows from that era
+stay in the database and still render; the notes below call them "legacy" or "build mode".
+
+**It is not tied to any one model vendor.** It talks to model APIs directly over HTTP. There is no
 Claude Code, no Agent SDK, no vendor SDK of any kind. `AGENT_PROVIDER` selects OpenRouter, OpenAI,
 Anthropic, xAI (Grok) or Moonshot (Kimi); `AGENT_MODEL` names the model. Phases can use different
 models (`AGENT_ACT_MODEL` etc.). Nothing outside `src/llm/` should contain provider-specific code.
 
-**The core invariant: no proposal, no action, ever.** Every real-world side-effecting tool call
-(creating a repo, deploying, etc.) only runs inside `actPhase`, fenced to exactly the tools the
-human-approved proposal named. Don't add anything that auto-approves proposals or lets `actPhase` reach
-beyond `proposal.required_tools` — that removes the one safeguard the rest of the design assumes is
-there. The fence is now enforced structurally rather than by configuration: `agent-loop.ts` owns tool
-dispatch, so a tool outside the phase's grant is never described to the model and is refused if the
-model names it anyway. (Under the old Agent SDK this needed three overlapping mechanisms —
-`allowedTools`, `canUseTool` and a `PreToolUse` hook — because each had a documented gap the next one
-patched. Those are gone; don't reintroduce that shape.)
+**The core invariant: no tool with an external side effect exists.** Every tool the agent can call
+either reads (the web, public data sources, public GitHub) or writes to its own SQLite database.
+This is enforced in three places rather than promised in a prompt:
 
-A human *may* edit `required_tools` — that's the operator reshaping the fence deliberately, not the agent
-escaping it. Two windows, and they're different endpoints on purpose:
+- `integrations-server.ts` registers only GitHub *read* tools.
+- `connectors/manifest.ts` accepts `risk: "read"` only, so an operator manifest declaring a write
+  operation fails validation at load and is skipped (logged in `CONNECTOR_ERRORS`).
+- `npm run smoke-test` fails if any registered tool classifies (`toolRisk`) as anything but `read`
+  or `memory`.
 
-- **At approval time** (`POST /api/proposals/:id/decision`, see approve-with-edits below), the edit is
-  applied *before* the status flips, so a proposal is never approved while still carrying its pre-edit
-  fence.
-- **After approval, until the act phase starts** (`POST /api/proposals/:id/scope`). A queued or scheduled
-  proposal you can see is slightly wrong should be narrowable without cancelling it outright. The window
-  closes at `store.hasActed(id)` (or while it's the running proposal): after that, narrowing can't
-  un-commit anything and widening would authorise work retroactively.
+Don't add a write tool, a connector `risk` other than read, or anything that sends, posts, buys,
+deploys or contacts. If a future feature genuinely needs one, it is a design change to discuss, not
+an integration to add.
 
-Either way the original is preserved on the row (`original_required_tools` / `original_description`).
-A name that isn't in the tool catalog is **allowed but flagged**, not rejected — `agent-loop.ts` matches
-tools by exact name, so an unrecognized entry grants nothing, and rejecting it blocked legitimate cases
-(a console whose catalog predates a newly added tool). The console badges it; the server logs it.
+**What approval gates now is spend.** The deep dive is the longest, most expensive phase, and only
+a human approval starts one. Don't add anything that auto-approves ideas. `report_submit` accepts a
+report only for the idea whose deep dive is running (`act_status = 'running'`), so a deep dive
+cannot file verdicts on ideas nobody asked about. Each phase is still fenced structurally:
+`agent-loop.ts` owns tool dispatch, so a tool outside the phase's grant is never described to the
+model and is refused if the model names it anyway. (Under the old Agent SDK this needed three
+overlapping mechanisms, `allowedTools`, `canUseTool` and a `PreToolUse` hook, because each had a
+documented gap the next one patched. Those are gone; don't reintroduce that shape.)
 
-Every other lever the console offers (pause, abort, directives, goals) can only reduce activity or
-redirect research; none of them grants the agent anything.
+At approval the operator can edit the idea's description (applied before the status flips, with
+the model's text kept in `original_description`) and add **focus questions** in the decision notes,
+which the deep dive is told to answer first. Every other lever the console offers (pause, abort,
+directives, goals) can only reduce activity or redirect research.
 
 **The same invariant, one level up: no accepted goal, no research.** Goals are what the loop is
 pointed at (see Architecture below). The agent can *suggest* one with `goal_suggest` when a lane it
 was given keeps coming up empty — but a suggested goal is inert: `status='suggested'` is excluded
 from `activeGoals()`, never appears in a prompt, and `resolveGoalId` refuses to file anything under
 it. Only a human clicking Accept makes it real. Don't add anything that auto-accepts a suggestion,
-for the same reason nothing auto-approves a proposal: it would let the agent choose what it works
+for the same reason nothing auto-approves an idea: it would let the agent choose what it works
 on. Retired goals are equally unreachable, so dismissing a suggestion also stops the lane coming
 back — that refusal is deliberate, not a bug.
 
@@ -57,8 +62,6 @@ back — that refusal is deliberate, not a bug.
 ```bash
 npm install
 npm run smoke-test    # sanity-checks the DB + tool wiring directly, no API key needed — run this first
-npm run test:github   # opt-in live check of the GitHub write path; needs a real GITHUB_TOKEN, creates throwaway repos
-npm run test:vercel   # opt-in live check of deploy-from-repo; needs GITHUB_TOKEN + VERCEL_TOKEN, creates a throwaway repo + project
 npm test              # vitest run — unit tests over src/**/*.test.ts, no API key needed
 npm run typecheck     # tsc --noEmit over src/
 npm start             # tsx src/orchestrator.ts — runs the agent loop + web console together (one process, one SQLite connection)
@@ -75,7 +78,7 @@ this mode writes nothing to the record. It needs no provider key and no `AGENT_M
 Read-only is enforced twice on purpose: SQLite itself rejects writes (`new MemoryStore(path,
 { readOnly: true })`), and `server.ts` refuses non-GET `/api` requests with a 403 so the UI gets
 one clear answer instead of a SQLite error surfacing from somewhere deep. So the console's write
-features (approve/reject, muting a lesson, editing scope, review verdicts) can't be exercised in
+features (approve/reject, muting a lesson, re-running a deep dive) can't be exercised in
 this mode — that's the trade for touching nothing. The obvious alternative, a scripted model driving
 the real loop against a scratch DB, was tried and rejected: an empty DB makes the console useless to
 develop against, and a copy of the real one drifts.
@@ -93,7 +96,7 @@ server's allowlist (anchored regexes, since the goal routes carry an id), and th
 independently ignores any key or column outside its own two allowlists.
 
 **Deleting a goal is excluded from this mode on purpose.** `MemoryStore.deleteGoal` also clears
-`goal_id` across proposals, lessons, notes and runs, and this writer must not be able to reach those
+`goal_id` across proposals, lessons, notes, runs and reports, and this writer must not be able to reach those
 tables. Dismissing (status → `retired`) is the reversible equivalent and stays within `goals`.
 
 Settings (`src/settings.ts`) are writable here for the same reason: they're what the next real run
@@ -124,32 +127,20 @@ refuses loopback/private addresses), and `src/llm/pricing.test.ts` (the cost tab
 reported-cost path, and the deliberate $0-for-unknown-model behaviour). The adapters and the loop itself
 aren't unit-tested — they're thin over HTTP, and a mock of a provider's wire format mostly tests the mock.
 `src/proposal-similarity.test.ts` (the duplicate check, against real proposals from the agent's
-own history — the pairs it must catch and the follow-up pair it must not).
-`src/act-verification.test.ts` (whether an act phase finished the approved plan, run against
-proposal #27's real step list and real tool calls — the case that motivated the module) and
+own history: the pairs it must catch and the follow-up pair it must not).
+`src/deep-dive.test.ts` (whether a deep dive produced a report, and the push-back when it didn't),
+`src/landscape.test.ts` (grouping a goal's notes by kind and merging the competitors its ideas named),
 `src/llm/types.test.ts` (the truncation-vocabulary list, which a new provider can quietly break),
 `src/shutdown.test.ts` (the teardown order, the grace period, and the forced second signal),
-`src/aborted.test.ts` (that both shapes of deliberate abort are recognized and a real failure isn't), and
-`src/agent-loop.test.ts` (the nudge — the exception to the no-loop-tests rule, see that module).
-`smoke-test.ts` runs end-to-end against a throwaway `./data/smoke-test.db`, and also builds the real tool
-registry and serializes every schema — which is the cheap way to catch a zod shape that can't be converted,
-since otherwise it surfaces as a provider 400 on the first live cycle.
-
-`src/integrations/github.test.ts` is the one place the "a mock of a wire format mostly tests the mock"
-rule is deliberately set aside, and **it is not sufficient on its own** — `npm run test:github`
-(`src/github-live-test.ts`) is the other half. What the unit tests cover is our *branching* across three
-states GitHub reports with three different statuses, which is where a real bug lived: a repo with zero
-commits rejects the **entire** Git Data API (blobs and trees included, not just the ref lookup) with
-`409 Git Repository is empty.`, so `github_create_repo` followed by `github_commit_files` — the normal
-shape of a build — could not work at all. `commitFiles` now bootstraps such a repo through the Contents
-API (the one write that functions there), then collapses that bootstrap into a single parentless commit
-so the history isn't left carrying an artifact of the API. A **404** on the ref is deliberately still an
-error rather than a second initial-commit path: treating it as one would report success while leaving an
-orphan branch, which is the same "reported fine, nothing there" failure one level subtler.
-The live script is what made this correct — the first version of the fix handled the 409 on the ref
-lookup and died on the very next call, and the mock agreed with it right up until the real API didn't.
-**Re-run `npm run test:github` after touching the write path**; it needs `GITHUB_TOKEN`, and cleanup
-needs the `delete_repo` scope (without it the throwaway repos survive and their URLs are printed).
+`src/aborted.test.ts` (that both shapes of deliberate abort are recognized and a real failure isn't),
+`src/connectors/*.test.ts` (manifest validation, including the refusal of write operations, and
+request building; the generic request features run against test-only manifests in
+`src/connectors/test-fixtures/`, loaded through `AGENT_CONNECTORS_DIR`, because no bundled connector
+happens to use all of them) and `src/agent-loop.test.ts` (the nudge, the exception to the
+no-loop-tests rule; see that module). `smoke-test.ts` runs end-to-end against a throwaway
+`./data/smoke-test.db`, builds the real tool registry and serializes every schema (the cheap way to
+catch a zod shape that can't be converted, since otherwise it surfaces as a provider 400 on the
+first live cycle), and asserts the no-write-tools invariant above.
 
 Frontend (`web/`) is an npm workspace of the root project — `npm install` at the root sets up both.
 Run its scripts from the root (below) or with `npm run <script> -w web` from anywhere:
@@ -168,13 +159,13 @@ rebuilding `web/dist` on every change.
 provider's key (`OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `XAI_API_KEY` /
 `MOONSHOT_API_KEY`). Then `AGENT_DOMAINS`, `AGENT_DB_PATH`, `AGENT_CYCLE_INTERVAL_MS`,
 `AGENT_MAX_PENDING_PROPOSALS`, `AGENT_SERVER_PORT`, `AGENT_API_TOKEN`, `AGENT_BIND_HOST`; optional
-search keys `TAVILY_API_KEY` / `BRAVE_API_KEY` (see below); optional integration keys `GITHUB_TOKEN` /
-`VERCEL_TOKEN` / `NETLIFY_AUTH_TOKEN` / `AGENT_NOTIFY_URL` (see `notify.ts`) / `QDRANT_URL` + `QDRANT_API_KEY` + `QDRANT_EMBEDDING_MODEL` +
-`QDRANT_EMBEDDING_DIM` (all four required together for semantic search) — each integration or feature
-is simply unavailable, not a startup error, when its keys are missing. Connector keys
-(`STRIPE_API_KEY` / `RESEND_API_KEY` / `PLAUSIBLE_API_KEY` / `CLOUDFLARE_API_TOKEN` /
-`BING_WEBMASTER_API_KEY` / `DATAFORSEO_AUTH`, plus `AGENT_CONNECTORS_DIR`) work the same way, except that they're read per call rather than at startup,
-so filling one in takes effect on the next cycle without a restart.
+search keys `TAVILY_API_KEY` / `BRAVE_API_KEY` (see below); optional `GITHUB_TOKEN` (read-only
+competitor search), `AGENT_NOTIFY_URL` (see `notify.ts`) and `QDRANT_URL` + `QDRANT_API_KEY` +
+`QDRANT_EMBEDDING_MODEL` + `QDRANT_EMBEDDING_DIM` (all four required together for semantic search).
+Each feature is simply unavailable, not a startup error, when its keys are missing. Connector keys
+(`DATAFORSEO_AUTH`, plus `AGENT_CONNECTORS_DIR` for extra manifests) work the same way, except that
+they're read per call rather than at startup, so filling one in takes effect on the next cycle
+without a restart.
 
 **`AGENT_MODEL` has no default on purpose.** Providers rename and retire models constantly; a model id
 baked into the code fails at the first API call with an opaque 404 instead of at startup with a message
@@ -185,88 +176,84 @@ were wrong here at once. `Number(process.env.X ?? default)` does not do what it 
 var that is present but empty — which is how `.env.example` ships this one — is `""`, not `undefined`,
 so the default never applies and `Number("")` is 0. Every model call shipped `max_tokens: 0`, and it
 went unnoticed only because OpenRouter ignores it. Fixing that alone would have been a *regression*:
-8192 was the documented default, and the largest successful act-phase commit in this agent's history is
-~16k output tokens, so the act phase only ever worked because the cap wasn't being applied. A low value
-here doesn't produce a smaller build, it produces one that stops mid-file. **Use `positiveIntEnv` for
-any new numeric env var** rather than `Number(... ?? d)`.
+8192 was the documented default, and the largest successful build-mode commit in this agent's history
+was ~16k output tokens, so that phase only ever worked because the cap wasn't being applied. The same
+holds for a deep dive, which submits its whole report in one `report_submit` call: a low value doesn't
+produce a shorter report, it produces one cut off mid-section. **Use `positiveIntEnv` for any new
+numeric env var** rather than `Number(... ?? d)`.
 
 ## Architecture
 
 ### The four-phase loop (`src/orchestrator.ts`)
 
-Each cycle: **research + plan → human review → act → outcome + reflect**.
+Each cycle: **research → human review → deep dive → reflect**.
 
-- **research + plan** (`researchAndPlanPhase`) — gets its whole tool grant up front with no human in the
-  loop, since every tool available to it is read-only or writes only to the agent's own memory DB. Can span multiple
-  goals per cycle and create 0-3 proposals; not forced to cover them evenly.
+- **research** (`researchAndPlanPhase`, persisted phase key `research_plan`): gets its whole tool
+  grant up front with no human in the loop, since every tool available to it is read-only or writes
+  only to the agent's own memory DB. Can span multiple goals per cycle and file 0-3 ideas; not forced
+  to cover them evenly. It saves findings as research notes with a `kind` (`gap`, `demand`,
+  `market_size`, `competitor`, `pricing`, `risk`, `saturated`, ...), which is what each goal's market
+  landscape is built from.
 
   **What it's shown, versus what it can ask for.** Four digests are injected into the prompt before it
-  starts: the open proposal queue, the lessons that apply, the ground already found saturated, and — for
-  any goal that's gone quiet — an exploration mandate. `openProposalDigest`'s own rationale is why
-  ("a duplicate has to be prevented on every cycle, and a tool only helps on the cycles the model
-  remembers to call it"), and it applies unchanged to lessons and dead ends: the prompt had always
-  *told* research to call `lesson_search` and `research_note_search` first, roughly a third of the notes
-  on file were "I checked, it's saturated", and cycles kept re-checking them anyway. The tools are still
-  granted — the digests are a floor, not a replacement. Each goal's **brief is passed verbatim**, which
-  is where operator instructions ("research in Swedish, check Fortnox/Bokio first") belong; the title is
-  only the key, and the prompt tells the model to echo it back exactly when filing anything.
+  starts: the open idea queue (with each deep-dived idea's verdict, so a "drop" isn't re-pitched without
+  new evidence), the lessons that apply, the ground already found saturated, and, for any goal that's
+  gone quiet, an exploration mandate. `openProposalDigest`'s own rationale is why ("a duplicate has to
+  be prevented on every cycle, and a tool only helps on the cycles the model remembers to call it"),
+  and it applies unchanged to lessons and dead ends: the prompt had always *told* research to call
+  `lesson_search` and `research_note_search` first, roughly a third of the notes on file were "I
+  checked, it's saturated", and cycles kept re-checking them anyway. The tools are still granted; the
+  digests are a floor, not a replacement. Each goal's **brief is passed verbatim**, which is where
+  operator instructions ("research in Swedish, check Fortnox/Bokio first") belong; the title is only
+  the key, and the prompt tells the model to echo it back exactly when filing anything.
 
-  Proposing **zero** is a legitimate result — the prompt tells it not to force a weak proposal, and a
+  Filing **zero** ideas is a legitimate result: the prompt tells it not to force a weak one, and a
   goal whose ideas keep getting rejected will eventually stop producing any. That state used to be
   invisible (stdout only), which is indistinguishable from a broken loop, so a cycle that creates
-  nothing now emits a `no_proposal` event carrying the model's own stated reason. It also carries the
-  phase's tool-call count, because **zero tool calls is a different thing entirely** — the phase never
+  nothing emits a `no_proposal` event carrying the model's own stated reason. It also carries the
+  phase's tool-call count, because **zero tool calls is a different thing entirely**: the phase never
   researched at all (an empty or failed model response) and the console says so rather than reporting
   it as a considered decision.
-- **human review** (`humanReviewPhase`) — emits a `proposal_pending` event and blocks on
+- **human review** (`humanReviewPhase`): emits a `proposal_pending` event and blocks on
   `waitForDecision()` (`review-gateway.ts`), resolved when a person clicks Approve/Reject in the web UI
   (`POST /api/proposals/:id/decision`).
 
-  **A proposal becomes visible when the row is written and decidable only when a resolver exists**,
-  and those were far apart: `enqueueForReview` ran only when the whole research phase *returned*, so a
-  proposal filed 10 minutes into a 15-minute phase sat in the console answering "No pending decision
-  for this proposal" to every Approve click until the phase ended. `reviewSweep()` closes it on the
-  scheduler interval (~15s worst case). It's a reconciliation sweep, not a notification on create,
-  because "pending row, nothing waiting on it" has several causes — an aborted research phase, a
-  reactive pass that threw — and fixing only the create path would leave the rest. `enqueueForReview`
-  is idempotent via `hasPendingDecision`, since a proposal now arrives from both directions. Multiple proposals can be under review concurrently, each on its
-  own promise. The decision can carry **scope edits** (`editedDescription`, `editedRequiredTools`);
-  those are applied via `store.applyProposalEdits` *before* `decideProposal` flips the status, so a
-  proposal is never approved while still carrying its pre-edit fence. `original_required_tools` /
-  `original_description` preserve what the model asked for. A **rejection** now runs
-  `reflectOnRejectionPhase` (memory-only tools, same grant as reflect) with the human's stated reason,
-  so being told no produces a lesson instead of teaching the agent nothing.
-- **act** (`actPhase`) — side-effecting tool access is hard-limited to exactly `proposal.required_tools`.
-  On top of that it always gets the same no-side-effect set research gets freely: memory tools, the
-  read-only integration tools (`github_read_repo`/`github_read_file`/etc.) so the model can read back what
-  it just committed/deployed and self-check it, and `WebSearch`/`WebFetch` so it can check a library's
-  current API mid-build rather than committing what it half-remembers with no build step to catch it.
-  None of those can change anything outside the process, so they widen what act can *learn*, never what
-  it can *do*. The prompt requires it to fully implement the described scope (no stub/placeholder files),
-  proofread for syntax/import errors since there's no build step available to actually run the code, and
-  re-read the real committed/deployed state before calling `outcome_record`. The whole grant is passed to
-  `runAgent` as `allowedTools`, which is now the entire fence — see the note at the top of this file.
+  **An idea becomes visible when the row is written and decidable only when a resolver exists**,
+  and those were far apart: `enqueueForReview` ran only when the whole research phase *returned*, so an
+  idea filed 10 minutes into a 15-minute phase sat in the console answering "No pending decision" to
+  every Approve click until the phase ended. `reviewSweep()` closes it on the scheduler interval (~15s
+  worst case). It's a reconciliation sweep, not a notification on create, because "pending row, nothing
+  waiting on it" has several causes (an aborted research phase, a decision that raced a restart) and
+  fixing only the create path would leave the rest. `enqueueForReview` is idempotent via
+  `hasPendingDecision`. Multiple ideas can be under review concurrently, each on its own promise. An
+  approval can carry an `editedDescription` (applied via `store.applyProposalEdits` *before*
+  `decideProposal` flips the status) and `notes`, which become the deep dive's focus questions. A
+  **rejection** runs `reflectOnRejectionPhase` (memory-only tools, same grant as reflect) with the
+  human's stated reason, so being told no produces a lesson instead of teaching the agent nothing.
+- **deep dive** (`deepDivePhase`, persisted phase key `act`): a read-only investigation of one approved
+  idea. The grant is `MEMORY_TOOLS` + `WebSearch`/`WebFetch` + the configured read tools +
+  `DEEP_DIVE_OUTPUT_TOOLS` (`report_submit`); nothing comes from the legacy `required_tools` column.
+  The prompt restates the research phase's market, monetization and launch-outline claims as things
+  to verify or refute, puts the operator's approval notes first as questions to answer, includes the
+  previous report's summary on a re-run, and fixes the report's section headings.
 
-  **The prompt asking for something is not the same as it having happened**, which is what
-  `verifyAct` (`act-verification.ts`) exists to close. Act used to be "done" the moment `runAgent`
-  returned, and `runAgent` returns whenever the model stops calling tools — so proposal #27 created a
-  repo, said "now I'll write the full prototype", returned no tool call, and the loop emitted
-  `phase_done`, reflected on a nonexistent outcome, and left an empty repo on the Deliverables page.
-  Now the run is checked against the approved plan and an incomplete one emits `act_incomplete`
-  (the act-phase counterpart of `no_proposal`), writes an orchestrator-authored failure outcome if the
-  agent recorded none, and tells reflect what actually went wrong. It is **not** a retry: re-running
-  act would repeat whatever side effects already landed, and side effects happening exactly once
-  inside an approved fence is the property the whole design rests on.
-- **reflect** (`reflectPhase`) — calls `lesson_search` first; reinforces an existing lesson via
-  `lesson_reinforce` if this outcome confirmed/contradicted it, otherwise adds one new generalized lesson.
-  Takes act's verdict, so a phase that half-executed is described as the failure it was instead of
-  being announced as "has an outcome recorded now" when nothing recorded one.
+  **The prompt asking for a report is not the same as one existing**, which is what `verifyDeepDive`
+  (`deep-dive.ts`) closes. `runAgent` returns whenever the model stops calling tools, so a model that
+  announces "now I'll write the report" and stops would otherwise look finished. `deepDiveNudge` pushes
+  back (up to `MAX_NUDGES`) until `report_submit` has been accepted; if it never is, the verdict
+  (`act_status = 'incomplete'`) and an `act_incomplete` event record it, and reflect is told what went
+  wrong. The event and column names are inherited from build mode and kept because they're persisted.
+- **reflect** (`reflectPhase`): calls `lesson_search` first; reinforces an existing lesson via
+  `lesson_reinforce` if this report confirmed/contradicted it, otherwise adds one new generalized
+  lesson. It is handed the report's verdict, score and summary *and* the research phase's original
+  viability score, so it can learn calibration ("research over-rated this kind of idea") rather than
+  only retelling the report. Without a report it gets the deep dive's problems instead.
 
-**Concurrency**: research runs one cycle at a time on `AGENT_CYCLE_INTERVAL_MS`. Every new proposal
-immediately starts waiting for review in parallel with any others already pending. Once approved, a
-proposal's act+reflect is pushed onto a single serialized chain (`scheduleActAndReflect`/`actChainTail`)
-so side-effecting tool calls from different proposals never run concurrently, even if several are
-approved back to back.
+**Concurrency**: research runs one cycle at a time on `AGENT_CYCLE_INTERVAL_MS`. Every new idea
+immediately starts waiting for review in parallel with any others already pending. Once approved, an
+idea's deep dive + reflect go through a single priority-ordered queue (`runQueue` / `drainQueue`), one
+at a time. That serialization now bounds spend and provider rate limits; there are no side effects
+left for it to guard.
 
 Every tool call in every phase is logged by `runPhase`'s `onToolCall` callback, and every phase's model
 API cost is recorded — spend counts against profit. Cost is no longer handed over the way the SDK's
@@ -296,9 +283,8 @@ restart. Consuming a directive persists the clear too, or a one-shot steer that 
 would then survive being used and quietly become standing instruction. `paused` persists as well: a
 pause is the operator saying "stop spending", and losing that on restart resumes activity they didn't
 ask for. Live execution state (`runningProposalId`, `queuedProposalIds`) is not persisted — it
-describes this process, not a preference. "Run a cycle now" resolves `sleepUntilNextCycle` early; aborting an act phase fires the
-`AbortController` passed to that run's `query()` (skipping reflect, since there's no outcome to reflect
-on). A directive is consumed — injected into one research prompt, then cleared.
+describes this process, not a preference. "Run a cycle now" resolves `sleepUntilNextCycle` early; aborting a deep dive fires
+the `AbortController` passed to that run (skipping reflect, since there's no report to reflect on). A directive is consumed — injected into one research prompt, then cleared.
 
 ### Backend modules (`src/`)
 
@@ -310,8 +296,8 @@ on). A directive is consumed — injected into one research prompt, then cleared
   natively — worth its own file rather than going through Anthropic's OpenAI-compat shim, which lags on
   tool use. `providers.ts` is the registry of base URLs / key env vars / model-list links; `http.ts` is
   one retrying JSON POST (429 and 5xx only — a 400 from a bad model id is returned immediately);
-  `pricing.ts` turns tokens into dollars; `index.ts` resolves one client per phase from the env, or
-  short-circuits to `mock.ts` (the scripted offline dev client — see Commands above).
+  `pricing.ts` turns tokens into dollars; `index.ts` resolves one client per phase from the settings
+  and env.
   Adapters must normalize `Usage.inputTokens` to *total* prompt tokens including cached ones — Anthropic
   reports the uncached remainder, so its adapter adds the cache fields back or pricing under-counts.
 - `agent-loop.ts` — the replacement for the SDK's `query()`: ask the model, run the tools it asked for,
@@ -333,43 +319,44 @@ on). A directive is consumed — injected into one research prompt, then cleared
 
   **`nudge` is what stops one bad turn losing the phase.** "No tool calls" means "done" only for a
   phase whose output is prose; for one with a checkable definition of finished it's a question the
-  caller can answer. Twice an act phase read everything it needed, wrote *"Now I'll write the full
-  prototype and commit it in one call"*, and returned nothing — proposals #27 and #29, both leaving
-  `CuplexUser/machwatch` empty. The callback (see `actPhase`, which builds it from `verifyAct`) returns
-  text to push back or null to finish. It goes in as an ordinary user turn **after** the model's own,
-  so the whole transcript survives and the model finishes the job rather than a fresh phase
-  re-deriving everything. `MAX_NUDGES` is 2: the realistic recovery is two-step (commit, then
-  `outcome_record`), and a model that ignores being told twice is stuck. It can't widen the fence — a
-  nudge is text — and it names only tools that haven't already run, so it can't cause a repeat.
+  caller can answer. In build mode an act phase twice read everything it needed, wrote *"Now I'll write
+  the full prototype and commit it in one call"*, and returned nothing (proposals #27 and #29). The
+  callback (see `deepDivePhase`, which uses `deepDiveNudge` from `deep-dive.ts`, and `reflectPhase`)
+  returns text to push back or null to finish. It goes in as an ordinary user turn **after** the
+  model's own, so the whole transcript survives and the model finishes the job rather than a fresh
+  phase re-deriving everything. `MAX_NUDGES` is 2: a first nudge is often answered with one more
+  search instead of the required output, and a model that ignores being told twice is stuck. It
+  can't widen the grant: a nudge is text.
   `agent-loop.test.ts` is the deliberate exception to "don't unit-test the loop": this is loop logic
   driven through our own `LlmClient` interface, not a mock of anyone's wire format.
 
   **A nudge after a *truncated* turn is a different nudge.** A turn that overflowed the output
-  limit without calling a tool is a model writing a file out as prose instead of putting it in the
-  call — telling it "you didn't finish, do X" is advice it already agrees with, and following it the
-  same way overflows again. So that path says what to do differently (content goes in the tool call,
-  split across smaller calls) and replays only the first `TRUNCATED_REPLAY_CHARS` of the cut-off
-  turn: the fragment can't be committed from, and keeping 32k of it in context makes the *next* turn
+  limit without calling a tool is a model writing a long document (in build mode a file, now a
+  report) out as prose instead of putting it in the call. Telling it "you didn't finish, do X" is
+  advice it already agrees with, and following it the same way overflows again. So that path says
+  what to do differently (content goes in the tool call, at a length that fits) and replays only the
+  first `TRUNCATED_REPLAY_CHARS` of the cut-off turn: the fragment can't be saved from, and keeping
+  32k of it in context makes the *next* turn
   likelier to overflow too. `providerRaw` is dropped there on purpose — the Anthropic adapter
   replays it in preference to `content`, which would put the whole turn back.
 
   **Tool calls run concurrently only when the whole batch is pure reads** (`canRunConcurrently`, gated
   on `toolRisk`). Research is latency-bound on the network — one run in the ledger took 39 minutes,
   almost all of it WebSearch/WebFetch in series — so this is free wall-clock. The bar is deliberately
-  high and `memory` is excluded along with `write`, even though it only touches the agent's own DB:
+  high and `memory` is excluded, even though it only touches the agent's own DB:
   several memory tools now check for a near-duplicate before inserting, and two similar calls dispatched
   together would both pass that check before either wrote, letting through exactly the duplicate the
   guard exists to stop. Results are consumed in the model's original call order regardless of which
   finished first, so the transcript, the `actions` table and the activity feed are unchanged —
-  concurrency is a latency change, not an ordering one. Act-phase behaviour is untouched.
+  concurrency is a latency change, not an ordering one.
 - `tools/registry.ts` — what replaced the MCP servers. A tool is a name, description, zod schema and
   handler; the registry converts schemas to JSON Schema (`z.toJSONSchema`, `io: "input"`) and dispatches.
   Every failure — unknown tool, invalid args, throwing handler — comes back as `isError` tool text rather
   than an exception, so one bad call costs a turn instead of the phase. **Tool names keep their
   `mcp__memory__` / `mcp__integrations__` prefixes** even though no MCP server exists any more: those
-  strings are persisted in `actions.tool_name` and in approved proposals' `required_tools`, and the
-  console strips them for display. Treat them as opaque namespaces; renaming would invalidate the fence
-  on already-approved proposals for no behavioural gain.
+  strings are persisted in `actions.tool_name` (and in legacy proposals' `required_tools`), and the
+  console strips them for display. Treat them as opaque namespaces; renaming would split the action
+  history for no behavioural gain.
 - `tools/web.ts` — `WebSearch` and `WebFetch`, which were Claude Code built-ins and had to be rebuilt.
   `WebFetch` is always registered (fetch + a regex HTML-to-text pass, with private/loopback addresses
   refused). `WebSearch` is registered only in `tavily`/`brave` search mode.
@@ -379,62 +366,67 @@ on). A directive is consumed — injected into one research prompt, then cleared
   `ChatRequest.nativeSearch`, which each adapter translates to its provider's own knob (OpenRouter
   `plugins`, xAI `search_parameters`, OpenAI `web_search_options`, Moonshot's `$web_search` builtin,
   Anthropic's `web_search_*` server tool). **The point of the seam: "WebSearch" means the same thing to
-  the operator in all modes** — one grantable tool name, one badge in the console, one entry in
-  `required_tools`. Keep it that way.
+  the operator in all modes**: one tool name in every phase's grant, one badge in the console. Keep it
+  that way.
 - **Goals** (`goals` table, in `memory-server.ts`) — what the loop is pointed at, and what replaced the
   free-text `domain` string as the thing the operator curates. That string was doing two incompatible
   jobs at once: a stable grouping key *and* a research brief. It could not do both. The model invents
   the domain on every `proposal_create` and nothing validated it, so 20 proposals arrived under **13
   distinct spellings** — "comparison site / affiliate", "affiliate comparison site" and "comparison
   directory affiliate site" are one idea under three keys — which silently broke every exact-match
-  lookup built on it: `action_history_search` returned nothing for any configured domain, the scoreboard
-  fragmented, and the `searchLessons` LIKE fallback reached zero rows. Meanwhile one configured domain
+  lookup built on it: the (since removed) `action_history_search` returned nothing for any configured
+  domain, the scoreboard fragmented, and the `searchLessons` LIKE fallback reached zero rows. Meanwhile one configured domain
   was a 400-character paragraph of research instructions, because a newline-delimited textarea was the
   only place to put a brief.
 
   A goal has `title` (short, stable, the key) and `brief` (the long instructions, kept out of the key),
   plus `status` / `weight` / `origin` / `parent_id` for branches. **Two mechanisms, deliberately
   separate**: `goal_id` is for *attribution* (scoreboard, per-goal health, filters) and is exact;
-  *recall* (`lesson_search`, `research_note_search`, `action_history_search`) matches semantically on
+  *recall* (`lesson_search`, `research_note_search`) matches semantically on
   `title + brief`, so it reaches history written under any of the old spellings. That split is why
   nothing had to be backfilled — pre-goals rows keep `goal_id = NULL` and their `domain` text, and are
   still findable. `resolveGoalId` maps the model's free-text `domain` onto a goal at write time, which
   is what makes the wording stop mattering; it is deliberately **strict and title-only** (measured:
   including the long brief made the Swedish goal a magnet that swallowed unrelated labels at 0.75),
   because a misfiled row puts a number on the scoreboard that isn't true, while an unassigned one is
-  merely where every legacy row already sits. `action_history_search` matches on `goal_id` **OR** text
-  and falls back to unfiltered recent history when a filter comes up empty — answering "[]" while 140
-  act-phase actions sit in the table is the most expensive thing that tool can say wrongly.
+  merely where every legacy row already sits. The market landscape (`landscape.ts`) uses `goal_id`
+  only, and says so in the console: guessing legacy rows into a goal would be the misfiling this
+  avoids.
 
-- `memory-server.ts` — SQLite-backed memory (`data/agent.db`) plus the tools the model can call:
+- `memory-server.ts`: SQLite-backed memory (`data/agent.db`) plus the tools the model can call:
   `research_note_add`, `research_note_search`, `lesson_search`, `lesson_add`, `lesson_reinforce`,
-  `proposal_create`, `proposal_status`, `outcome_record`, `action_history_search`, `goal_suggest`.
-  `proposal_create` and `goal_suggest` are **not** in `MEMORY_TOOLS` — they're `RESEARCH_OUTPUT_TOOLS`,
-  granted only to research, because both write a row a *human* then acts on and neither is something
-  act or reflect has business doing. Approving proposals,
-  logging actions, marking a run successful, and **curating memory** (editing, muting, or deleting a
-  lesson; deleting or merging research notes) are deliberately *not* model-callable tools — those stay
-  with the orchestrator and the human. `buildMemoryTools(store)` returns them; `MemoryStore` itself is a
-  plain class the orchestrator and `server.ts` call directly for everything the model must not control.
+  `proposal_status` (all in `MEMORY_TOOLS`, every phase), `proposal_create` and `goal_suggest`
+  (`RESEARCH_OUTPUT_TOOLS`, research only, because both write a row a *human* then acts on), and
+  `report_submit` (`DEEP_DIVE_OUTPUT_TOOLS`, deep dive only). `outcome_record` and
+  `action_history_search` were build-mode tools and are gone; the `outcomes` table stays for legacy
+  rows. Approving ideas, logging actions, and **curating memory** (editing, muting, or deleting a
+  lesson; deleting or merging research notes) are deliberately *not* model-callable tools: those
+  stay with the orchestrator and the human. `buildMemoryTools(store)` returns the tools; `MemoryStore`
+  itself is a plain class the orchestrator and `server.ts` call directly for everything the model
+  must not control.
 
-  **Every proposal has to say how it makes money.** `proposal_create` requires a `revenueModel`, a
-  `monetization` block (who pays, price point, path to first dollar, days, key assumption, validation
-  signal) and an ordered `steps` list, stored as `revenue_model` / `monetization_json` / `steps_json`.
-  Before this the only structured money field was `expected_upside` — a bare number — so the
-  mechanism, the buyer and the steps lived in prose inside `description`, whose format spec didn't
-  even list the money path among its suggested bullets. The review decision is the one irreversible
-  human act in the loop and it was being made without the thing it most needs.
+  **Every idea has to state its market and its money.** `proposal_create` (name kept, it is
+  persisted) requires a `market` block (market size and how it was derived, `demandEvidence` with
+  an http(s) `sourceUrl` per claim, named `competitors`, `keyRisks`, a 1-5 `viabilityScore` and a
+  `confidence`), a `revenueModel`, a `monetization` block (who pays, price point, path to first
+  dollar, days, key assumption, validation signal) and an ordered `steps` list (the launch outline a
+  human would follow, validation first). They're stored as `market_json` / `revenue_model` /
+  `monetization_json` / `steps_json`. A demand-evidence URL that isn't http(s) refuses the create in
+  band, so every claim the deep dive is asked to verify points somewhere checkable. The revenue
+  models include `sponsorship_donations`, `open_core` and `deferred` (audience first, charge later),
+  so free and open-source ideas state their money path honestly instead of filing as "other".
+  `requiredTools` and the agent-step/fence cross-check are gone with build mode; legacy steps still
+  carry `owner`/`tool` and still render.
 
-  The load-bearing part is **one in-band cross-check**: an `owner: "agent"` step naming a `tool` that
-  isn't in `requiredTools` refuses the create, naming the step and the tool. The act phase is fenced
-  to exactly `requiredTools`, so such a step cannot run — and which of the two is wrong isn't
-  guessable from inside the tool, so it goes back to the model rather than being silently reconciled.
-  That check is what keeps "the steps needed" and "what the fence permits" one statement instead of
-  two unrelated pieces of prose. `actPhase` then passes the approved steps through verbatim
-  (`approvedPlanBrief`), human-owned ones included and marked as not the agent's to do; until that
-  existed, execution re-derived an approach from the description and could diverge from the plan that
-  got a yes. All three columns are nullable and **not backfilled** — a pre-existing proposal renders
-  no monetization section rather than a row of dashes, same stance as `goal_id`.
+  All these columns are nullable and **not backfilled**: a pre-existing proposal renders no section
+  rather than a row of dashes, same stance as `goal_id`. `market_json IS NULL` is also how the
+  console recognizes a legacy build-mode proposal.
+
+  **`report_submit` is the deep dive's one output.** It refuses in band unless the idea is approved
+  *and* `act_status = 'running'`, the body is at least ~600 characters, and every source is an
+  http(s) URL. Reports live in their own `reports` table (verdict `pursue`/`maybe`/`drop`, score,
+  confidence, summary, Markdown body, `sources_json`); an idea can have several and the newest counts
+  (`latestReportsByProposal`). `GET /api/proposals` attaches each idea's latest report summary.
 
   Muting matters most: `searchLessons` is the single chokepoint
   every `lesson_search` goes through, so muting there removes a wrong lesson from the agent's reasoning
@@ -466,11 +458,10 @@ on). A directive is consumed — injected into one research prompt, then cleared
   these"), not as positive context — a distinction the store previously could not express.
   `listSaturatedNotes` bridges legacy rows with a `kind IS NULL AND topic LIKE '%saturat%'` clause,
   reading a label the model already wrote in its own topic; without it the saturation digest and the
-  exploration query return nothing until months of new notes accumulate. Also owns the
-  `events` table (persisted activity feed, capped at `EVENTS_KEEP`) and `action_history_search`'s
-  backing query, which joins `actions` to `proposals` to answer "what's already been done" for
-  research/plan — restricted to `phase = 'act'` on `status = 'approved'` proposals to stay low-noise,
-  unlike the Actions page below which shows every phase.
+  exploration query return nothing until months of new notes accumulate. The research and deep-dive
+  prompts now ask for `demand`, `market_size`, `competitor`, `pricing` and `risk` notes too, which is
+  what the market landscape groups by. Also owns the `events` table (persisted activity feed, capped
+  at `EVENTS_KEEP`).
 - `qdrant.ts` — REST client for Qdrant Cloud, both vector storage/search and (via Cloud Inference)
   server-side embedding generation in the same request — no separate embeddings provider needed. Fails
   soft: without all of `QDRANT_URL` / `QDRANT_API_KEY` / `QDRANT_EMBEDDING_MODEL` / `QDRANT_EMBEDDING_DIM`
@@ -513,8 +504,8 @@ on). A directive is consumed — injected into one research prompt, then cleared
   software comparison site" — two of them pending *simultaneously*), and same idea under a
   different `domain` string, which is why the check is **not** scoped per-domain. Two layers now
   stop it: `openProposalDigest()` in `orchestrator.ts` puts the open queue in the research
-  prompt (research+plan previously had no way to see it at all — `action_history_search` only
-  covers work that already *ran*, and `proposal_status` needs an id the model can't know), and
+  prompt (research previously had no way to see it at all: `proposal_status` needs an id the model
+  can't know), and
   this module refuses the create outright when the new text is too close to an open one.
   Lexical, not semantic, on purpose: it's a pure function over two strings, so it needs no
   API key or Qdrant call on the create path, is unit-tested against the real history, and can
@@ -529,233 +520,97 @@ on). A directive is consumed — injected into one research prompt, then cleared
   ones: a rejection usually asks for a fix, and the improved retry necessarily resembles what
   it improves on.
 
-  **The same carve-out covers an approved proposal whose act phase didn't finish**
-  (`store.listDuplicateCandidates`, filtering on `act_status`). A proposal to complete unbuilt
-  work is by construction near-identical to the work — there is no wording that describes
-  finishing #27 without resembling #27. The refinement pass on #27 hit this for real:
-  `proposal_create` was refused twice (43%, then 32% overlap) and landed only on the third
-  attempt, once the model had reworded it under the threshold. It got through by sounding
-  different rather than being different, which is the opposite of what this check should
-  select for. `interrupted` and `incomplete` are excluded; `running` is **not**, because
-  research runs concurrently with act and a proposal being built right now is exactly one a
-  new proposal must not duplicate.
-- `deliverables.ts` — derives "what has this agent actually built" from act-phase actions on approved
-  proposals: one record per proposal, carrying its repo / live deployment / PR as typed artifacts.
-  Purely derived on read (`GET /api/deliverables`), so it can't disagree with the action log and adds
-  no state to maintain. Deterministic on purpose: every artifact comes from a write tool's own
-  result (or, for commits, its `owner`/`repo` input), never from scanning outcome notes or model prose
-  for things that look like links. `DELIVERABLE_TOOLS` is both the SQL filter in
-  `store.listDeliverableActions()` and the switch in `buildDeliverables`, so the two can't drift.
-  Connectors don't get a switch case: an operation declaring `deliverable` in its manifest is handled
-  by one generic branch, since `result` has already shaped its response into a top-level `url`.
-  Unit-tested (`deliverables.test.ts`) — it's pure functions over rows, no API key needed.
+  **The same carve-out covers an approved idea whose deep dive didn't finish**
+  (`store.listDuplicateCandidates`, filtering on `act_status`). It dates from build mode, where a
+  proposal to complete unbuilt work was by construction near-identical to the work: #27's
+  refinement was refused twice (43%, then 32% overlap) and got through only by sounding different
+  rather than being different, the opposite of what this check should select for. A sharper
+  re-pitch of an idea whose investigation stalled is in the same position. `interrupted` and
+  `incomplete` are excluded; `running` is **not**, because research runs concurrently with deep
+  dives and an idea being investigated right now is exactly one a new idea must not duplicate.
+- `deep-dive.ts`: `verifyDeepDive` and `deepDiveNudge`. Pure functions over the phase's tool calls,
+  so no store and no API key. Complete means one `report_submit` the tool *accepted*; a refused call
+  (`isError`) doesn't count. Zero tool calls, truncation and exhausted turns are reported
+  separately, because they call for different responses. It replaced `act-verification.ts`, which
+  checked each approved step's declared tool against the calls that ran; a deep dive has no step
+  list to check.
 
-  **A card is built from whatever write tool succeeded, which is not the same as a finished
-  build** — `github_create_repo` alone makes one, which is how #27 sat here looking shipped with
-  an empty repo. Each record now carries `actStatus`, and the page badges `running` /
-  `interrupted` / `incomplete` in the error colour ahead of the outcome tag. Carried rather than
-  filtered: an abandoned build's repo is still a real thing the operator needs to open, usually
-  to clean it up, and hiding the card recreates the original problem from the other side.
+  The verdict persists to `proposals.act_status` / `act_problems` (`ActStatus`: `running` →
+  `interrupted` | `complete` | `incomplete`; the column names are inherited from build mode). **Stored
+  rather than derived from `actions`**, for two reasons: the verdict depends on the model's finish
+  reason, which no table records, and the state that matters most (a deep dive the process died
+  inside) is exactly the one with no completion row to derive from. `markActStarted` writes
+  `running` *before* the model is called, and `report_submit` reads it to accept a report only for
+  that idea. `reapInterruptedDeepDives()` turns leftover `running` rows into `interrupted` at
+  startup, which is sound because deep dives only ever run in the orchestrator process.
 
-  **A re-run supersedes, it doesn't accumulate.** Every Vercel deploy mints its own immutable
-  deployment URL, so re-running a build added a row to the card each time — #30 carried three
-  identical `automationsolver-play · production` links, only the last of which the project
-  served. `addSuperseding` keeps the newest per project **and target**: a preview does not
-  supersede production, they're two different live things. The other half is in
-  `integrations/vercel.ts`, where `deploy` waits for the new deployment to reach `READY` and then
-  deletes the older ones it replaced — waiting first is what keeps a failed build from taking the
-  live site down with it, and a cleanup failure is reported in the result rather than failing a
-  deploy that already succeeded.
+  **It no longer deschedules.** In build mode an interrupted act phase kept its `next_run_at` and
+  re-ran from the top on restart, repeating real commits and deploys, so startup descheduled it and
+  waited for the operator. A deep dive has no side effects, so a hard-killed one simply resumes on the
+  first scheduler tick. A graceful shutdown still reaches `drainQueue`'s `finally` and clears
+  `next_run_at`, leaving it under "Unfinished deep dives". The one-time migration that added
+  `market_json` also nulled `next_run_at` on every approved legacy proposal, so nothing from build
+  mode wakes up as a deep dive; `POST /api/proposals/:id/rerun` brings any of them back deliberately.
+- `landscape.ts`: `buildLandscape`, a goal's market landscape derived on read from its notes
+  (`listResearchNotesForGoal`), ideas (`listProposalsForGoal`) and latest reports. Notes are grouped by
+  `effectiveKind` (the same `%saturat%` legacy bridge `listSaturatedNotes` uses) in a fixed order:
+  open ground first, dead ends last. Competitors named across the ideas' market blocks are merged by
+  name, later mentions filling gaps rather than overwriting. Served by `GET /api/goals/:id/landscape`;
+  unit-tested in `landscape.test.ts`. Deliberately not an agent-written summary: derived, it can't
+  drift from the record it shows.
+- `integrations/github.ts` + `integrations-server.ts`: three read-only GitHub tools
+  (`github_search_repos`, `github_read_repo`, `github_read_file`), for checking software competitors
+  and their traction. Every write function, the Vercel and Netlify clients, their live tests
+  (`test:github`, `test:vercel`) and `deliverables.ts` were removed with build mode. Don't add a write
+  tool back here; see the invariant at the top of this file.
+- `connectors/`: the way to add a research data source. A connector is a JSON manifest
+  (`connectors/defs/*.json`) describing a REST API: base URL, auth, and a list of operations with
+  typed params. `manifest.ts` is the zod meta-schema, `load.ts` reads and validates the bundled dir
+  plus `AGENT_CONNECTORS_DIR` at module load, `tools.ts` turns each operation into an ordinary
+  `ToolDefinition`. Shipped: DataForSEO (real Google search volume and CPC), Hacker News (demand
+  signals), TED (EU public procurement notices). Stripe, Resend, Plausible, Cloudflare, Bing Webmaster
+  and IndexNow were removed with build mode: they either wrote or measured sites the agent had shipped.
 
-  **Dispatching a build by hand** is `POST /api/proposals/:id/rerun`, offered from two places:
-  the Deliverables card (which *is* the empty repo — finding out a build stopped and restarting
-  it shouldn't be two screens) and `ProposalDialog`, which covers a proposal that produced no
-  artifact and so has no card. Both read `web/src/actStatus.ts` so they agree on what
-  "unfinished" means. It only re-triggers already-approved work, refuses while `act_status` is
-  `running`, and emits `proposal_scheduled` so the console reflects it — a button that works
-  while the page looks unchanged reads as a button that doesn't work.
-
-  **Offer the button on `act_status !== 'running'`, never on "the badge says it failed."**
-  `act_status` is null for every act phase that ran before the column existed (#15, #16, #17, #27
-  in the live DB), and gating on the badge made re-running exactly the oldest stuck builds
-  impossible — #27, the empty machwatch repo this whole thread started from, had no button. The
-  null resolves itself the first time a proposal runs again; the button must not depend on it.
-- `act-verification.ts` — `verifyAct`: did the act phase do what the human approved? Pure functions
-  over the phase's tool calls plus the proposal's `steps_json`, in the same style as
-  `deliverables.ts`, so no store and no API key.
-
-  **It checks each agent-owned step's declared `tool`, not its `doneWhen` prose**, and that choice is
-  the module. `doneWhen` is free text a model wrote — proposal #27's happened to be machine-checkable
-  ("index.html + README.md + app.js are readable on the default branch") and the next one won't be, and
-  a verifier that parses natural language is wrong in both directions. The tool name is exact, it's
-  already what `proposal_create` cross-checks against `required_tools` at create time, and it's in
-  `actions.tool_name` verbatim — so this is the same invariant one phase later: a step said it needed
-  this tool and the fence was widened to allow it, therefore it must have run. A call that came back
-  `isError` doesn't count, or a `409 Git Repository is empty` would read as a completed commit.
-  Truncation, exhausted turns, a phase with zero tool calls, and a missing `outcome_record` are all
-  reported separately, because they call for different responses. `act-verification.test.ts` runs the
-  real #27 step list and tool calls through it.
-
-  **"This attempt didn't call it" is not "the work doesn't exist" — a re-run is where those come
-  apart.** `actPhase` snapshots `store.succeededActTools(id, planTools)` before the model runs and
-  passes it as `priorSuccessfulTools`; a step whose tool succeeded in an earlier act phase on the
-  same proposal counts as done. Without it #40 — repo created, six files committed and read back —
-  came back `incomplete` when the operator re-ran it, and the nudge ordered `github_create_repo`
-  again, which answers **422 on an existing repo forever**, so the step was unsatisfiable by
-  construction and the retry that did land was a duplicate commit. The act prompt also names those
-  tools, so not repeating a side effect is an instruction rather than something the model has to
-  re-derive by reading the repo back. Two carve-outs: `outcome_record` is **never** credited from a
-  prior run (it describes the run that wrote it, and it has no side effect to repeat), and the list
-  is empty for a **recurring** proposal, where each occurrence is meant to do the work again.
-
-  The verdict persists to `proposals.act_status` / `act_problems` (`ActStatus`:
-  `running` → `interrupted` | `complete` | `incomplete`). **Stored rather than derived from
-  `actions` the way `deliverables.ts` is**, for two reasons: the verdict depends on the model's
-  finish reason, which no table records, and the state that matters most — an act phase the
-  process died inside — is exactly the one with no completion row to derive from.
-  `markActStarted` writes `running` *before* the model is called, so anything that kills the
-  process in between leaves a marker; `reapInterruptedActPhases()` turns those into
-  `interrupted` at the next startup, which is sound because act phases only ever run in the
-  orchestrator process.
-
-  **`next_run_at` is the resume marker, and it is only cleared in `drainQueue`'s `finally`** —
-  which a killed process never reaches. So an interrupted act phase (and a *completed* one whose
-  reflect was cut short) used to still read as due, and `schedulerTick()` would re-run act from
-  the top on the next start, repeating real side effects: a second `github_commit_files` is a
-  second commit, and a connector that sends an email or creates a payment link is not idempotent
-  at all. `reapAfterUncleanShutdown` therefore also **deschedules** anything whose act phase had
-  already started, and the operator resumes it deliberately via `POST /api/proposals/:id/rerun`
-  (→ `store.requeueApprovedProposal`, picked up by the next `schedulerTick`; approved-only, so it
-  re-triggers authorized work and grants nothing).
-
-  The condition is exact rather than a heuristic: a **non-recurring** proposal gets `next_run_at`
-  from `scheduleApprovedProposal` and has it nulled by `advanceOrClearSchedule`, so
-  `act_status IS NOT NULL AND next_run_at IS NOT NULL` has no legitimate state. **Recurring
-  proposals are deliberately left alone** — for them a past-due `next_run_at` after a completed
-  act is equally the crash case and an occurrence that came due while the process was down, and
-  skipping real scheduled work is the worse error.
-- `integrations/{github,vercel,netlify}.ts` + `integrations-server.ts` — thin API wrappers and the tools
-  that expose them (`buildIntegrationsTools()`). Read-only tools (`github_read_repo`, `vercel_list_projects`, etc.) are free for the research
-  phase to call. Write tools (`github_create_repo`, `vercel_deploy`, `netlify_deploy`, etc.) only work in
-  `actPhase`, and only when named in the approved proposal's `required_tools`. Each write tool that
-  creates/deploys something returns a plain `url` field on success — `memory-server.ts`'s
-  `extractResultUrl` pulls that out generically (by field name, not per-tool switching) to back the
-  Actions page's browsable result links.
-
-  **`createRepo` hardcodes `private: true` and takes no visibility argument.** It was an
-  `isPrivate` tool parameter defaulting to `false`, which made every repo the agent created public
-  the moment it omitted the field — and a repo is public from its first commit, so noticing
-  afterwards is noticing too late. A default the model can override is not the same as a decision
-  it can't reach: making it public is an operator act performed in GitHub's own UI, after seeing
-  what was built. Don't re-add the parameter. `z.object` here is non-strict, so an approved
-  proposal or a model still passing `isPrivate` has it stripped rather than erroring.
-
-  **`vercel_deploy` takes its files from a GitHub repo, not from the model's output.** A Vercel
-  deployment is an immutable, *complete* snapshot: every deploy replaces the project, so a site
-  cannot be built up over several calls, and the whole thing therefore had to fit inside one tool
-  call's arguments. A 21-file static site is past any output-token budget, so the turn truncated
-  mid-file and the agent wrote the limit down as "for sites of this size, the human must deploy via
-  the Vercel CLI" — the loop handing real work back to the operator. The limit was ours, not
-  Vercel's: `files[]` also accepts `{file, sha, size}` referencing blobs uploaded first to
-  `POST /v2/files` (sha1 in `x-vercel-digest`, octet-stream body), which is how the Vercel CLI
-  works. `deploy` now takes a `DeploySource` — inline `files` as before, or `{repo}`, which reads
-  the tree with `GITHUB_TOKEN` and streams each blob straight to Vercel. Paired with `commitFiles`,
-  which commits on `base_tree` and so **is** additive across calls, the pipeline is: commit over as
-  many calls as it takes, then deploy once from the repo.
-
-  **It is the same tool name on purpose.** `required_tools` is the act-phase fence and `verifyAct`
-  matches steps by exact tool name, so extending `vercel_deploy` rather than adding a
-  `vercel_deploy_repo` means every already-approved proposal and every step list keeps working with
-  no scope edit. It grants nothing new either: the act phase already reaches `GITHUB_TOKEN` through
-  the auto-granted read-only `github_read_file`, and this can still only deploy to Vercel. Passing
-  both sources, or neither, is an in-band error naming what to do next — the second one says that a
-  call cut off at the output limit is itself the signal to use `fromRepo`.
-
-  Three details that are load-bearing rather than incidental. `readTree` **throws on GitHub's
-  `truncated` flag**, because a partial tree comes back as a 200 and would otherwise deploy half a
-  site and report success. `selectTreeFiles` strips the `directory` prefix, so `public/index.html`
-  serves at the root — without that the site is live, reachable and 404s at its own front door;
-  it's pure and is what `vercel.test.ts` covers. And the deployment POST carries
-  `?skipAutoDetectionConfirmation=1`: a whole repo tree is far likelier than a hand-picked file
-  list to contain a `package.json`, and Vercel answers **400 asking you to confirm** when the
-  framework it detects differs from the project's setting, with nobody there to confirm it.
-
-  `npm run test:vercel` (`src/vercel-live-test.ts`) is the other half of the same
-  unit-tests-plus-live-script pair `test:github` established, and for the same reason — this is a
-  write path across *two* APIs, and every belief in it is a belief about somebody else's service.
-  It commits a 17-file site over three calls, deploys the `public/` subtree, **fetches the live URL
-  and asserts the committed bytes come back out of it**, then re-deploys to check the supersede
-  path. That last check is the one that separates "deployed" from "shipped". `netlify_deploy` still
-  carries the original inline-only limit.
-- `connectors/` — the second way to add a tool, and the one to reach for first. A connector is a JSON
-  manifest (`connectors/defs/*.json`) describing a REST API: base URL, auth, and a list of operations
-  with typed params. `manifest.ts` is the zod meta-schema, `load.ts` reads and validates the bundled
-  dir plus `AGENT_CONNECTORS_DIR` at module load, `tools.ts` turns each operation into an ordinary
-  `ToolDefinition`. Shipped: Stripe, Resend, Plausible, Cloudflare, Bing Webmaster Tools, IndexNow,
-  Hacker News, DataForSEO.
-
-  **Four of those exist to close the outcome loop**, which was the largest hole in the record: the
-  agent shipped repos and deployments and then reported how they were doing from prose. Cloudflare
-  Web Analytics (free, script-based, so it works on Vercel) answers pageviews/top paths/referrers,
-  Bing Webmaster Tools answers impressions and whether anything is indexed at all, IndexNow pushes
-  new URLs so there is something to measure within hours instead of weeks, and DataForSEO answers
-  real Google search volume — the number every comparison-site proposal used to guess from the
-  wording of search results. Google Search Console is the one that got away: it needs a consent
-  flow or a signed service-account JWT, so Bing is the 80% that fits in a manifest.
-
-  The point is that adding a connector stopped being a nine-file change — a client module, two
-  hand-maintained risk lists, a `deliverables.ts` switch case, a frontend label map — and became one
-  file. Each operation declares its own `risk` next to itself, and `tool-catalog.ts` folds those
-  declarations into the same lists everything already reads.
+  **`risk` must be `"read"`.** The meta-schema accepts nothing else, so a write operation in an
+  operator's manifest is a load error (skipped and logged in `CONNECTOR_ERRORS`, like any malformed
+  manifest) rather than a registered tool. The method is not what makes an operation a write: TED's
+  search only takes its query as a POST body, so `POST` stays legal.
 
   **Three things it can express that aren't obvious**, each added for exactly one API and then
-  reusable. A dotted `as` (`"variables.siteTag"`) nests a JSON body, which is what lets a flat,
-  model-friendly signature drive a GraphQL request — the alternative was an object-typed param, i.e.
-  the model hand-writing `{query, variables}` on every call. `bodyStyle: "array"` sends `[{...}]`,
-  which DataForSEO's live endpoints require and reject an object for. And `resultList` projects a
-  list response down to declared fields: **not cosmetic** — results are rendered into the transcript
-  against a hard character cap, so an unprojected listing spends that cap on `_highlightResult` and
-  thumbnail metadata and truncates away the part worth asking for. It returns `count` (before the
-  cap) alongside `items`, so "that was all of them" stays distinguishable from "there was more".
-  A 200 carrying a non-empty `errors` array is now an in-band error, because that is how GraphQL
-  reports failure and it was otherwise a successful call that returned nothing.
+  reusable. A dotted `as` (`"variables.siteTag"`) nests a JSON body, which lets a flat, model-friendly
+  signature drive a GraphQL request. `bodyStyle: "array"` sends `[{...}]`, which DataForSEO's live
+  endpoints require. And `resultList` projects a list response down to declared fields: **not
+  cosmetic**, because results are rendered into the transcript against a hard character cap, so an
+  unprojected listing spends that cap on metadata and truncates away the part worth asking for. It
+  returns `count` (before the cap) alongside `items`. A 200 carrying a non-empty `errors` array is an
+  in-band error, because that is how GraphQL reports failure. The generic features no bundled
+  manifest uses are tested against `src/connectors/test-fixtures/`.
 
-  **What it deliberately can't express**: file-upload deploys (Netlify's sha1 digest manifest,
-  Vercel's file payload — those stay native TS in `integrations/`, and both kinds of tool look
-  identical to the model) and OAuth token round trips, which is why the distribution category is
-  email and webhooks only. That second one is a real limit, not a theoretical one: **Reddit's
-  keyless `.json` endpoints now answer 403 to every request**, browser user-agent and
-  `old.reddit.com` included, so a Reddit connector needs app credentials and a token exchange and
-  was dropped rather than shipped broken. Check an API actually answers before writing a manifest
-  for it. Manifests are operator-authored files at the same trust level as `.env`; the agent never
-  writes one.
+  **What it can't express**: OAuth token round trips. **Reddit's keyless `.json` endpoints answer
+  403 to every request**, so a Reddit connector needs app credentials and a token exchange and was
+  dropped rather than shipped broken. Check an API actually answers before writing a manifest for it.
+  Manifests are operator-authored files at the same trust level as `.env`; the agent never writes one.
 
-  **Credentials are read at call time, never captured at module load** — the opposite of what
-  `integrations/*.ts` do. That's what lets a key filled in while the loop runs work on the next call
-  rather than the next restart, and it's the shape to keep if more config moves out of `.env`. For
-  the same reason connector tools are **registered whether or not their key is set** (an unconfigured
-  one answers `Error: STRIPE_API_KEY is not set` in band, like the native integrations); what a
-  missing key changes is which tools the *research prompt and grant* mention, recomputed per cycle by
-  `configuredConnectorTools()`. A `deliverable` block on an operation is what puts its result on the
-  Deliverables page. `load.test.ts` / `tools.test.ts` cover manifest validation and request building;
-  a broken *bundled* manifest fails `npm run smoke-test` via `CONNECTOR_ERRORS`, while a broken one in
-  an operator's own dir is skipped and logged rather than taking the console down with it.
-- `tool-catalog.ts` — the one place that knows which tools exist and which touch the real world
-  (`toolRisk` → write/read/memory). Three consumers used to each carry their own copy of that answer:
-  `orchestrator.ts` (listing act-phase write tools in the research prompt), `server.ts` (validating
-  operator edits to `required_tools` against `ALL_GRANTABLE_TOOLS` — now to warn on an uncatalogued name,
-  not to reject it), and the console (badging risk at
-  decision time, via `GET /api/tools`). Read-only integration tools stay defined next to their
-  handlers — in `integrations-server.ts` for the hand-written clients, in a manifest for the
-  declarative connectors — and this module merges both. The lists carry **every** connector
-  operation, configured or not: what a missing credential changes is what research is told about,
-  never whether a name is a legitimate thing for a proposal to have asked for. `GET /api/tools`
-  reports `configured` per tool so the console can say so at decision time.
+  **Credentials are read at call time, never captured at module load.** That's what lets a key filled
+  in while the loop runs work on the next call rather than the next restart. Connector tools are
+  **registered whether or not their key is set** (an unconfigured one answers `Error: DATAFORSEO_AUTH
+  is not set` in band); what a missing key changes is which tools each phase's *grant* includes,
+  recomputed per cycle by `configuredConnectorTools()`. `load.test.ts` / `tools.test.ts` cover
+  manifest validation and request building; a broken *bundled* manifest fails `npm run smoke-test` via
+  `CONNECTOR_ERRORS`.
+- `tool-catalog.ts`: the one place that knows which tools exist and what each can touch
+  (`toolRisk` → `read` / `memory` / `unknown`). `READONLY_INTEGRATION_TOOLS` merges the GitHub reads
+  with every connector read, configured or not; `MEMORY_TOOLS`, `RESEARCH_OUTPUT_TOOLS` and
+  `DEEP_DIVE_OUTPUT_TOOLS` are the agent's own-database writes. `ALL_CATALOG_TOOLS` is what the smoke
+  test checks the registry against. There is no write list any more: `unknown` is what the names of
+  retired build-mode tools classify as when they turn up in old `actions` rows.
 - `agent-control.ts` — runtime knobs (pause, run-now, abort, domains, interval, directive) plus the
-  execution snapshot the console reads. Same in-process bus shape as `review-gateway.ts` and
-  `reactive-triggers.ts`.
-- `settings.ts` — operator settings that used to need a `.env` edit and a restart: the pending-proposal
-  cap, the search mode, and the provider/model for each phase. Same shape as `agent-control.ts` on
+  execution snapshot the console reads. Same in-process bus shape as `review-gateway.ts`. (The
+  build-mode `reactive-triggers.ts`, a research pass fired by marking a deliverable "needs
+  refinement", went with the deliverables; re-running a deep dive covers the research-mode case.)
+- `settings.ts` — operator settings that used to need a `.env` edit and a restart: the pending-idea
+  cap, the search mode, and the provider/model for each phase (the deep dive's is `actModel`, labeled
+  "Deep-dive model"). Same shape as `agent-control.ts` on
   purpose — in-memory state plus an injected `persist`, importing nothing from `MemoryStore` — and
   stored in `control_settings` under a `setting:` prefix, so console-only mode can write them through
   the same narrow `ControlSettingsWriter` rather than being handed the store.
@@ -790,11 +645,11 @@ on). A directive is consumed — injected into one research prompt, then cleared
 
   **Secrets and bootstrap values deliberately did not move.** Provider keys, `GITHUB_TOKEN` and the
   connector keys stay in `.env`: a leaked `agent.db` (or one of the `.bak-*` files beside it) costs you
-  the agent's memory today and would cost you a live credential otherwise. `AGENT_DB_PATH`, the port,
+  the agent's memory and would cost you a live credential otherwise. `AGENT_DB_PATH`, the port,
   the bind host and `AGENT_API_TOKEN` can't move at all — you need the database before you can read
   settings out of it, and the token gates the console that would edit it. Adding a setting is one entry
   in `SETTINGS`; the API, the source reporting and the page are all driven off it.
-- `notify.ts` — pushes a message to the operator when a proposal starts waiting for review, and
+- `notify.ts` — pushes a message to the operator when an idea starts waiting for review, and
   nothing else. `humanReviewPhase` blocks on a promise until somebody clicks Approve or Reject, so
   this is the only place the loop stops indefinitely: a cycle finishing at 03:00 sat there until the
   next time a browser was opened. Subscribed on the event bus in `orchestrator.ts`, one level above
@@ -817,12 +672,11 @@ on). A directive is consumed — injected into one research prompt, then cleared
 - `shutdown.ts` — `createShutdown`, the Ctrl-C path. Without it Ctrl-C was indistinguishable from
   `kill -9`, and **every `finally` in this process is load-bearing**: `runPhase` writes the run's
   cost to the ledger in one (so a killed research cycle's spend simply vanished), `drainQueue`
-  clears `next_run_at` in one, and `actPhase` records its verdict only after the run returns.
-  The goal is not to let the work finish — an act phase can run half an hour — but to interrupt
-  it so the unwinding code executes. Research and reflect now run under a shared
-  `AbortController` for that reason; they had no signal at all before. Order matters and is
-  asserted in the tests: stop the scheduler and the server *before* aborting, or the scheduler
-  can start an act phase into the gap. A second signal exits 130 immediately.
+  clears `next_run_at` in one, and `deepDivePhase` records its verdict only after the run
+  returns. The goal is not to let the work finish (a deep dive can run half an hour) but to
+  interrupt it so the unwinding code executes. Research and reflect run under a shared
+  `AbortController` for that reason. Order matters and is asserted in the tests: stop the
+  scheduler and the server *before* aborting, or the scheduler can start a deep dive into the gap. A second signal exits 130 immediately.
 
   **Built against injected dependencies** rather than reaching into the orchestrator's module
   state, because the signal itself is untestable here: Node on Windows emulates `SIGINT` as
@@ -838,23 +692,27 @@ on). A directive is consumed — injected into one research prompt, then cleared
   **`mainLoop().catch` at the bottom of `orchestrator.ts` is the one that mattered**: an abort
   during research rejected all the way out to it, and it called `process.exit(1)` — racing the
   shutdown sequence to the exit and winning, so the "clean" path exited 1 with the database closed
-  by process teardown. For the same reason the reactive trigger is `.catch`ed rather than `void`ed:
-  a floating rejection there took the process down mid-shutdown.
+  by process teardown. A floating rejection anywhere else takes the process down mid-shutdown the
+  same way, so anything that runs a phase off the main path has to be `.catch`ed, not `void`ed.
 - `events.ts` / `review-gateway.ts` / `server.ts` — the live layer under the web UI. `events.ts` is an
   in-process bus the orchestrator emits to; `server.ts` persists each event via `store.logEvent()` *then*
   rebroadcasts it over WebSocket with the same `{id, occurredAt}` the DB assigned, and serves the REST API
-  (proposal/action/event history), and in production also serves the built `web/dist` static files;
-  `review-gateway.ts` resolves a proposal's pending approval promise when a decision comes in via the API.
-- `mcp-server.ts` + `mcp/` — an MCP server (stdio) giving Claude Desktop eight read-only tools
+  (ideas, reports, actions, event history, and `GET /api/goals/:id/landscape`), and in production also
+  serves the built `web/dist` static files; `review-gateway.ts` resolves an idea's pending approval
+  promise when a decision comes in via the API. The build-mode routes (`/api/tools`,
+  `/api/proposals/:id/scope`, `/api/proposals/:id/review`, `/api/deliverables`) are gone; every new
+  report route is a GET, so console-only mode needed no allowlist change.
+- `mcp-server.ts` + `mcp/` — an MCP server (stdio) giving Claude Desktop nine read-only tools
   over the agent's record. `mcp-server.ts` is wiring only; the tools live one subject per module
   in `mcp/`: `goals_list` (goals.ts, goal + health merged as `GET /api/goals` does),
   `research_notes_search`/`_list` (notes.ts), `lessons_search`/`_list` (lessons.ts),
-  `proposals_list`/`proposal_get` (proposals.ts), `deliverables_list` (deliverables.ts). It opens
+  `proposals_list`/`proposal_get` (proposals.ts, names kept for clients already configured),
+  `reports_list`/`report_get` (reports.ts; `deliverables_list` was removed with build mode). It opens
   `data/agent.db` with `new MemoryStore(path, { readOnly: true })` rather than going through
   `server.ts`'s REST API, so it needs no port, no `AGENT_API_TOKEN` and no running loop.
 
-  **There is deliberately no write tool** — not adding, not editing, not muting, not approving a
-  proposal, not accepting a suggested goal: curating this record is a human act performed in the
+  **There is deliberately no write tool** — not adding, not editing, not muting, not approving an
+  idea, not accepting a suggested goal: curating this record is a human act performed in the
   console, and a second, unaudited path into what the loop reasons from is exactly what muting
   exists to prevent. For the same reason `lessons_list` filters muted rows itself, since the
   `listAllLessons` it calls is the console's *curation* listing and deliberately includes them.
@@ -862,19 +720,19 @@ on). A directive is consumed — injected into one research prompt, then cleared
   **There is also no live status or queue tool**, and that's the same call as excluding run-now
   from console-only mode: `/api/queue`'s `running`/`queued` come from `getControlState()`, which
   is process-local memory in `agent-control.ts` and would read as uninitialised defaults here. A
-  tool answering "nothing running" mid-deploy is worse than no tool. The DB-derivable half is
+  tool answering "nothing running" mid-deep-dive is worse than no tool. The DB-derivable half is
   `proposals_list` with `status: "stalled"`, which calls `store.listStalledBuilds()` rather than
-  re-deriving it — its `act_status IS NULL` rule is load-bearing (see the Build queue note).
+  re-deriving it: its `act_status IS NULL` rule is load-bearing (see the Deep-dive queue note).
 
-  Reuse over reimplementation is the rule throughout: `deliverables_list` runs the same four-call
-  `buildDeliverables(...)` composition as `GET /api/deliverables`, and `proposal_get` renders
-  `parseMonetization`/`parseSteps`/`toolRisk` rather than parsing those columns itself.
+  Reuse over reimplementation is the rule throughout: `reports_list` is `store.listReports`, and
+  `proposal_get` renders `parseMarket`/`parseMonetization`/`parseSteps` and the latest report
+  rather than parsing those columns itself.
   `mcp/render.ts` is the pure half — rows in, Markdown out, **no store import**, which is what
   lets `mcp/render.test.ts` cover it with no DB file and no API key. Two rules run through the
   renderers: a column that is null on legacy rows renders *nothing* rather than a dash (most of
-  them were added to a live DB and never backfilled, so absent is the common case), and whether
-  work *finished* is printed before what it produced (an unfinished build with a real repo URL
-  must not read as shipped).
+  them were added to a live DB and never backfilled, so absent is the common case), and the
+  verdict is printed before the reasoning behind it (a report opens with pursue/maybe/drop, an
+  idea's detail with its latest report and whether its deep dive finished).
 
   **Three things here are ordering or environment traps, not style.** (1) `mcp-env.ts` is a
   separate module *because* `qdrant.ts` reads `QDRANT_*` into module-level consts at load time
@@ -896,14 +754,18 @@ on). A directive is consumed — injected into one research prompt, then cleared
 
 React + TypeScript + Ant Design, linted with oxlint, talking to `src/server.ts` over REST
 (`web/src/api.ts`) and WebSocket (`web/src/useAgentSocket.ts`). Pages live in `web/src/pages/`: Dashboard
-(pending proposals + stat tiles + recent activity), Live feed (full filterable activity stream),
-Proposals (full history, bulk approve/reject, click a row for `ProposalDialog`), **Deliverables**,
-**Build queue** (`/builds`, `GET /api/queue`), Actions (every tool call
-on an *approved* proposal — action type, an input-derived description, and a browsable result URL when
-the tool returned one; phase-filterable, click a row for full input/output JSON via `ActionDialog`),
-Economics (spend over time, spend by phase, spend by provider/model, per-domain scoreboard with
-forecast accuracy), Lessons, Research notes, **Goals**, Agent control (which also lists the
-connectors and which of them are still missing a key), **Settings**.
+(pending ideas, verdict and spend tiles, recent activity), Live feed (full filterable activity
+stream), **Deep-dive queue** (`/queue`, `GET /api/queue`), **Ideas** (path `/proposals`: full
+history with research score and report verdict, bulk approve/reject, click a row for
+`ProposalDialog`), **Reports** (`/reports`), Actions (every tool call on an *approved* idea, with what
+it came to; click a row for full input/output JSON via `ActionDialog`), Economics (spend over time,
+by phase, by provider/model, per-domain scoreboard; the revenue figures there are legacy build-mode
+outcomes), Lessons, Research notes, **Goals** (with each goal's market landscape), Agent control
+(which also lists the connectors and which are still missing a key), **Settings**. `/builds` and
+`/deliverables` redirect to `/queue` and `/reports` so old bookmarks land.
+
+User-facing text says **"idea"**; code, routes, API paths and table names keep "proposal". Renaming
+those would break bookmarks, MCP clients and persisted names for no behavioural gain.
 
 **Settings is driven entirely off the registry** in `src/settings.ts` — label, help, type, range,
 options and the source of each value all come from the server, so adding a setting there needs no
@@ -916,53 +778,56 @@ unrelated invalid value block an unrelated valid edit.
 live on Agent control (that card is now a link). Title and brief are separate fields, since the old one
 was both a lane's name and its research brief. The page carries three things the textarea couldn't: a
 **Suggested** section for `goal_suggest` rows with Accept / Edit-and-accept / Dismiss; **goal health**
-per lane (proposals, approved, shipped, spend, and empty cycles), which was previously invisible — a
+per lane (ideas, approved, deep dives, spend, and empty cycles), which was previously invisible — a
 goal that had gone quiet looked exactly like one nobody had gotten to yet; and a **Retired** section,
 kept rather than deleted so the work stays attributed and the agent is refused if it re-suggests the
-lane. Deep-linked at `/goals/:id` like every other detail view, and lazy-loaded like every route
-except the Dashboard.
+lane. `/goals/:id` opens a dialog with two tabs: **Market landscape** (`GoalLandscape.tsx`, the
+default for active and paused goals: ideas with research score and verdict, competitors merged
+across ideas, notes grouped by kind) and **Edit** (`?tab=edit`, the default for suggested and retired
+goals, which have nothing researched to show). A new goal is editor-only.
 
-**Build queue** answers the one question the console couldn't: what is the agent building, in
-what order, and how long will it take. The Dashboard said a phase was running, the Live feed said
-what it was doing, and Proposals said what was approved — but the queue itself was an in-memory
-array nothing exposed. Four sections: the **running** build (elapsed clock, model, abort, and a
-build log that is the existing activity feed narrowed to that `proposalId` — not a second
-stream), **up next**, **scheduled later**, and **stalled**.
+**Deep-dive queue** (`DeepDiveQueuePage.tsx`; it was the Build queue, and its types are still named
+`BuildQueue` / `QueuedBuild`) answers what the agent is investigating, in what order, and how long it
+takes. Four sections: the **running** deep dive (elapsed clock, model, abort, and a log that is the
+existing activity feed narrowed to that `proposalId`, not a second stream), **up next**, **scheduled
+later**, and **unfinished deep dives** with a Retry button.
 
 Three things it must keep getting right. Ordering comes from `compareByPriorityThenDue`, the
 same function `pickNext` pops with — a queue that lists a different order than the worker takes
 invites planning around a sequence that won't happen. The duration figure is always **median +
-range + sample size**, never a bare number: real act phases in the ledger span 8 to 32 minutes,
-so one confident estimate would be wrong nearly always and believed anyway; it's scoped to the
-pinned act model, falling back to all models when that one has no history (exactly the situation
-right after a model switch). And it **polls on a 5s timer as well as on `historyVersion`**,
-because the worker picking work up emits no event and a stale queue view is the one thing this
-page must not be.
+range + sample size**, never a bare number: real `act`-phase runs in the ledger span 8 to 32
+minutes, so one confident estimate would be wrong nearly always and believed anyway; it's scoped to
+the pinned deep-dive model, falling back to all models when that one has no history (exactly the
+situation right after a model switch). And it **polls on a 5s timer as well as on
+`historyVersion`**, because the worker picking work up emits no event and a stale queue view is the
+one thing this page must not be.
 
 **`listStalledBuilds` is where the subtlety lives.** `act_status IS NULL` does *not* mean
 unfinished — it means no verdict on record, which is true of every act phase that ran before the
 column existed (eight rows in the live DB, several of which shipped a repo and a live site).
-Offering those a retry would mean a duplicate commit or a second deploy, so the null case counts
-as stalled only when the proposal has no act-phase actions at all.
+Those are history, not unfinished deep dives, so the null case counts as stalled only when the
+proposal has no act-phase actions at all.
 
-**Deliverables vs Actions — two different questions.** Actions answers "what did it do, call by call",
-and that's what it should keep doing. Deliverables answers "what exists now, and where do I click to
-see it": one card per approved proposal that produced something reachable, with every artifact as a
-real anchor on the card face. The links used to be four interactions deep (scroll the wide table →
-expand the row → scroll right to a column that's off-screen at the arriving scroll position → open a
-dialog), which is indistinguishable from their not being there. If you add a write tool that creates
-something browsable, teach `deliverables.ts` about it — otherwise the thing it builds is reachable
-only from raw JSON. For a connector that means one `deliverable` block in its manifest, not a code
-change.
+**Reports are where the work ends.** `ReportsPage` lists them (verdict filter, list rows without
+bodies) and `ReportDialog` fetches the full report by id at `/reports/:id`; `ReportView` renders one
+report the same way there and inside `ProposalDialog`, which shows the newest report first and links
+the earlier ones. `report_submitted` is in `HISTORY_CHANGING_EVENTS` and fires a browser notification.
 
-**Where the money question gets answered.** `MonetizationBlock.tsx` renders a proposal's revenue
-model, monetization block and step list; `web/src/monetization.ts` holds the parsers and labels
-(split out so the component file exports only components — oxlint's fast-refresh rule). The dialog
-gets the full block, and `ProposalReviewCard` gets a deliberately compact two-line summary, because
-the Dashboard card is where the decision actually happens and the money path is the part that used to
-be missing there entirely. Everything renders from structured fields rather than Markdown, so
-`MarkdownLite`'s bold-and-bullets-only limit doesn't apply — and a legacy proposal with null columns
-renders nothing at all rather than a row of dashes.
+**Where the market and money questions get answered.** `MarketBlock.tsx` renders an idea's market
+assessment (demand evidence as links, competitors, size, risks, score) and `MonetizationBlock.tsx` its
+revenue model, monetization block and launch outline; `web/src/monetization.ts` holds the parsers
+and labels, `web/src/report.ts` the verdict and score tags (split out so the component files export
+only components, oxlint's fast-refresh rule). The dialog gets the full blocks, and
+`ProposalReviewCard` gets compact one-line summaries of each, because the Dashboard card is where the
+decision actually happens. A legacy proposal with null columns renders nothing for those blocks;
+its old tool fence and recorded outcome show as plain history text.
+
+**`MarkdownLite` is a deliberate subset**: `**bold**`, `` `code` ``, http(s) links (`[text](url)` and
+bare URLs, via `Typography.Link`), `#`/`##`/`###` headings, and bullet or numbered lists. That is what
+the agent's prompts ask for; reports were the reason headings and links were added. The parser lives
+in `web/src/markdown.ts`, and everything renders as React elements, never HTML, so model-written text
+can't inject markup and a `javascript:` link stays literal text. Tables stay literal too, which is
+why `report_submit` asks for none.
 
 **No vendor names in the UI.** The loop is provider-neutral and the provider is a config switch, so a
 label like "Claude API spend" is wrong the moment someone points `AGENT_PROVIDER` elsewhere — and the
@@ -971,8 +836,8 @@ written before `provider`/`model` were recorded at all (those are nullable, and 
 own "unrecorded" bucket rather than credited to whatever is configured now). Spend is "model API
 spend", and `GET /api/economics` returns `spendByModel` so the total decomposes into who was actually
 paid. `unattributedSpend` is there for the same reason: the domain scoreboard can only see spend
-charged to a proposal, and research/plan runs never are, so the page states the remainder instead of
-leaving a gap between the column and the headline. Any figure the console derives (Net) prints its
+charged to a proposal, and research runs never are, so the page states the remainder instead of
+leaving a gap between the column and the headline. Any figure the console derives prints its
 inputs next to it — a number the operator can't reconstruct is one they can't trust.
 
 **Theming.** Components import `palette` from `web/src/theme.ts` and get **CSS variables**
@@ -991,9 +856,10 @@ white page (the activity console). Anything AntD styles for you needs the mode p
 (the pulse-ring keyframe, the column-resize handle) `index.css` carries `--rl-*-rgb` channel triples
 alongside the hex, since `rgba()` can't take a `var()` holding `#rrggbb`.
 
-**Deep links.** Every detail dialog is driven by the URL — `/proposals/:id`, `/actions/:id`,
-`/lessons/:id`, `/research/:id` — so rows are bookmarkable and Back closes the dialog. The nav highlight
-keys off the first path segment, so `/proposals/12` still selects Proposals. New detail views should
+**Deep links.** Every detail dialog is driven by the URL — `/proposals/:id`, `/reports/:id`,
+`/actions/:id`, `/lessons/:id`, `/research/:id`, `/goals/:id` — so rows are bookmarkable and Back
+closes the dialog. The nav highlight keys off the first path segment, so `/proposals/12` still selects
+Ideas. New detail views should
 follow this rather than holding the selected row in local state.
 
 **Bundle splitting.** `App.tsx` loads every route except the landing Dashboard through `React.lazy`

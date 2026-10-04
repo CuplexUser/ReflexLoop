@@ -9,10 +9,10 @@ import { palette } from '../theme'
 
 const TYPE_META: Record<SearchHit['type'], { label: string; icon: React.ReactNode; path: (hit: SearchHit) => string }> =
   {
-    proposal: { label: 'Proposal', icon: <FileTextOutlined />, path: (h) => `/proposals/${h.id}` },
+    proposal: { label: 'Idea', icon: <FileTextOutlined />, path: (h) => `/proposals/${h.id}` },
     lesson: { label: 'Lesson', icon: <BulbOutlined />, path: (h) => `/lessons/${h.id}` },
     research_note: { label: 'Research', icon: <ExperimentOutlined />, path: (h) => `/research/${h.id}` },
-    // Actions are grouped under their proposal on the Actions page, so that's what we open.
+    // Actions are grouped under their idea on the Actions page, so that's what we open.
     action: { label: 'Action', icon: <ThunderboltOutlined />, path: (h) => `/actions/${h.proposalId ?? h.id}` },
   }
 
@@ -95,7 +95,7 @@ export function CommandPalette({ open, onClose }: { open: boolean; onClose: () =
         ref={inputRef}
         size="large"
         variant="borderless"
-        placeholder="Search proposals, actions, lessons, research…"
+        placeholder="Search ideas, actions, lessons, research…"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={onKeyDown}

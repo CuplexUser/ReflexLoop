@@ -13,7 +13,7 @@ interface SocketState {
   feed: FeedEntry[]
   /** Server-assigned event ids already folded into `feed` -- de-dupes the REST history fetch against whatever already arrived live over the socket. */
   seenIds: Set<number>
-  /** Proposals currently awaiting a decision -- several can be pending review at once. */
+  /** Ideas currently awaiting a decision -- several can be pending review at once. */
   pendingProposals: ProposalRow[]
   runningPhase: { phase: string; proposalId: number | null } | null
   /** Bumped only on events that mean "REST history/status is now stale" -- pages use this as a refetch trigger. */
@@ -28,6 +28,7 @@ const HISTORY_CHANGING_EVENTS = new Set<AgentEvent['type']>([
   'proposal_scheduled',
   'scheduled_run_starting',
   'outcome_recorded',
+  'report_submitted',
   'lesson_saved',
   'phase_done',
   'domains_changed',
@@ -118,15 +119,21 @@ export function useAgentSocket() {
     const { event } = state.liveEventPulse
     if (event.type === 'proposal_pending') {
       notify(
-        `Proposal #${event.proposal.id} awaiting review`,
+        `Idea #${event.proposal.id} awaiting review`,
         preview(event.proposal.description, 160),
         `proposal-pending-${event.proposal.id}`,
       )
     } else if (event.type === 'scheduled_run_starting') {
       notify(
-        `Scheduled action starting: #${event.proposal.id}`,
+        `Scheduled deep dive starting: #${event.proposal.id}`,
         preview(event.proposal.description, 160),
         `scheduled-run-${event.proposal.id}`,
+      )
+    } else if (event.type === 'report_submitted') {
+      notify(
+        `Report ready: idea #${event.proposalId}`,
+        `${event.verdict}, viability ${event.viabilityScore}/5`,
+        `report-${event.reportId}`,
       )
     }
   }, [state.liveEventPulse])

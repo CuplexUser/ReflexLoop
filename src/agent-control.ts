@@ -2,16 +2,15 @@
 //
 // Runtime knobs the operator can turn without an env change and a restart:
 // pause/resume the research loop, run a cycle right now, abort an in-flight
-// act phase, retarget the domains, and leave a one-shot directive for the next
+// deep dive, retarget the domains, and leave a one-shot directive for the next
 // research prompt.
 //
-// Deliberately does NOT let the operator widen what the agent may do. Pausing,
+// Deliberately does NOT let the operator approve anything from here. Pausing,
 // aborting, and steering research all either reduce activity or change what the
-// agent looks into -- none of them touch the approval fence, and a directive
-// only ever lands in the research+plan prompt, whose output is still a proposal
-// that a human has to approve. Nothing here can cause a side effect on its own.
+// agent looks into, and a directive only ever lands in the research prompt, whose
+// output is still an idea that a human has to approve before any deep dive runs.
 //
-// Same shape as review-gateway.ts and reactive-triggers.ts: in-process state
+// Same shape as review-gateway.ts: in-process state
 // plus an event emitter, since the API server and the orchestrator run in one
 // process sharing one SQLite connection.
 
@@ -52,7 +51,7 @@ export interface ControlState {
   runningProposalId: number | null;
   queuedProposalIds: number[];
   /**
-   * When the current act phase started, ISO. Derived here rather than passed in, from the
+   * When the current deep dive started, ISO. Derived here rather than passed in, from the
    * transition into a new `runningProposalId` -- the queue view needs an elapsed time and the
    * `runs` row that would carry it isn't written until the phase is over, which is exactly the
    * window where someone is watching and wants to know how long it has been going.
@@ -196,7 +195,7 @@ export function onRunNow(listener: () => void): void {
   bus.on("run-now", listener);
 }
 
-/** Asks the orchestrator to abort the act phase currently executing, if any. */
+/** Asks the orchestrator to abort the deep dive currently executing, if any. */
 export function requestAbort(proposalId: number): void {
   bus.emit("abort", proposalId);
 }

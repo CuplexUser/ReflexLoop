@@ -18,7 +18,7 @@
 // connector keys -- stay in .env. Putting them in data/agent.db would mean plaintext
 // secrets in a file that console-only mode also opens, that gets copied into
 // agent.db.bak-* next to it, and that gets handed around as "the database": today a
-// leaked DB costs you the agent's memory, afterwards it would cost you a Stripe key.
+// leaked DB costs you the agent's memory, afterwards it would cost you a live credential.
 // Bootstrap settings (AGENT_DB_PATH, the port, the bind host, AGENT_API_TOKEN) can't
 // move either -- you need the database before you can read settings out of it, and
 // the API token gates the very console that would edit it.
@@ -135,7 +135,7 @@ export const SETTINGS: readonly SettingSpec[] = [
   },
   {
     key: "actProvider",
-    label: "Act provider",
+    label: "Deep-dive provider",
     help: "Leave empty to use the base provider.",
     group: "model",
     type: "enum",
@@ -145,10 +145,10 @@ export const SETTINGS: readonly SettingSpec[] = [
   },
   {
     key: "actModel",
-    label: "Act model",
+    label: "Deep-dive model",
     help:
-      "Act writes real code into real repos with no build step to catch a mistake -- this is where " +
-      "your best model earns its cost. Empty inherits the base model.",
+      "The deep dive is the longest, most source-heavy phase, and its report is what you act on -- " +
+      "this is where your best model earns its cost. Empty inherits the base model.",
     group: "model",
     type: "string",
     envVar: "AGENT_ACT_MODEL",

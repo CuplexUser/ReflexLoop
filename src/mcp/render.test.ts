@@ -1,23 +1,23 @@
 // src/mcp/render.test.ts
 //
-// The MCP server's rendering layer is pure functions over rows, like deliverables.ts and
-// act-verification.ts, so it tests without a database file or an API key. What's covered is
-// the handful of things that are easy to get wrong and invisible until a client shows the
-// wrong thing to a human: a legacy row rendering as a row of dashes instead of as silence,
-// an unfinished build reading as shipped, a suggested goal reading as an accepted one, and
-// a goal title that matches two lanes resolving to one of them.
+// The MCP server's rendering layer is pure functions over rows, like deep-dive.ts and
+// landscape.ts, so it tests without a database file or an API key. What's covered is the
+// handful of things that are easy to get wrong and invisible until a client shows the wrong
+// thing to a human: a legacy row rendering as a row of dashes instead of as silence, a
+// report's verdict buried under its reasoning, a suggested goal reading as an accepted one,
+// and a goal title that matches two lanes resolving to one of them.
 
 import { describe, expect, it } from "vitest";
 import {
-  renderDeliverable,
   renderGoal,
   renderProposalDetail,
   renderProposalSummary,
+  renderReport,
+  renderReportSummary,
   resolveGoal,
   shortTool,
 } from "./render.js";
-import type { GoalRow, ProposalRow } from "../memory-server.js";
-import type { Deliverable } from "../deliverables.js";
+import type { GoalRow, ProposalRow, ReportRow } from "../memory-server.js";
 
 const goal = (over: Partial<GoalRow> & Pick<GoalRow, "id" | "title">): GoalRow => ({
   brief: "",
@@ -58,6 +58,34 @@ const legacyProposal: ProposalRow = {
   steps_json: null,
   act_status: null,
   act_problems: null,
+  market_json: null,
+};
+
+const researchIdea: ProposalRow = {
+  ...legacyProposal,
+  id: 31,
+  required_tools: "",
+  revenue_model: "deferred",
+  monetization_json: JSON.stringify({
+    whoPays: "teams that adopt the free tool",
+    pricePoint: "$20/seat/mo for the hosted version",
+    pathToFirstDollar: "hosted tier once 500 self-hosted installs exist",
+    daysToFirstDollar: 180,
+    keyAssumption: "self-hosters become hosted buyers",
+    validationSignal: "500 installs",
+  }),
+  market_json: JSON.stringify({
+    marketSize: "~12k teams (estimate from GitHub topic counts)",
+    demandEvidence: [{ claim: "recurring requests on the forum", sourceUrl: "https://example.com/thread" }],
+    competitors: [{ name: "Acme", pricing: "$30/seat" }],
+    keyRisks: ["incumbents bundle it for free"],
+    viabilityScore: 4,
+    confidence: "medium",
+  }),
+  steps_json: JSON.stringify([
+    { title: "Publish the free tool", doneWhen: "listed on two directories" },
+    { title: "Open the hosted waitlist", doneWhen: "100 signups" },
+  ]),
 };
 
 const fullProposal: ProposalRow = {
@@ -132,6 +160,7 @@ describe("renderGoal", () => {
       proposals: 4,
       approved: 2,
       shipped: 1,
+      deep_dives: 2,
       outcomes: 1,
       successes: 0,
       api_spend: 1.25,
@@ -141,6 +170,8 @@ describe("renderGoal", () => {
     expect(text).toContain("Research in Swedish. Check Fortnox and Bokio first.");
     expect(text).toContain("$1.25 model API spend");
     expect(text).toContain("3 empty cycles since");
+    expect(text).toContain("2 deep-dived");
+    expect(text).toContain("1 built (legacy)");
   });
 });
 
@@ -156,7 +187,22 @@ describe("renderProposalSummary", () => {
     const text = renderProposalSummary(fullProposal, new Map([[3, "Affiliate comparison sites"]]), 3);
     expect(text).toContain("Money: subscription · $9/mo · first dollar in 14 days");
     expect(text).toContain("goal: Affiliate comparison sites");
-    expect(text).toContain("act: incomplete");
+    expect(text).toContain("deep dive: incomplete");
+  });
+
+  it("shows the research score and the report verdict for a research-mode idea", () => {
+    const text = renderProposalSummary(researchIdea, new Map(), null, {
+      id: 4,
+      proposal_id: 31,
+      verdict: "maybe",
+      viability_score: 3,
+      confidence: "medium",
+      summary: "Promising if the buyers are reachable.",
+      created_at: "2026-10-01T00:00:00.000Z",
+    });
+    expect(text).toContain("research score 4/5");
+    expect(text).toContain("report: maybe 3/5");
+    expect(text).not.toContain("deep dive:");
   });
 });
 
@@ -168,12 +214,22 @@ describe("renderProposalDetail", () => {
     expect(text).not.toContain("## Act phase");
     expect(text).not.toContain("## Outcome");
     expect(text).not.toContain("## Schedule");
-    // The fence is on every proposal, legacy or not -- it's what approval granted.
-    expect(text).toContain("- github_create_repo — write");
-    expect(text).toContain("- WebSearch — read");
+    expect(text).not.toContain("## Market");
+    // A legacy build-mode fence is still shown, plainly -- those tools no longer exist.
+    expect(text).toContain("## Legacy build-mode tool fence\ngithub_create_repo, WebSearch");
   });
 
-  it("leads with the act verdict, then the plan, then what it cost", () => {
+  it("renders a research-mode idea's market read and launch outline, with no fence", () => {
+    const text = renderProposalDetail(researchIdea);
+    expect(text).toContain("viability 4/5 · medium confidence");
+    expect(text).toContain("- recurring requests on the forum (https://example.com/thread)");
+    expect(text).toContain("- Acme · $30/seat");
+    expect(text).toContain("## Launch outline");
+    expect(text).not.toContain("owner:");
+    expect(text).not.toContain("fence");
+  });
+
+  it("leads with the verdict, then the plan, then what it cost", () => {
     const text = renderProposalDetail(fullProposal, {
       goalTitle: "Affiliate comparison sites",
       outcome: {
@@ -188,57 +244,46 @@ describe("renderProposalDetail", () => {
       spend: { costUsd: 0.42, phases: 3 },
       actCalls: 2,
     });
-    expect(text.indexOf("## Act phase")).toBeLessThan(text.indexOf("## Description"));
+    expect(text.indexOf("## Act phase (legacy build mode)")).toBeLessThan(text.indexOf("## Description"));
     expect(text).toContain("Status: incomplete");
     expect(text).toContain("- Step 1 named github_commit_files, which never ran.");
     expect(text).toContain("Price point: $9/mo");
     expect(text).toContain("   owner: human");
     expect(text).toContain("   owner: agent · tool: github_create_repo");
     expect(text).toContain("failure · revenue $0.00");
-    expect(text).toContain("$0.42 model API spend over 3 phases · 2 act-phase tool calls");
+    expect(text).toContain("$0.42 model API spend over 3 phases · 2 deep-dive tool calls");
   });
 });
 
-describe("renderDeliverable", () => {
-  const base: Deliverable = {
-    proposalId: 27,
-    domain: "machine monitoring",
-    description: "A machine-status dashboard.",
-    name: "CuplexUser/machwatch",
-    reviewStatus: null,
-    actStatus: "interrupted",
-    priority: "normal",
-    artifacts: [],
-    siteUrl: null,
-    repoUrl: "https://github.com/CuplexUser/machwatch",
-    filesCommitted: 0,
-    commits: 0,
-    actionCount: 1,
-    startedAt: "2026-08-10T09:00:00.000Z",
-    lastActivityAt: "2026-08-10T09:05:00.000Z",
-    outcome: null,
+describe("reports", () => {
+  const report: ReportRow = {
+    id: 4,
+    proposal_id: 31,
+    goal_id: 3,
+    verdict: "drop",
+    viability_score: 2,
+    confidence: "high",
+    summary: "Incumbents give it away free.",
+    body: "## Summary\nIncumbents give it away free.\n\n## Competitors\n- Acme",
+    sources_json: JSON.stringify([{ title: "Acme pricing", url: "https://acme.example/pricing" }]),
+    created_at: "2026-10-02T00:00:00.000Z",
   };
 
-  it("says the build stopped before it says what it produced", () => {
-    const text = renderDeliverable({
-      ...base,
-      artifacts: [
-        {
-          kind: "repo",
-          provider: "github",
-          label: "CuplexUser/machwatch",
-          url: "https://github.com/CuplexUser/machwatch",
-          detail: null,
-          occurredAt: "2026-08-10T09:05:00.000Z",
-          actionId: 501,
-        },
-      ],
+  it("leads a summary with the verdict", () => {
+    const text = renderReportSummary({
+      ...report,
+      proposal_domain: "dev tools",
+      proposal_description: "**Hosted widget** -- a widget",
+      goal_title: "Developer tools",
     });
-    expect(text.indexOf("act: interrupted")).toBeLessThan(text.indexOf("https://github.com"));
-    expect(text).toContain("- repo · github · CuplexUser/machwatch — https://github.com/CuplexUser/machwatch");
+    expect(text).toContain("drop · viability 2/5 · high confidence · 2026-10-02 · goal: Developer tools");
+    expect(text.indexOf("drop")).toBeLessThan(text.indexOf("Incumbents"));
   });
 
-  it("says so plainly when a build produced no browsable artifact", () => {
-    expect(renderDeliverable(base)).toContain("No browsable artifact");
+  it("renders the full body and every source", () => {
+    const text = renderReport(report, { ideaHeadline: "**Hosted widget**", goalTitle: "Developer tools" });
+    expect(text).toContain("Idea: Hosted widget");
+    expect(text).toContain("## Competitors\n- Acme");
+    expect(text).toContain("- Acme pricing — https://acme.example/pricing");
   });
 });

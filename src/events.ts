@@ -23,7 +23,11 @@ export type AgentEvent =
   | { type: "proposal_decided"; proposal: ProposalRow }
   | { type: "proposal_scheduled"; proposal: ProposalRow }
   | { type: "scheduled_run_starting"; proposal: ProposalRow }
+  // Legacy: emitted by build-mode act phases. No longer emitted, but kept in the union so
+  // persisted events still type-check when the console replays the feed.
   | { type: "outcome_recorded"; proposalId: number }
+  // A deep dive's one required output landed. The research-mode counterpart of the above.
+  | { type: "report_submitted"; proposalId: number; reportId: number; verdict: string; viabilityScore: number }
   | { type: "lesson_saved"; domain: string }
   // A research cycle that proposes nothing is a legitimate outcome, but it used to be
   // indistinguishable from a broken loop: stdout said "No proposal this cycle" and the
@@ -31,10 +35,9 @@ export type AgentEvent =
   // carried because zero of them means something different -- the phase never researched
   // anything, which is a failure, not a decision.
   | { type: "no_proposal"; reason: string; toolCalls: number }
-  // The act-phase counterpart, and the one that was missing: a phase that stopped partway
-  // through the approved plan emitted `phase_done` exactly like one that finished it. See
-  // act-verification.ts for how "partway" is decided and why it's the steps' declared tools
-  // rather than their `doneWhen` prose.
+  // The deep-dive counterpart (type name kept from build mode, where it was the act phase's):
+  // a deep dive that ended without submitting a report emits `phase_done` exactly like one that
+  // did. See deep-dive.ts for how that is decided.
   // `providerStopReason` is the provider's own word for why the model stopped, carried verbatim
   // because it is the one fact that separates "the model gave up" from "the request died
   // upstream" -- and the second machwatch failure could not be told apart without it.

@@ -1,45 +1,36 @@
 import { Fragment, type CSSProperties } from 'react'
 import { Typography } from 'antd'
+import { parseBlocks, parseInline } from '../markdown'
 
-const { Paragraph } = Typography
+const { Paragraph, Title } = Typography
 
-// Minimal Markdown rendering for model-authored text: **bold** inline, and
-// "- "/"* " bullet lists, separated into paragraph/list blocks by blank
-// lines. Anything else (headings, links, italics) is left as literal text --
-// deliberately not a full Markdown parser, just enough structure for the
-// proposal_create/research_note_add prompts to target.
+// Minimal Markdown rendering for model-authored text. The parser (../markdown.ts) handles
+// **bold**, `code`, http(s) links, "## " headings and bullet/numbered lists -- just enough
+// structure for the proposal_create, research_note_add and report_submit prompts to target.
+// Everything renders as React elements, never as HTML.
 
 function renderInline(text: string, keyPrefix: string) {
-  return text
-    .split(/(\*\*[^*]+\*\*)/g)
-    .filter((part) => part.length > 0)
-    .map((part, i) =>
-      part.startsWith('**') && part.endsWith('**') ? (
-        <strong key={`${keyPrefix}-${i}`}>{part.slice(2, -2)}</strong>
-      ) : (
-        <Fragment key={`${keyPrefix}-${i}`}>{part}</Fragment>
-      )
-    )
-}
-
-type Block = { type: 'paragraph'; text: string } | { type: 'list'; items: string[] }
-
-function parseBlocks(text: string): Block[] {
-  const rawBlocks = text.trim().replace(/\r\n/g, '\n').split(/\n{2,}/)
-  const blocks: Block[] = []
-  for (const raw of rawBlocks) {
-    const lines = raw
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean)
-    if (lines.length === 0) continue
-    if (lines.every((l) => /^[-*]\s+/.test(l))) {
-      blocks.push({ type: 'list', items: lines.map((l) => l.replace(/^[-*]\s+/, '')) })
-    } else {
-      blocks.push({ type: 'paragraph', text: lines.join(' ') })
+  return parseInline(text).map((part, i) => {
+    const key = `${keyPrefix}-${i}`
+    switch (part.type) {
+      case 'bold':
+        return <strong key={key}>{part.text}</strong>
+      case 'code':
+        return (
+          <Typography.Text key={key} code>
+            {part.text}
+          </Typography.Text>
+        )
+      case 'link':
+        return (
+          <Typography.Link key={key} href={part.href} target="_blank" rel="noopener noreferrer">
+            {part.text}
+          </Typography.Link>
+        )
+      default:
+        return <Fragment key={key}>{part.text}</Fragment>
     }
-  }
-  return blocks
+  })
 }
 
 export function MarkdownLite({ text, style }: { text: string; style?: CSSProperties }) {
@@ -50,15 +41,26 @@ export function MarkdownLite({ text, style }: { text: string; style?: CSSPropert
     <div style={style}>
       {blocks.map((block, i) => {
         const last = i === blocks.length - 1
-        return block.type === 'list' ? (
-          <ul key={i} style={{ margin: `4px 0 ${last ? 0 : 12}px`, paddingLeft: 20 }}>
-            {block.items.map((item, j) => (
-              <li key={j} style={{ marginBottom: 4 }}>
-                {renderInline(item, `${i}-${j}`)}
-              </li>
-            ))}
-          </ul>
-        ) : (
+        if (block.type === 'heading') {
+          return (
+            <Title key={i} level={block.level === 1 ? 4 : 5} style={{ marginTop: i === 0 ? 0 : 16, marginBottom: 8 }}>
+              {renderInline(block.text, `${i}`)}
+            </Title>
+          )
+        }
+        if (block.type === 'list') {
+          const List = block.ordered ? 'ol' : 'ul'
+          return (
+            <List key={i} style={{ margin: `4px 0 ${last ? 0 : 12}px`, paddingLeft: 20 }}>
+              {block.items.map((item, j) => (
+                <li key={j} style={{ marginBottom: 4 }}>
+                  {renderInline(item, `${i}-${j}`)}
+                </li>
+              ))}
+            </List>
+          )
+        }
+        return (
           <Paragraph key={i} style={{ marginBottom: last ? 0 : 12 }}>
             {renderInline(block.text, `${i}`)}
           </Paragraph>

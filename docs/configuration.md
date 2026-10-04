@@ -28,8 +28,9 @@ cost of each call, which keeps the Economics page accurate.
 default would eventually fail with an unclear error. If it is missing, the startup message links
 to your provider's model list.
 
-You can give each phase its own model with `AGENT_RESEARCH_MODEL`, `AGENT_ACT_MODEL` and
-`AGENT_REFLECT_MODEL`, plus matching `_PROVIDER` variables.
+You can give each phase its own model with `AGENT_RESEARCH_MODEL`, `AGENT_ACT_MODEL` (the deep
+dive, which kept its old internal name) and `AGENT_REFLECT_MODEL`, plus matching `_PROVIDER`
+variables. The deep dive is the phase where your strongest model pays off.
 
 ### Recommended: web search
 
@@ -40,10 +41,10 @@ to the model provider's own built-in search, whose quality varies. `WebFetch` ne
 
 | Variable | What it enables |
 | --- | --- |
-| `GITHUB_TOKEN`, `VERCEL_TOKEN`, `NETLIFY_AUTH_TOKEN` | The GitHub, Vercel and Netlify tools |
-| `STRIPE_API_KEY`, `RESEND_API_KEY`, `PLAUSIBLE_API_KEY`, `CLOUDFLARE_API_TOKEN`, `BING_WEBMASTER_API_KEY`, `DATAFORSEO_AUTH` | Connector tools |
-| `AGENT_CONNECTORS_DIR` | A folder of extra connector manifests outside the repository |
-| `AGENT_NOTIFY_URL` | A webhook message when a proposal needs review |
+| `GITHUB_TOKEN` | Read-only GitHub search, for checking software competitors. No write scope needed. |
+| `DATAFORSEO_AUTH` | Real Google search volume for keywords (paid per call) |
+| `AGENT_CONNECTORS_DIR` | A folder of extra read-only connector manifests outside the repository |
+| `AGENT_NOTIFY_URL` | A webhook message when an idea needs review |
 | `AGENT_CONSOLE_URL` | The address notification links point to, if you review from another device |
 | `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_EMBEDDING_MODEL`, `QDRANT_EMBEDDING_DIM` | [Semantic search](semantic-search.md). All four are required together. |
 | `AGENT_DOMAINS` | The starting goals for a brand new database |
@@ -52,8 +53,8 @@ to the model provider's own built-in search, whose quality varies. `WebFetch` ne
 A few details worth knowing:
 
 - **Connector keys are read on every call**, not at startup, so adding one takes effect on the
-  next cycle without a restart. The GitHub, Vercel and Netlify tokens need a restart.
-- **Use a Stripe test-mode key** (`sk_test_...`) until you are confident in what the agent does.
+  next cycle without a restart. `GITHUB_TOKEN` needs a restart.
+- **Hacker News and TED need no key** and are always available.
 - **`AGENT_DOMAINS` only seeds the first run.** After that, goals are managed on the console's
   Goals page, and editing `.env` has no effect.
 - **Qdrant** has a free cluster at [cloud.qdrant.io](https://cloud.qdrant.io) that needs no

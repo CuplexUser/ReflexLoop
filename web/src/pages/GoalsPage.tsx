@@ -12,11 +12,13 @@ import {
   Popconfirm,
   Row,
   Space,
+  Tabs,
   Tag,
   Tooltip,
   Typography,
 } from 'antd'
 import {
+  BarChartOutlined,
   CheckOutlined,
   CloseOutlined,
   DeleteOutlined,
@@ -25,13 +27,14 @@ import {
   PlayCircleOutlined,
   PlusOutlined,
 } from '@ant-design/icons'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import type { GoalHealth, GoalRow, GoalStatus } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { palette } from '../theme'
 import { money, timeAgo } from '../format'
 import { MarkdownLite } from '../components/MarkdownLite'
+import { GoalLandscape } from '../components/GoalLandscape'
 
 /**
  * What the agent is pointed at.
@@ -42,9 +45,13 @@ import { MarkdownLite } from '../components/MarkdownLite'
  * lessons and the Economics scoreboard. Title and brief are separate here, and the brief is
  * what reaches the research prompt verbatim.
  *
+ * Each goal also opens onto its market landscape (/goals/:id): the ideas filed under it, their
+ * deep-dive verdicts, the competitors they named and the research notes grouped by kind. Editing
+ * is the other tab (/goals/:id?tab=edit).
+ *
  * The Suggested section is the other half: `goal_suggest` lets the agent point at an adjacent
  * lane when one it was given keeps coming up empty, but a suggested goal is inert — never
- * researched, never in a prompt — until someone accepts it here. Same shape as proposal
+ * researched, never in a prompt — until someone accepts it here. Same shape as idea
  * approval, one level up: the agent proposes a direction, the operator decides.
  *
  * Layout notes, since they encode decisions that looked like taste and weren't:
@@ -73,6 +80,7 @@ export function GoalsPage() {
   const consoleOnly = useConsoleOnly()
   const navigate = useNavigate()
   const { id } = useParams()
+  const [searchParams] = useSearchParams()
 
   const [goals, setGoals] = useState<GoalRow[]>([])
   const [health, setHealth] = useState<GoalHealth[]>([])
@@ -102,9 +110,17 @@ export function GoalsPage() {
   const retired = goals.filter((g) => g.status === 'retired')
   const activeCount = live.filter((g) => g.status === 'active').length
 
-  // The deep-linked goal, so /goals/:id opens its editor and Back closes it — same convention
-  // as every other detail view in the console.
+  // The deep-linked goal, so /goals/:id opens its dialog and Back closes it — same convention
+  // as every other detail view in the console. A live goal opens on its market landscape; a
+  // suggested or retired one has nothing researched to show yet, so it opens on the editor.
   const editing = id ? (goals.find((g) => g.id === Number(id)) ?? null) : null
+  const tabParam = searchParams.get('tab')
+  const tab: GoalTab =
+    tabParam === 'edit' || tabParam === 'landscape'
+      ? tabParam
+      : editing && (editing.status === 'active' || editing.status === 'paused')
+        ? 'landscape'
+        : 'edit'
 
   async function act(key: number | 'new', action: () => Promise<unknown>, success: string) {
     setBusy(key)
@@ -164,7 +180,7 @@ export function GoalsPage() {
                         Accept
                       </Button>
                     </Tooltip>
-                    <Button icon={<EditOutlined />} onClick={() => navigate(`/goals/${goal.id}`)}>
+                    <Button icon={<EditOutlined />} onClick={() => navigate(`/goals/${goal.id}?tab=edit`)}>
                       Edit first
                     </Button>
                     <Tooltip title={consoleOnly ? READ_ONLY_HINT : 'Retires the lane, and refuses it if re-suggested'}>
@@ -214,8 +230,8 @@ export function GoalsPage() {
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             Each research cycle works from these. The brief reaches the research prompt word for word; the title is
-            the grouping key on the Economics scoreboard. Changes take effect next cycle — nothing already approved
-            is affected.
+            the grouping key everything is filed under. Open a goal to see its market landscape. Changes take effect
+            next cycle — nothing already approved is affected.
           </Typography.Text>
 
           {live.length === 0 && !loading ? (
@@ -229,7 +245,8 @@ export function GoalsPage() {
                     health={healthById.get(goal.id)}
                     consoleOnly={consoleOnly}
                     busy={busy === goal.id}
-                    onEdit={() => navigate(`/goals/${goal.id}`)}
+                    onEdit={() => navigate(`/goals/${goal.id}?tab=edit`)}
+                    onOpen={() => navigate(`/goals/${goal.id}`)}
                     onToggleStatus={() =>
                       act(
                         goal.id,
@@ -271,6 +288,8 @@ export function GoalsPage() {
       <GoalEditor
         goal={editing}
         draft={draft}
+        tab={tab}
+        onTabChange={(next) => editing && navigate(`/goals/${editing.id}?tab=${next}`, { replace: true })}
         consoleOnly={consoleOnly}
         onClose={() => {
           setDraft(null)
@@ -297,6 +316,8 @@ export function GoalsPage() {
     </Space>
   )
 }
+
+type GoalTab = 'landscape' | 'edit'
 
 /** Past this many quiet cycles the research prompt starts asking for an adjacent angle instead. */
 const STALE_AFTER_EMPTY_CYCLES = 3
@@ -342,6 +363,7 @@ function GoalCard({
   consoleOnly,
   busy,
   onEdit,
+  onOpen,
   onToggleStatus,
 }: {
   goal: GoalRow
@@ -349,6 +371,7 @@ function GoalCard({
   consoleOnly: boolean
   busy: boolean
   onEdit: () => void
+  onOpen: () => void
   onToggleStatus: () => void
 }) {
   const [expanded, setExpanded] = useState(false)
@@ -388,7 +411,7 @@ function GoalCard({
             {goal.origin === 'agent' && <Tag style={{ marginInlineEnd: 0 }}>agent-suggested</Tag>}
             {goal.weight !== 1 && <Tag style={{ marginInlineEnd: 0 }}>weight {goal.weight}</Tag>}
             {stale && !paused && (
-              <Tooltip title={`${health?.empty_cycles} cycles without a proposal — the lane may be worked out.`}>
+              <Tooltip title={`${health?.empty_cycles} cycles without a new idea — the lane may be worked out.`}>
                 <Tag color="warning" style={{ marginInlineEnd: 0 }}>
                   going quiet
                 </Tag>
@@ -397,6 +420,9 @@ function GoalCard({
           </Space>
         </div>
         <Space size={4}>
+          <Tooltip title="Market landscape: ideas, verdicts, competitors and notes for this goal">
+            <Button size="small" icon={<BarChartOutlined />} onClick={onOpen} />
+          </Tooltip>
           <Tooltip title="Edit title, brief and weight">
             <Button size="small" icon={<EditOutlined />} onClick={onEdit} />
           </Tooltip>
@@ -496,21 +522,21 @@ function GoalHealthRow({ health, stale }: { health: GoalHealth; stale: boolean }
   return (
     <div style={{ borderTop: `1px solid ${palette.border}`, paddingTop: 10 }}>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px 22px' }}>
-        <Metric label="Proposals" value={health.proposals} />
+        <Metric label="Ideas" value={health.proposals} />
         <Metric label="Approved" value={health.approved} />
-        <Metric label="Shipped" value={health.shipped} />
+        <Metric label="Deep dives" value={health.deep_dives} hint="Approved ideas with at least one feasibility report." />
         <Metric label="Spend" value={money(health.api_spend)} />
         <Metric
           label="Empty cycles"
           value={health.empty_cycles}
           tone={stale ? palette.rejected : undefined}
-          hint="Research cycles since this goal last produced a proposal. Past three, the research prompt starts asking for an adjacent angle or a goal_suggest instead of more of the same."
+          hint="Research cycles since this goal last produced an idea. Past three, the research prompt starts asking for an adjacent angle or a goal_suggest instead of more of the same."
         />
       </div>
       <Typography.Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 8 }}>
         {health.last_proposal_at
-          ? `Last proposal ${timeAgo(health.last_proposal_at)}`
-          : 'No proposals from this lane yet'}
+          ? `Last idea ${timeAgo(health.last_proposal_at)}`
+          : 'No ideas from this lane yet'}
       </Typography.Text>
     </div>
   )
@@ -552,6 +578,8 @@ function Metric({
 function GoalEditor({
   goal,
   draft,
+  tab,
+  onTabChange,
   consoleOnly,
   onClose,
   onSave,
@@ -559,6 +587,8 @@ function GoalEditor({
 }: {
   goal: GoalRow | null
   draft: { title: string; brief: string } | null
+  tab: GoalTab
+  onTabChange: (tab: GoalTab) => void
   consoleOnly: boolean
   onClose: () => void
   onSave: (fields: { title: string; brief: string; weight?: number; status?: GoalStatus }) => Promise<void>
@@ -577,102 +607,122 @@ function GoalEditor({
 
   const isSuggestion = goal?.status === 'suggested'
   const isRetired = goal?.status === 'retired'
+  // A new goal has no landscape yet; an existing one shows the edit form only on its tab.
+  const showingEditor = !goal || tab === 'edit'
+
+  const editorFooter = (
+    <Space>
+      {onDelete && (
+        <Popconfirm
+          title="Delete this goal?"
+          description="Ideas, reports, lessons and notes filed under it are kept — they just stop being attributed to a goal. Retiring is usually the better move: it keeps the attribution and stops the agent re-suggesting the lane."
+          okButtonProps={{ danger: true }}
+          disabled={consoleOnly}
+          onConfirm={onDelete}
+        >
+          <Tooltip title={consoleOnly ? 'Deleting reaches other tables, so it needs a normal run.' : undefined}>
+            <Button danger icon={<DeleteOutlined />} disabled={consoleOnly}>
+              Delete
+            </Button>
+          </Tooltip>
+        </Popconfirm>
+      )}
+      <Button onClick={onClose}>Cancel</Button>
+      <Tooltip title={consoleOnly ? READ_ONLY_HINT : undefined}>
+        <Button
+          type="primary"
+          disabled={!title.trim() || consoleOnly}
+          onClick={() =>
+            void onSave({
+              title: title.trim(),
+              brief,
+              weight,
+              ...(isSuggestion || isRetired ? { status: 'active' as const } : {}),
+            })
+          }
+        >
+          {isSuggestion ? 'Save and accept' : isRetired ? 'Save and reactivate' : 'Save'}
+        </Button>
+      </Tooltip>
+    </Space>
+  )
+
+  const editor = (
+    <Space direction="vertical" size={12} style={{ width: '100%' }}>
+      {isSuggestion && (
+        <Alert
+          type="info"
+          showIcon
+          message="This is an agent suggestion — saving here accepts it and makes it active."
+          description={goal?.rationale ?? undefined}
+        />
+      )}
+      {isRetired && (
+        <Alert
+          type="warning"
+          showIcon
+          message="This goal is retired — saving brings it back into the rotation."
+        />
+      )}
+      <div>
+        <Typography.Text strong>Title</Typography.Text>
+        <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 4 }}>
+          Short and stable. This is the key ideas, notes and lessons are filed under, and what the agent is told
+          to echo back verbatim when it files one — so renaming it splits the history.
+        </Typography.Paragraph>
+        <Input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="e.g. Swedish market"
+          showCount
+          maxLength={80}
+        />
+      </div>
+      <div>
+        <Typography.Text strong>Brief</Typography.Text>
+        <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 4 }}>
+          Passed to the research prompt word for word. Markdown is fine. Be specific about what counts and what
+          doesn't — which markets, which buyers, which incumbents to rule out first.
+        </Typography.Paragraph>
+        <Input.TextArea
+          value={brief}
+          onChange={(e) => setBrief(e.target.value)}
+          autoSize={{ minRows: 5, maxRows: 16 }}
+          placeholder="Research in Swedish (svenska sökord, Flashback, r/sweden). Target enskild firma / aktiebolag pain points. Check Fortnox, Bokio and Visma before proposing something they already cover."
+        />
+      </div>
+      <Space align="center">
+        <Typography.Text strong>Weight</Typography.Text>
+        <InputNumber min={0} step={0.5} value={weight} onChange={(v) => setWeight(v ?? 1)} />
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          Ordering only, for now — the research prompt lists goals in weight order and picks whichever look most
+          promising.
+        </Typography.Text>
+      </Space>
+    </Space>
+  )
 
   return (
     <Modal
       open={open}
       onCancel={onClose}
-      title={goal ? `Goal #${goal.id}` : 'New goal'}
-      width={720}
-      footer={
-        <Space>
-          {onDelete && (
-            <Popconfirm
-              title="Delete this goal?"
-              description="Proposals, lessons and notes filed under it are kept — they just stop being attributed to a goal. Retiring is usually the better move: it keeps the attribution and stops the agent re-suggesting the lane."
-              okButtonProps={{ danger: true }}
-              disabled={consoleOnly}
-              onConfirm={onDelete}
-            >
-              <Tooltip title={consoleOnly ? 'Deleting reaches other tables, so it needs a normal run.' : undefined}>
-                <Button danger icon={<DeleteOutlined />} disabled={consoleOnly}>
-                  Delete
-                </Button>
-              </Tooltip>
-            </Popconfirm>
-          )}
-          <Button onClick={onClose}>Cancel</Button>
-          <Tooltip title={consoleOnly ? READ_ONLY_HINT : undefined}>
-            <Button
-              type="primary"
-              disabled={!title.trim() || consoleOnly}
-              onClick={() =>
-                void onSave({
-                  title: title.trim(),
-                  brief,
-                  weight,
-                  ...(isSuggestion || isRetired ? { status: 'active' as const } : {}),
-                })
-              }
-            >
-              {isSuggestion ? 'Save and accept' : isRetired ? 'Save and reactivate' : 'Save'}
-            </Button>
-          </Tooltip>
-        </Space>
-      }
+      title={goal ? `Goal #${goal.id} — ${goal.title}` : 'New goal'}
+      width={goal ? 860 : 720}
+      destroyOnClose
+      footer={showingEditor ? editorFooter : null}
     >
-      <Space direction="vertical" size={12} style={{ width: '100%' }}>
-        {isSuggestion && (
-          <Alert
-            type="info"
-            showIcon
-            message="This is an agent suggestion — saving here accepts it and makes it active."
-            description={goal?.rationale ?? undefined}
-          />
-        )}
-        {isRetired && (
-          <Alert
-            type="warning"
-            showIcon
-            message="This goal is retired — saving brings it back into the rotation."
-          />
-        )}
-        <div>
-          <Typography.Text strong>Title</Typography.Text>
-          <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 4 }}>
-            Short and stable. This is the grouping key on the Economics scoreboard, and what the agent is told to
-            echo back verbatim when it files a proposal or a lesson — so renaming it splits the history.
-          </Typography.Paragraph>
-          <Input
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder="e.g. Swedish market"
-            showCount
-            maxLength={80}
-          />
-        </div>
-        <div>
-          <Typography.Text strong>Brief</Typography.Text>
-          <Typography.Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 4 }}>
-            Passed to the research prompt word for word. Markdown is fine. Be specific about what counts and what
-            doesn't — which markets, which buyers, which incumbents to rule out first.
-          </Typography.Paragraph>
-          <Input.TextArea
-            value={brief}
-            onChange={(e) => setBrief(e.target.value)}
-            autoSize={{ minRows: 5, maxRows: 16 }}
-            placeholder="Research in Swedish (svenska sökord, Flashback, r/sweden). Target enskild firma / aktiebolag pain points. Check Fortnox, Bokio and Visma before proposing something they already cover."
-          />
-        </div>
-        <Space align="center">
-          <Typography.Text strong>Weight</Typography.Text>
-          <InputNumber min={0} step={0.5} value={weight} onChange={(v) => setWeight(v ?? 1)} />
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            Ordering only, for now — the research prompt lists goals in weight order and picks whichever look most
-            promising.
-          </Typography.Text>
-        </Space>
-      </Space>
+      {goal ? (
+        <Tabs
+          activeKey={tab}
+          onChange={(key) => onTabChange(key as GoalTab)}
+          items={[
+            { key: 'landscape', label: 'Market landscape', children: <GoalLandscape goalId={goal.id} /> },
+            { key: 'edit', label: 'Edit', children: editor },
+          ]}
+        />
+      ) : (
+        editor
+      )}
     </Modal>
   )
 }

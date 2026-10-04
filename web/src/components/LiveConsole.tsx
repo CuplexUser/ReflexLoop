@@ -9,14 +9,15 @@ function lineColor(type: AgentEvent['type']): string {
     case 'proposal_pending':
     case 'no_proposal':
       return palette.pending
-    // Not `pending` — an act phase that stopped partway through approved work is the one
-    // thing in this feed the operator has to act on, and it used to look like a clean finish.
+    // Not `pending` — a deep dive that ended without a report is the one thing in this feed
+    // the operator has to act on, and it would otherwise look like a clean finish.
     case 'act_incomplete':
     case 'reflect_incomplete':
       return palette.rejected
     case 'proposal_decided':
     case 'phase_done':
     case 'outcome_recorded':
+    case 'report_submitted':
     case 'lesson_saved':
       return palette.approved
     case 'run_started':
@@ -41,29 +42,32 @@ function renderLine(event: AgentEvent): string {
     case 'phase_done':
       return `${phaseTag}✓ done in ${(event.durationMs / 1000).toFixed(1)}s — $${event.costUsd.toFixed(4)}`
     case 'proposal_pending':
-      return `⚠ proposal #${event.proposal.id} awaiting review — ${preview(event.proposal.description, 140)}`
+      return `⚠ idea #${event.proposal.id} awaiting review — ${preview(event.proposal.description, 140)}`
     case 'proposal_decided':
-      return `${event.proposal.status === 'approved' ? '✓' : '✗'} proposal #${event.proposal.id} ${event.proposal.status}`
+      return `${event.proposal.status === 'approved' ? '✓' : '✗'} idea #${event.proposal.id} ${event.proposal.status}`
     case 'outcome_recorded':
+      // Legacy: only build-mode act phases emitted this; kept so old feed entries still read.
       return `$ outcome recorded for proposal #${event.proposalId}`
+    case 'report_submitted':
+      return `▣ report #${event.reportId} on idea #${event.proposalId} — ${event.verdict}, viability ${event.viabilityScore}/5`
     case 'lesson_saved':
       return `◆ lesson saved — domain: ${event.domain}`
     case 'no_proposal':
       // Zero tool calls means the phase never researched anything -- that's a failed run
       // dressed up as a quiet one, and it should not read like a considered decision.
       return event.toolCalls === 0
-        ? `✗ no proposal — the research phase ran no tools and returned nothing; the model call likely failed`
-        : `○ no proposal this cycle (${event.toolCalls} tool calls) — ${preview(event.reason, 300)}`
+        ? `✗ no idea — the research phase ran no tools and returned nothing; the model call likely failed`
+        : `○ no new idea this cycle (${event.toolCalls} tool calls) — ${preview(event.reason, 300)}`
     case 'act_incomplete':
-      // Spelled out rather than summarised: every entry here is a step of the approved plan
-      // that never ran, and the operator has to decide what to do about each one.
-      return `✗ proposal #${event.proposalId} act phase INCOMPLETE (${event.toolCalls} tool calls, ${event.stopReason}${
+      // Spelled out rather than summarised: the operator decides whether to retry from what
+      // went wrong. The event type is persisted, so it keeps its build-mode name.
+      return `✗ idea #${event.proposalId} deep dive INCOMPLETE (${event.toolCalls} tool calls, ${event.stopReason}${
         event.providerStopReason ? `/${event.providerStopReason}` : ''
       }) — ${event.problems.join(' ')}`
     case 'reflect_incomplete':
       // Zero tool calls here specifically means lesson_search never ran -- the reflect prompt
       // requires it before anything else, so a phase that ended without it recorded nothing.
-      return `✗ proposal #${event.proposalId} reflect phase ended without calling lesson_search (${event.toolCalls} tool calls) — no lesson recorded`
+      return `✗ idea #${event.proposalId} reflect phase ended without calling lesson_search (${event.toolCalls} tool calls) — no lesson recorded`
     case 'cycle_idle':
       return `… idle until ${new Date(event.nextCycleAt).toLocaleTimeString()}`
     default:

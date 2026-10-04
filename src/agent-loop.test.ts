@@ -115,10 +115,10 @@ describe("runAgent nudge", () => {
     expect(replayed.content.length).toBeLessThan(600);
     expect(replayed.content).toContain("Here is index.html");
     expect(replayed.content).toContain("cut off at the output limit");
-    expect(replayed.providerRaw).toBeUndefined();
+    expect((replayed as { providerRaw?: unknown }).providerRaw).toBeUndefined();
     // And the model is told the thing it doesn't otherwise know: repeating itself the same
     // way overflows the same way.
-    expect(nudge.content).toContain("put them in the tool call itself");
+    expect(nudge.content).toContain("put the content in the tool call itself");
     expect(nudge.content).toContain("Call github_commit_files now.");
   });
 

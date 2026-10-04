@@ -4,7 +4,7 @@ import { buildConnectorTools } from "./connectors/tools.js";
 import { CONNECTOR_ERRORS } from "./connectors/load.js";
 import { buildWebTools } from "./tools/web.js";
 import { ToolRegistry } from "./tools/registry.js";
-import { ALL_GRANTABLE_TOOLS } from "./tool-catalog.js";
+import { ALL_CATALOG_TOOLS, toolRisk } from "./tool-catalog.js";
 import { unlinkSync, existsSync } from "node:fs";
 
 // Qdrant is disabled for this run, and it has to happen before memory-server is loaded --
@@ -47,15 +47,23 @@ const registry = new ToolRegistry([
 const schemas = registry.schemas(registry.names());
 console.log(`registry: ${schemas.length} tools, all schemas serialized`);
 
-// The catalog is what server.ts validates an operator's required_tools edits against and
-// what the console badges. A name in the catalog with no tool behind it would look
-// grantable and then silently never fire. WebSearch is the deliberate exception: in
-// native/none search mode there is no local tool, and agent-loop.ts reads the grant.
-const missing = ALL_GRANTABLE_TOOLS.filter((name) => !registry.has(name) && name !== "WebSearch");
+// The catalog is what every phase's grant is built from. A name in the catalog with no tool
+// behind it would be granted and then silently never fire. WebSearch is the deliberate
+// exception: in native/none search mode there is no local tool, and agent-loop.ts reads the grant.
+const missing = ALL_CATALOG_TOOLS.filter((name) => !registry.has(name) && name !== "WebSearch");
 if (missing.length > 0) {
   throw new Error(`tool-catalog lists tools the registry doesn't provide: ${missing.join(", ")}`);
 }
 console.log("tool catalog matches the registry");
+
+// The research-only invariant, checked structurally: every registered tool is a read or a write
+// to this agent's own memory. A tool classifying as anything else -- a new write integration, a
+// connector the catalog doesn't know -- fails the build here rather than reaching a phase.
+const outside = registry.names().filter((name) => toolRisk(name) !== "read" && toolRisk(name) !== "memory");
+if (outside.length > 0) {
+  throw new Error(`registered tools outside read/memory (this agent must have no write tools): ${outside.join(", ")}`);
+}
+console.log("every registered tool is read-only or memory-only");
 
 // ---- goals: what the loop is pointed at, and the one thing the agent may only suggest ----
 
@@ -105,8 +113,28 @@ const proposalId = store.createProposal({
   expectedCost: 50,
   expectedTimeHours: 6,
   expectedUpside: 200,
-  requiredTools: ["WebSearch", "WebFetch"],
   goalId: goal.id,
+  revenueModel: "one_off",
+  monetization: {
+    whoPays: "members of one hobby community",
+    pricePoint: "$25 per shirt",
+    pathToFirstDollar: "a print-on-demand storefront with its checkout",
+    daysToFirstDollar: 14,
+    keyAssumption: "the community buys merch outside its own official store",
+    validationSignal: "10 pre-orders from one forum post",
+  },
+  market: {
+    marketSize: "~40k active forum members (estimate)",
+    demandEvidence: [{ claim: "repeated merch requests in the forum", sourceUrl: "https://example.com/forum" }],
+    competitors: [{ name: "Official store", pricing: "$35" }],
+    keyRisks: ["licensing of community imagery"],
+    viabilityScore: 2,
+    confidence: "low",
+  },
+  steps: [
+    { title: "Post a pre-order interest thread", doneWhen: "10 replies with intent to buy" },
+    { title: "Open the storefront", doneWhen: "first order paid" },
+  ],
 });
 console.log("proposal id", proposalId);
 console.log("pending:", store.listPendingProposals());
@@ -135,20 +163,32 @@ console.log("scheduling round-trip OK");
 
 store.logAction(proposalId, "act", "WebSearch", { query: "pod niches" }, { results: 3 });
 
-const outcomeId = store.recordOutcome({
+// A deep dive's output. report_submit only accepts it while the deep dive is running, which
+// is what markActStarted records.
+store.markActStarted(proposalId);
+const reportId = store.createReport({
   proposalId,
-  actualRevenue: 40,
-  actualCost: 55,
-  actualTimeHours: 7,
-  success: false,
-  notes: "niche was too small, low search volume",
+  goalId: goal.id,
+  verdict: "drop",
+  viabilityScore: 2,
+  confidence: "medium",
+  summary: "The niche is too small and the official store already covers it.",
+  body: "## Summary\nToo small.",
+  sources: [{ title: "Forum", url: "https://example.com/forum" }],
 });
-console.log("outcome id", outcomeId);
+store.recordActVerdict(proposalId, { complete: true, problems: [] });
+const latest = store.latestReportsByProposal().get(proposalId);
+if (latest?.id !== reportId || latest.verdict !== "drop") {
+  throw new Error("latestReportsByProposal did not return the report just written");
+}
+if (store.listReports({ goalId: goal.id }).length !== 1) {
+  throw new Error("listReports did not find the report under its goal");
+}
+console.log("report id", reportId);
 
 const lessonId = await store.addLesson(
   "print-on-demand",
-  "Validate search volume for a niche before committing design time",
-  outcomeId
+  "Validate search volume for a niche before committing design time"
 );
 console.log("lesson id", lessonId);
 await store.reinforceLesson(lessonId, "confirmed");
@@ -169,7 +209,7 @@ const [health] = store.goalHealth();
 console.log("goal health:", {
   proposals: health.proposals,
   approved: health.approved,
-  shipped: health.shipped,
+  deepDives: health.deep_dives,
   emptyCycles: health.empty_cycles,
 });
 

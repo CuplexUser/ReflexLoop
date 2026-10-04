@@ -6,7 +6,8 @@ import type { OutcomeRow, Priority, ProposalRow, RevenueModel } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { ProposalDialog } from '../components/ProposalDialog'
-import { REVENUE_MODELS, parseMonetization, revenueModelLabel } from '../monetization'
+import { REVENUE_MODELS, parseMarket, parseMonetization, revenueModelLabel } from '../monetization'
+import { VERDICTS, VERDICT_LABEL, VERDICT_TAG, scoreTag } from '../report'
 import { TableToolbar } from '../components/TableToolbar'
 import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, markdownPreview, recurrenceLabel, timeAgo } from '../format'
 import { useTableView } from '../hooks/useTableView'
@@ -89,7 +90,7 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
         render: (status: ProposalRow['status'], p: ProposalRow) => (
           <Space size={4}>
             <Tag color={STATUS_COLOR[status]}>{status}</Tag>
-            {/* Age matters only while it's blocking: a pending proposal holds up its act phase. */}
+            {/* Age matters only while it's blocking: a pending idea holds up its deep dive. */}
             {status === 'pending' && (
               <Tooltip title={`Awaiting a decision since ${new Date(p.created_at).toLocaleString()}`}>
                 <Typography.Text type="secondary" style={{ fontSize: 11 }}>
@@ -126,6 +127,42 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
           ),
       },
       {
+        // The research phase's own score, before any deep dive checked it.
+        title: 'Research',
+        width: 100,
+        sorter: (a: ProposalRow, b: ProposalRow) => (parseMarket(a)?.viabilityScore ?? 0) - (parseMarket(b)?.viabilityScore ?? 0),
+        render: (_: unknown, p: ProposalRow) => {
+          const market = parseMarket(p)
+          return market ? (
+            <Tag color={scoreTag(market.viabilityScore)}>{market.viabilityScore}/5</Tag>
+          ) : (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              —
+            </Typography.Text>
+          )
+        },
+      },
+      {
+        // What the deep dive concluded -- the latest report, if there is one.
+        title: 'Report',
+        width: 120,
+        sorter: (a: ProposalRow, b: ProposalRow) =>
+          (a.latest_report ? 3 - VERDICTS.indexOf(a.latest_report.verdict) : 0) -
+          (b.latest_report ? 3 - VERDICTS.indexOf(b.latest_report.verdict) : 0),
+        filters: VERDICTS.map((v) => ({ text: VERDICT_LABEL[v], value: v })),
+        onFilter: (value: unknown, record: ProposalRow) => record.latest_report?.verdict === value,
+        render: (_: unknown, p: ProposalRow) =>
+          p.latest_report ? (
+            <Tag color={VERDICT_TAG[p.latest_report.verdict]}>
+              {VERDICT_LABEL[p.latest_report.verdict]} {p.latest_report.viability_score}/5
+            </Tag>
+          ) : (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              —
+            </Typography.Text>
+          ),
+      },
+      {
         title: 'Revenue model',
         dataIndex: 'revenue_model',
         width: 140,
@@ -133,7 +170,7 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
         onFilter: (value: unknown, record: ProposalRow) => record.revenue_model === value,
         render: (model: RevenueModel | null) => {
           const label = revenueModelLabel(model)
-          // Null on every proposal filed before the monetization block existed — those get a
+          // Null on every idea filed before the monetization block existed — those get a
           // dash rather than being bucketed as "other", which would be a claim about them.
           return label ? (
             <Tag color="green">{label}</Tag>
@@ -179,7 +216,7 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
     try {
       const result = await api.bulkDecide(pendingSelected, approved)
       message.success(
-        `${approved ? 'Approved' : 'Rejected'} ${result.decided.length} proposal${result.decided.length === 1 ? '' : 's'}` +
+        `${approved ? 'Approved' : 'Rejected'} ${result.decided.length} idea${result.decided.length === 1 ? '' : 's'}` +
           (result.skipped.length > 0 ? ` · ${result.skipped.length} skipped (no longer pending)` : ''),
       )
       setSelectedIds([])
@@ -205,13 +242,16 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
           onExportCsv={() =>
             // The monetization block is flattened into its own columns rather than exported as
             // the raw JSON it's stored as — a cell holding a whole object is worse than no
-            // column at all, and these are the fields anyone comparing proposals wants.
+            // column at all, and these are the fields anyone comparing ideas wants.
             exportCsv(
-              'proposals',
+              'ideas',
               filtered.map((p) => {
                 const monetization = parseMonetization(p)
                 return {
                   ...p,
+                  research_score: parseMarket(p)?.viabilityScore ?? '',
+                  report_verdict: p.latest_report?.verdict ?? '',
+                  report_score: p.latest_report?.viability_score ?? '',
                   revenue_model_label: revenueModelLabel(p.revenue_model) ?? '',
                   who_pays: monetization?.whoPays ?? '',
                   price_point: monetization?.pricePoint ?? '',
@@ -225,21 +265,23 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
                 { key: 'description', title: 'Description' },
                 { key: 'status', title: 'Status' },
                 { key: 'priority', title: 'Priority' },
+                { key: 'research_score', title: 'Research score' },
+                { key: 'report_verdict', title: 'Report verdict' },
+                { key: 'report_score', title: 'Report score' },
                 { key: 'revenue_model_label', title: 'Revenue model' },
                 { key: 'who_pays', title: 'Who pays' },
                 { key: 'price_point', title: 'Price point' },
                 { key: 'path_to_first_dollar', title: 'Path to first dollar' },
                 { key: 'days_to_first_dollar', title: 'Days to first dollar' },
-                { key: 'expected_cost', title: 'Expected cost' },
-                { key: 'expected_time_hours', title: 'Expected hours' },
-                { key: 'expected_upside', title: 'Expected upside' },
-                { key: 'required_tools', title: 'Required tools' },
+                { key: 'expected_cost', title: 'Est. cost to validate' },
+                { key: 'expected_time_hours', title: 'Est. hours to first signal' },
+                { key: 'expected_upside', title: 'Est. first-year revenue' },
                 { key: 'created_at', title: 'Created' },
                 { key: 'decided_at', title: 'Decided' },
               ]
             )
           }
-          onExportJson={() => exportJson('proposals', filtered)}
+          onExportJson={() => exportJson('ideas', filtered)}
         />
       </Space>
 
@@ -255,11 +297,11 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
           }}
         >
           <Typography.Text>
-            {pendingSelected.length} pending proposal{pendingSelected.length === 1 ? '' : 's'} selected
+            {pendingSelected.length} pending idea{pendingSelected.length === 1 ? '' : 's'} selected
           </Typography.Text>
           <Popconfirm
-            title={`Approve ${pendingSelected.length} proposal${pendingSelected.length === 1 ? '' : 's'}?`}
-            description="Each runs with default priority and no schedule. To edit scope, open one individually."
+            title={`Approve ${pendingSelected.length} idea${pendingSelected.length === 1 ? '' : 's'}?`}
+            description="Each gets a deep dive, run one at a time with default priority and no focus questions. To add those, open one individually."
             disabled={consoleOnly}
             onConfirm={() => bulkDecide(true)}
           >
@@ -277,7 +319,7 @@ export function ProposalsPage({ proposals, outcomes }: { proposals: ProposalRow[
             </Tooltip>
           </Popconfirm>
           <Popconfirm
-            title={`Reject ${pendingSelected.length} proposal${pendingSelected.length === 1 ? '' : 's'}?`}
+            title={`Reject ${pendingSelected.length} idea${pendingSelected.length === 1 ? '' : 's'}?`}
             disabled={consoleOnly}
             onConfirm={() => bulkDecide(false)}
           >

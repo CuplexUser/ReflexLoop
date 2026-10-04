@@ -1,14 +1,12 @@
 // src/mcp/proposals.ts
 //
-// Proposals: what the agent wants to do, what a human decided about it, and how the
-// approved work went. Reading only -- approving or rejecting is the one irreversible human
-// act in the loop and it happens in the console, behind a review card that shows the fence
-// and the money path together.
+// Ideas (stored as proposals): what the agent filed, what a human decided about it, and what
+// its deep dive concluded. Reading only -- approving or rejecting happens in the console,
+// behind a review card that shows the market read and the money path together.
 //
 // `proposals_list` is the queue; `proposal_get` is the whole record for one, which is where
-// the monetization block, the step list, the required_tools fence and the act verdict live.
-// None of those were reachable from an MCP client before, and they are most of what a
-// pending proposal actually says.
+// the market block, the monetization block, the launch outline and the latest report's verdict
+// live. The tool names keep "proposal" because MCP clients may already have them configured.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -27,9 +25,9 @@ function select(status: StatusArg): ProposalRow[] {
       return store.listOpenProposals();
     // Deliberately the store's own query rather than a filter over listAllProposals: its
     // `act_status IS NULL` rule is load-bearing. Null means "no verdict on record", which is
-    // true of every act phase that ran before the column existed -- several of which shipped
-    // a repo and a live site -- so it counts as stalled only when the proposal has no
-    // act-phase actions at all. Re-deriving that here would eventually drift from it.
+    // true of every build-mode act phase that ran before the column existed, so it counts as
+    // stalled only when the proposal has no act-phase actions at all. Re-deriving that here
+    // would eventually drift from it.
     case "stalled":
       return store.listStalledBuilds();
     case "all":
@@ -43,16 +41,17 @@ export function registerProposalTools(server: McpServer) {
   server.registerTool(
     "proposals_list",
     {
-      title: "List proposals",
+      title: "List ideas",
       description:
-        "The agent's proposals: what it wants to do and what was decided. 'open' is pending plus " +
-        "approved, 'pending' is what is waiting on a human decision, and 'stalled' is approved work " +
-        "whose build stopped and which nothing will pick up again until someone re-runs it. " +
+        "The ideas the agent filed and what was decided about each, with its research viability score " +
+        "and, once deep-dived, its report verdict. 'open' is pending plus approved, 'pending' is what is " +
+        "waiting on a human decision, and 'stalled' is approved ideas whose deep dive stopped without a " +
+        "report and which nothing will pick up again until someone re-runs it. " +
         "Reading only -- approving and rejecting happen in the web console.",
       inputSchema: {
         status: z.enum(STATUSES).optional().describe("Which proposals to list (default: open)."),
         goal: goalArg,
-        query: z.string().optional().describe("Only proposals whose domain or description contains this text."),
+        query: z.string().optional().describe("Only ideas whose domain or description contains this text."),
         limit: limitArg,
       },
     },
@@ -69,10 +68,11 @@ export function registerProposalTools(server: McpServer) {
         )
         .slice(0, limit ?? DEFAULT_LIMIT);
       const goals = titlesById();
+      const reports = store.latestReportsByProposal();
       return rendered(
-        `Proposals (${status ?? "open"})`,
-        rows.map((p) => renderProposalSummary(p, goals, p.goal_id)),
-        "No proposals matched."
+        `Ideas (${status ?? "open"})`,
+        rows.map((p) => renderProposalSummary(p, goals, p.goal_id, reports.get(p.id))),
+        "No ideas matched."
       );
     }
   );
@@ -80,17 +80,17 @@ export function registerProposalTools(server: McpServer) {
   server.registerTool(
     "proposal_get",
     {
-      title: "Read one proposal in full",
+      title: "Read one idea in full",
       description:
-        "Everything on record for one proposal: the full description, the tools the act phase is " +
-        "fenced to (with how much damage each can do), the money path it had to state before it " +
-        "could be filed, the ordered steps and who owns each, whether the approved work actually " +
-        "finished, the recorded outcome, and what the proposal cost in model API spend to produce.",
-      inputSchema: { id: z.number().int().positive().describe("The proposal's id, as shown by proposals_list.") },
+        "Everything on record for one idea: its latest deep-dive verdict, the full description, the " +
+        "research phase's market read (demand evidence, competitors, size, risks), the money path it had " +
+        "to state before it could be filed, the launch outline, and what it cost in model API spend. " +
+        "Legacy build-mode proposals also show their tool fence and recorded outcome.",
+      inputSchema: { id: z.number().int().positive().describe("The idea's id, as shown by proposals_list.") },
     },
     async ({ id }) => {
       const row = store.getProposal(id);
-      if (!row) return result(`No proposal #${id}.`);
+      if (!row) return result(`No idea #${id}.`);
 
       const outcome =
         (store.listOutcomes() as unknown as OutcomeLike[]).find((o) => o.proposal_id === id) ?? null;
@@ -103,6 +103,7 @@ export function registerProposalTools(server: McpServer) {
           outcome,
           spend: { costUsd: runs.reduce((sum, r) => sum + r.cost_usd, 0), phases: runs.length },
           actCalls: store.actActionCounts().get(id) ?? 0,
+          report: store.latestReportsByProposal().get(id) ?? null,
         })
       );
     }

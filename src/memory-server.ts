@@ -35,7 +35,6 @@ import {
 // tool_output has carried two storage shapes across this project's life and both are
 // still in the DB; tool-output.ts is the single place that knows how to read either.
 import { extractResultUrl, isErrorResult, parseToolResult } from "./tool-output.js";
-import { DELIVERABLE_TOOLS, type DeliverableActionRow } from "./deliverables.js";
 import { findNearDuplicate, similarity, terms } from "./proposal-similarity.js";
 
 const SCHEMA = `
@@ -147,6 +146,23 @@ CREATE TABLE IF NOT EXISTS goals (
   rationale TEXT,                            -- why the agent suggested it
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+-- What a deep dive produces: the agent's written feasibility report on one approved idea.
+-- An idea can have several (each re-run files a new one beside the old); the newest is the
+-- one that counts. Written only through report_submit, which accepts a report solely for the
+-- proposal whose deep dive is running right now.
+CREATE TABLE IF NOT EXISTS reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  proposal_id INTEGER NOT NULL REFERENCES proposals(id),
+  goal_id INTEGER REFERENCES goals(id),
+  verdict TEXT NOT NULL,                     -- pursue | maybe | drop
+  viability_score INTEGER NOT NULL,          -- 1-5
+  confidence TEXT NOT NULL,                  -- low | medium | high
+  summary TEXT NOT NULL,
+  body TEXT NOT NULL,                        -- Markdown
+  sources_json TEXT NOT NULL,                -- [{title, url, note?}]
+  created_at TEXT NOT NULL
 );
 `;
 
@@ -279,8 +295,8 @@ export class MemoryStore {
     // (node:sqlite's bundled SQLite supports DROP COLUMN); no-op on a fresh DB.
     this.dropColumnIfExists("research_notes", "embedding");
     this.dropColumnIfExists("lessons", "embedding");
-    // Human-only verdict on an approved proposal's actual deliverable -- separate from
-    // the model's self-reported outcome.success, and never settable by the model itself.
+    // Legacy (build mode): a human's verdict on an approved proposal's deliverable. Nothing
+    // writes it any more; kept so those verdicts still render.
     this.ensureColumn("proposals", "review_status", "TEXT");
 
     // Human curation of the agent's own memory. A lesson the model got wrong would
@@ -358,7 +374,7 @@ export class MemoryStore {
     this.ensureColumn("proposals", "steps_json", "TEXT");
 
     // Whether the approved work actually got done. See ActStatus for the states and why this
-    // is a stored column rather than derived from `actions` the way deliverables.ts is: the
+    // is a stored column rather than derived from `actions`: the
     // verdict depends on the model's finish reason, which no table records, and the state that
     // matters most -- an act phase the process died in the middle of -- is precisely the one
     // with no completion row to derive from.
@@ -367,69 +383,53 @@ export class MemoryStore {
     // the correct reading for them rather than a backfill guess.
     this.ensureColumn("proposals", "act_status", "TEXT");
     this.ensureColumn("proposals", "act_problems", "TEXT");
+
+    // The research phase's market assessment of an idea: demand evidence, named competitors,
+    // market size, risks and a viability score. NULL on every proposal written while this agent
+    // still built and deployed things, which is also how the console tells a legacy build-mode
+    // proposal from a research-mode idea.
+    const addedMarket = this.ensureColumn("proposals", "market_json", "TEXT");
+    if (addedMarket) {
+      // One-time, on the switch to research-only: approved build-mode proposals that still hold
+      // a next_run_at (recurring ones especially) would otherwise wake up on the first start as
+      // deep dives nobody asked for. Not destructive -- POST /api/proposals/:id/rerun puts any
+      // of them back deliberately.
+      this.db.exec(`UPDATE proposals SET next_run_at = NULL WHERE status = 'approved' AND next_run_at IS NOT NULL`);
+    }
   }
 
   /**
-   * Repairs the state a process that died mid-flight leaves behind. Called once at startup.
+   * Records the deep dives a process that died mid-flight left behind. Called once at startup.
    *
-   * Safe as an unconditional sweep because act phases only ever run in the orchestrator
+   * Safe as an unconditional sweep because deep dives only ever run in the orchestrator
    * process, one at a time: if this process is only starting now, nothing is running, so every
    * `running` row is a corpse.
    *
-   * **Two separate repairs, and the second is the one with teeth.**
-   *
-   * `running` → `interrupted` records what happened. On its own it changes nothing about what
-   * runs next, because the thing that decides that is `next_run_at` — set on every approval and
-   * cleared only in `drainQueue`'s `finally`, which a killed process never reaches. So a
-   * proposal whose act phase died, *and* one whose act phase finished but whose reflect was cut
-   * short, both still read as due and get their act phase re-run from the top on the next
-   * start. That re-runs real side effects: a second `github_commit_files` is a second commit,
-   * and a connector that sends an email or creates a payment link is not idempotent at all.
-   *
-   * So anything whose act phase has already started is descheduled here, and the operator
-   * re-triggers it deliberately (`POST /api/proposals/:id/rerun`) once they have looked at what
-   * actually landed. The condition is exact rather than a guess: a **non-recurring** proposal
-   * has `next_run_at` set by `scheduleApprovedProposal` and nulled by `advanceOrClearSchedule`,
-   * so `act_status IS NOT NULL AND next_run_at IS NOT NULL` has no legitimate state — it can
-   * only mean the `finally` didn't run.
-   *
-   * **Recurring proposals are left alone**, deliberately. For them a past-due `next_run_at`
-   * after a completed act is ambiguous: it is equally the crash case and a legitimate
-   * occurrence that came due while the process was down, and skipping real scheduled work is
-   * the worse error. Recurrence already means "run this again".
+   * It deliberately does **not** deschedule them. When the agent built and deployed things,
+   * re-running an act phase from the top repeated real side effects, so anything interrupted
+   * waited for the operator. A deep dive has none -- it reads the web and writes to this
+   * database -- so a row whose `next_run_at` survived the crash simply resumes on the next
+   * scheduler tick, which is what the operator would have asked for anyway. A graceful
+   * shutdown still reaches `drainQueue`'s `finally` and clears `next_run_at`, so only a hard
+   * kill resumes automatically.
    */
-  reapAfterUncleanShutdown(): { interrupted: ProposalRow[]; descheduled: ProposalRow[] } {
+  reapInterruptedDeepDives(): ProposalRow[] {
     const interrupted = this.db
       .prepare(`SELECT * FROM proposals WHERE act_status = 'running'`)
       .all() as unknown as ProposalRow[];
     if (interrupted.length > 0) {
       this.db.exec(`UPDATE proposals SET act_status = 'interrupted' WHERE act_status = 'running'`);
     }
-
-    const descheduled = this.db
-      .prepare(
-        `SELECT * FROM proposals
-          WHERE act_status IS NOT NULL AND next_run_at IS NOT NULL AND recurrence_ms IS NULL`
-      )
-      .all() as unknown as ProposalRow[];
-    if (descheduled.length > 0) {
-      this.db.exec(
-        `UPDATE proposals SET next_run_at = NULL
-          WHERE act_status IS NOT NULL AND next_run_at IS NOT NULL AND recurrence_ms IS NULL`
-      );
-    }
-
-    return { interrupted, descheduled };
+    return interrupted;
   }
 
   /**
-   * Puts an approved proposal back in the run queue by hand, after a human has looked at what a
-   * previous attempt actually left behind.
+   * Puts an approved idea back in the deep-dive queue by hand: a retry after an unfinished deep
+   * dive, or a fresh report on one already investigated.
    *
-   * The counterpart to the deschedule above: the automatic path is gone precisely so this one is
-   * a decision. `schedulerTick` picks it up within its poll interval, so this needs no bus of its
-   * own. Returns false for anything not approved -- re-running is resuming authorized work, never
-   * a way to act on something that was never approved.
+   * `schedulerTick` picks it up within its poll interval, so this needs no bus of its own.
+   * Returns false for anything not approved -- spending on a deep dive is something only an
+   * approval authorizes.
    */
   requeueApprovedProposal(id: number): boolean {
     const proposal = this.getProposal(id);
@@ -538,7 +538,7 @@ export class MemoryStore {
    */
   deleteGoal(id: number): boolean {
     if (!this.getGoal(id)) return false;
-    for (const table of ["proposals", "lessons", "research_notes", "runs"]) {
+    for (const table of ["proposals", "lessons", "research_notes", "runs", "reports"]) {
       this.db.prepare(`UPDATE ${table} SET goal_id = NULL WHERE goal_id = ?`).run(id);
     }
     this.db.prepare(`UPDATE goals SET parent_id = NULL WHERE parent_id = ?`).run(id);
@@ -654,6 +654,9 @@ export class MemoryStore {
                 COUNT(DISTINCT CASE WHEN EXISTS (
                   SELECT 1 FROM actions a WHERE a.proposal_id = p.id AND a.phase = 'act'
                 ) THEN p.id END) AS shipped,
+                COUNT(DISTINCT CASE WHEN EXISTS (
+                  SELECT 1 FROM reports rp WHERE rp.proposal_id = p.id
+                ) THEN p.id END) AS deep_dives,
                 COUNT(DISTINCT o.id) AS outcomes,
                 COALESCE(SUM(CASE WHEN o.success = 1 THEN 1 ELSE 0 END), 0) AS successes,
                 (SELECT COALESCE(SUM(r.cost_usd), 0) FROM runs r
@@ -809,6 +812,13 @@ export class MemoryStore {
 
   listAllResearchNotes(limit = 200) {
     return this.db.prepare(`SELECT * FROM research_notes ORDER BY fetched_at DESC LIMIT ?`).all(limit) as unknown as ResearchNoteRow[];
+  }
+
+  /** Every note filed under one goal, newest first. Backs the goal's market landscape. */
+  listResearchNotesForGoal(goalId: number, limit = 300) {
+    return this.db
+      .prepare(`SELECT * FROM research_notes WHERE goal_id = ? ORDER BY fetched_at DESC LIMIT ?`)
+      .all(goalId, limit) as unknown as ResearchNoteRow[];
   }
 
   async deleteResearchNote(id: number) {
@@ -1053,15 +1063,17 @@ export class MemoryStore {
     expectedCost: number;
     expectedTimeHours: number;
     expectedUpside: number;
-    requiredTools: string[];
+    /** Legacy build-mode fence. Research-mode ideas have none; stored as '' (the column is NOT NULL). */
+    requiredTools?: string[];
     goalId?: number | null;
     revenueModel?: RevenueModel | null;
     monetization?: Monetization | null;
     steps?: ProposalStep[] | null;
+    market?: MarketAssessment | null;
   }) {
     const stmt = this.db.prepare(
-      `INSERT INTO proposals (domain, description, expected_cost, expected_time_hours, expected_upside, required_tools, created_at, goal_id, revenue_model, monetization_json, steps_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO proposals (domain, description, expected_cost, expected_time_hours, expected_upside, required_tools, created_at, goal_id, revenue_model, monetization_json, steps_json, market_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const result = stmt.run(
       p.domain,
@@ -1069,12 +1081,13 @@ export class MemoryStore {
       p.expectedCost,
       p.expectedTimeHours,
       p.expectedUpside,
-      p.requiredTools.join(","),
+      (p.requiredTools ?? []).join(","),
       now(),
       p.goalId ?? null,
       p.revenueModel ?? null,
       p.monetization ? JSON.stringify(p.monetization) : null,
-      p.steps ? JSON.stringify(p.steps) : null
+      p.steps ? JSON.stringify(p.steps) : null,
+      p.market ? JSON.stringify(p.market) : null
     );
     return Number(result.lastInsertRowid);
   }
@@ -1089,6 +1102,13 @@ export class MemoryStore {
 
   listAllProposals() {
     return this.db.prepare(`SELECT * FROM proposals ORDER BY created_at DESC`).all() as unknown as ProposalRow[];
+  }
+
+  /** Every idea filed under one goal, newest first. Backs the goal's market landscape. */
+  listProposalsForGoal(goalId: number) {
+    return this.db
+      .prepare(`SELECT * FROM proposals WHERE goal_id = ? ORDER BY created_at DESC`)
+      .all(goalId) as unknown as ProposalRow[];
   }
 
   /** Pending or approved -- the proposals a new one would be a duplicate *of*. */
@@ -1108,17 +1128,16 @@ export class MemoryStore {
    * as a near-duplicate of the thing it improves on. Blocking it turns one "no" into a permanent
    * ban on the subject.
    *
-   * **Approved proposals whose act phase didn't finish** are excluded here for exactly that
-   * reason. A proposal to complete unbuilt work is, by construction, near-identical to the work
-   * -- there is no wording that both describes finishing #27 and doesn't resemble #27. The
-   * refinement pass on #27 hit this for real: `proposal_create` was refused twice (43% then 32%
-   * overlap) and only landed on the third attempt, after the model had reworded it enough to
-   * slip under the threshold. It got through by sounding different, not by being different,
-   * which is the exact selection pressure this check exists to avoid creating.
+   * **Approved proposals whose deep dive didn't finish** are excluded for the same reason. The
+   * carve-out dates from build mode, where a proposal to complete unbuilt work was by
+   * construction near-identical to the work (#27's refinement was refused twice before it got
+   * through by sounding different rather than being different). An idea whose investigation
+   * stalled is in the same position: a sharper re-pitch of it should not be blocked by the
+   * original.
    *
    * `interrupted` is included in the carve-out and `running` is deliberately not: research runs
-   * concurrently with act, so a proposal being built *right now* is precisely one a new proposal
-   * must not duplicate. See `reapInterruptedActPhases` for what separates the two.
+   * concurrently with deep dives, so an idea being investigated *right now* is precisely one a
+   * new proposal must not duplicate.
    */
   listDuplicateCandidates() {
     return this.db
@@ -1137,37 +1156,27 @@ export class MemoryStore {
   }
 
   /**
-   * Marks an act phase as in flight. Written before the model is called, so a crash between
-   * here and the verdict leaves a `running` row for the next startup to reap rather than a
-   * proposal that looks like it never acted.
+   * Marks a deep dive as in flight. Written before the model is called, so a crash between
+   * here and the verdict leaves a `running` row for the next startup to reap rather than an
+   * idea that looks like it was never investigated. `report_submit` also reads it: a report is
+   * accepted only for the idea whose deep dive is `running`.
    */
   markActStarted(id: number) {
     this.db.prepare(`UPDATE proposals SET act_status = 'running', act_problems = NULL WHERE id = ?`).run(id);
   }
 
-  /**
-   * Records what `verifyAct` concluded once the act phase returned.
-   *
-   * Also clears `review_status` back to null (Unreviewed): that column is the human's verdict
-   * on the deliverable as it stood after the *previous* act phase, and a rerun -- from the
-   * Deliverables page's Retry button or a recurring proposal coming due again -- just replaced
-   * that deliverable with a new attempt. Leaving a stale "Needs refinement" (or "MVP done") tag
-   * sitting on it would describe a build that no longer exists rather than prompting the fresh
-   * look the new one deserves. Runs whether the new attempt completed or not: either way it's a
-   * different state than what earned the old verdict. A no-op for a first-time build, which is
-   * already null.
-   */
+  /** Records what `verifyDeepDive` concluded once the deep dive returned. */
   recordActVerdict(id: number, verdict: { complete: boolean; problems: string[] }) {
     this.db
-      .prepare(`UPDATE proposals SET act_status = ?, act_problems = ?, review_status = NULL WHERE id = ?`)
+      .prepare(`UPDATE proposals SET act_status = ?, act_problems = ? WHERE id = ?`)
       .run(verdict.complete ? "complete" : "incomplete", verdict.problems.length ? JSON.stringify(verdict.problems) : null, id);
   }
 
   /**
-   * How long act phases have actually taken, from the ledger.
+   * How long deep dives (persisted phase key `act`) have actually taken, from the ledger.
    *
-   * A forecast rather than a promise, and shaped to say so: act durations in the real history
-   * span 8 to 32 minutes, so a single confident number would be wrong nearly always. The caller
+   * A forecast rather than a promise, and shaped to say so: act-phase durations in the real
+   * history span 8 to 32 minutes, so a single confident number would be wrong nearly always. The caller
    * gets the median, the range and the sample size and can present all three.
    *
    * `model` scopes it, because that is the variable that moves this most -- comparing a run on
@@ -1203,14 +1212,14 @@ export class MemoryStore {
   }
 
   /**
-   * Approved work that nothing is going to run: no `next_run_at`, and not finished.
+   * Approved ideas that nothing is going to investigate: no `next_run_at`, and no finished deep
+   * dive.
    *
    * The `act_status IS NULL` half is the subtle one and it must not be read as "unfinished".
-   * Null means "no verdict on record", which is true of every act phase that ran before the
-   * column existed -- eight proposals in the live DB, including ones that shipped a repo and a
-   * live site. Listing those as stalled would invite re-running builds that already succeeded,
-   * which is a duplicate commit or a second deploy, so the null case is only stalled when the
-   * proposal genuinely has no act-phase actions at all.
+   * Null means "no verdict on record", which is true of every build-mode act phase that ran
+   * before the column existed -- several of which shipped a repo and a live site. Those are
+   * history, not stalled work, so the null case is only stalled when the proposal genuinely has
+   * no act-phase actions at all.
    *
    * The recorded statuses need no such care: `interrupted` and `incomplete` are positive
    * findings, and `complete` and `running` are excluded outright.
@@ -1231,17 +1240,6 @@ export class MemoryStore {
       .all() as unknown as ProposalRow[];
   }
 
-  /** Approved proposals whose act phase started and never reached a verdict, or reached a bad one. */
-  listUnfinishedActs(): ProposalRow[] {
-    return this.db
-      .prepare(
-        `SELECT * FROM proposals
-          WHERE status = 'approved' AND act_status IN ('interrupted', 'incomplete')
-          ORDER BY decided_at DESC`
-      )
-      .all() as unknown as ProposalRow[];
-  }
-
   decideProposal(id: number, status: "approved" | "rejected", humanNotes?: string) {
     this.db
       .prepare(`UPDATE proposals SET status = ?, human_notes = ?, decided_at = ? WHERE id = ?`)
@@ -1249,15 +1247,8 @@ export class MemoryStore {
   }
 
   /**
-   * Applies a human's edits to a proposal's scope at approval time, preserving what the model
-   * originally proposed. Only ever called from the decision endpoint, before the proposal is
-   * approved -- an approved proposal's fence is never edited afterwards.
-   */
-  /**
-   * Whether an act phase has already run for this proposal. The dividing line for
-   * whether its scope can still be edited: once the model has committed or deployed
-   * something, narrowing required_tools can't un-do it, and widening would authorise
-   * work retroactively.
+   * Whether an act phase has ever run for this proposal. For a legacy build-mode proposal that
+   * means something was built; the research digest uses it to label those as history.
    */
   hasActed(id: number): boolean {
     const row = this.db
@@ -1267,35 +1258,10 @@ export class MemoryStore {
   }
 
   /**
-   * Which of `toolNames` have already run *successfully* in an act phase on this proposal.
-   *
-   * This is what keeps a second act run on the same proposal from being judged as though the
-   * first one never happened. `verifyAct` asks "did each approved step's tool run?", and a
-   * re-run answers no for every step the previous run already did -- so a finished build came
-   * back `incomplete`, and the nudge told the model to redo work that was already on disk.
-   * Worse, several of those calls cannot succeed twice: `github_create_repo` on an existing
-   * repo is a 422 forever, so the step could never be satisfied no matter how often it ran.
-   *
-   * Success is read the same way `deliverables.ts` reads it -- a stored output that decodes to
-   * an "Error: ..." string is the handler's own in-band failure and does not count. Narrowed to
-   * the caller's tool names in SQL because the rows this skips are the fat ones (a WebFetch of
-   * a whole page), exactly as in `listDeliverableActions`.
+   * Applies a human's edit to an idea's description at approval time, preserving what the model
+   * originally wrote in `original_description`.
    */
-  succeededActTools(id: number, toolNames: string[]): string[] {
-    if (toolNames.length === 0) return [];
-    const placeholders = toolNames.map(() => "?").join(",");
-    const rows = this.db
-      .prepare(
-        `SELECT tool_name, tool_output FROM actions
-         WHERE proposal_id = ? AND phase = 'act' AND tool_name IN (${placeholders})`
-      )
-      .all(id, ...toolNames) as unknown as { tool_name: string; tool_output: string | null }[];
-    return [
-      ...new Set(rows.filter((r) => !isErrorResult(parseToolResult(r.tool_output))).map((r) => r.tool_name)),
-    ];
-  }
-
-  applyProposalEdits(id: number, edits: { description?: string; requiredTools?: string[] }) {
+  applyProposalEdits(id: number, edits: { description?: string }) {
     const existing = this.getProposal(id);
     if (!existing) return false;
 
@@ -1307,23 +1273,7 @@ export class MemoryStore {
         )
         .run(edits.description, existing.description, id);
     }
-    if (edits.requiredTools !== undefined) {
-      const next = edits.requiredTools.join(",");
-      if (next !== existing.required_tools) {
-        this.db
-          .prepare(
-            `UPDATE proposals SET required_tools = ?,
-               original_required_tools = COALESCE(original_required_tools, ?) WHERE id = ?`
-          )
-          .run(next, existing.required_tools, id);
-      }
-    }
     return true;
-  }
-
-  /** Human-only verdict on whether an approved proposal's deliverable is MVP-done or needs more work. */
-  setProposalReview(id: number, reviewStatus: "mvp_done" | "needs_refinement" | null) {
-    this.db.prepare(`UPDATE proposals SET review_status = ? WHERE id = ?`).run(reviewStatus, id);
   }
 
   /** Called right after approval: sets the human-chosen priority/schedule and computes the first next_run_at. */
@@ -1392,25 +1342,7 @@ export class MemoryStore {
     return rows.map((r) => ({ ...r, result_url: extractResultUrl(r.tool_output) }));
   }
 
-  /**
-   * The act-phase calls that can produce a browsable artifact -- what buildDeliverables
-   * turns into the Deliverables page. Narrowed to those tool names in SQL rather than
-   * filtered in JS because the rows this skips are the fat ones: a WebFetch of a whole
-   * page, or a research note's full text, none of which can name a repo or a deployment.
-   */
-  listDeliverableActions(): DeliverableActionRow[] {
-    const tools = DELIVERABLE_TOOLS.map(() => "?").join(",");
-    return this.db
-      .prepare(
-        `SELECT a.id, a.proposal_id, a.tool_name, a.tool_input, a.tool_output, a.occurred_at
-         FROM actions a JOIN proposals p ON p.id = a.proposal_id
-         WHERE p.status = 'approved' AND a.phase = 'act' AND a.tool_name IN (${tools})
-         ORDER BY a.occurred_at ASC`
-      )
-      .all(...DELIVERABLE_TOOLS) as unknown as DeliverableActionRow[];
-  }
-
-  /** Act-phase calls per approved proposal -- the full trail size behind each deliverable. */
+  /** Act-phase (deep-dive, or legacy build) calls per approved proposal. */
   actActionCounts(): Map<number, number> {
     const rows = this.db
       .prepare(
@@ -1421,50 +1353,6 @@ export class MemoryStore {
       )
       .all() as unknown as { proposal_id: number; n: number }[];
     return new Map(rows.map((r) => [r.proposal_id, r.n]));
-  }
-
-  /**
-   * What's actually been done (act-phase, side-effecting tool calls only) on approved
-   * proposals -- what the agent itself calls via action_history_search so research/plan
-   * can check for existing work before proposing something that duplicates it.
-   */
-  listActionHistory(filter: { goalId?: number; text?: string } = {}, limit = 20) {
-    const base = `SELECT a.tool_name, a.tool_input, a.tool_output, a.occurred_at, a.proposal_id,
-                          p.domain, p.description AS proposal_description
-                   FROM actions a JOIN proposals p ON p.id = a.proposal_id
-                   WHERE p.status = 'approved' AND a.phase = 'act'`;
-
-    // Matching is goal_id OR text, never goal_id alone. Every proposal predating goals has
-    // goal_id = NULL under one of 13 free-text domain spellings, so an id-only filter would
-    // report "nothing has been built here" for work that plainly has been -- which is exactly
-    // how the old exact `p.domain = ?` filter failed, and the guard the research prompt leans
-    // on to avoid re-building shipped work.
-    const clauses: string[] = [];
-    const params: (string | number)[] = [];
-    if (filter.goalId !== undefined) {
-      clauses.push("p.goal_id = ?");
-      params.push(filter.goalId);
-    }
-    if (filter.text?.trim()) {
-      const like = `%${filter.text.trim()}%`;
-      clauses.push("p.domain LIKE ?", "p.description LIKE ?");
-      params.push(like, like);
-    }
-
-    const where = clauses.length > 0 ? ` AND (${clauses.join(" OR ")})` : "";
-    const rows = this.db
-      .prepare(`${base}${where} ORDER BY a.occurred_at DESC LIMIT ?`)
-      .all(...params, limit) as unknown as ActionHistoryRow[];
-
-    return rows.map((r) => ({
-      proposalId: r.proposal_id,
-      domain: r.domain,
-      proposalDescription: r.proposal_description,
-      tool: r.tool_name.replace(/^mcp__(memory|integrations)__/, ""),
-      input: safeParseJson(r.tool_input),
-      resultUrl: extractResultUrl(r.tool_output),
-      occurredAt: r.occurred_at,
-    }));
   }
 
   // ---- outcomes -----------------------------------------------------------
@@ -1501,6 +1389,91 @@ export class MemoryStore {
          ORDER BY o.recorded_at DESC`
       )
       .all();
+  }
+
+  // ---- reports --------------------------------------------------------------
+  //
+  // A deep dive's written verdict on one approved idea. Only report_submit writes these, and
+  // only for the idea whose deep dive is running; everything else here is a read.
+
+  createReport(r: {
+    proposalId: number;
+    goalId: number | null;
+    verdict: ReportVerdict;
+    viabilityScore: number;
+    confidence: Confidence;
+    summary: string;
+    body: string;
+    sources: ReportSource[];
+  }) {
+    const result = this.db
+      .prepare(
+        `INSERT INTO reports (proposal_id, goal_id, verdict, viability_score, confidence, summary, body, sources_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        r.proposalId,
+        r.goalId,
+        r.verdict,
+        r.viabilityScore,
+        r.confidence,
+        r.summary,
+        r.body,
+        JSON.stringify(r.sources),
+        now()
+      );
+    return Number(result.lastInsertRowid);
+  }
+
+  getReport(id: number) {
+    return this.db.prepare(`SELECT * FROM reports WHERE id = ?`).get(id) as ReportRow | undefined;
+  }
+
+  /**
+   * Report list rows: everything but the body, plus enough of the idea to label the row. The
+   * body is the bulk of each row and no list view shows it.
+   */
+  listReports(filter: { goalId?: number; verdict?: ReportVerdict; limit?: number } = {}) {
+    const clauses: string[] = [];
+    const params: (string | number)[] = [];
+    if (filter.goalId !== undefined) {
+      clauses.push("r.goal_id = ?");
+      params.push(filter.goalId);
+    }
+    if (filter.verdict) {
+      clauses.push("r.verdict = ?");
+      params.push(filter.verdict);
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    return this.db
+      .prepare(
+        `SELECT r.id, r.proposal_id, r.goal_id, r.verdict, r.viability_score, r.confidence, r.summary, r.created_at,
+                p.domain AS proposal_domain, p.description AS proposal_description, g.title AS goal_title
+         FROM reports r
+         JOIN proposals p ON p.id = r.proposal_id
+         LEFT JOIN goals g ON g.id = r.goal_id
+         ${where}
+         ORDER BY r.id DESC LIMIT ?`
+      )
+      .all(...params, filter.limit ?? 500) as unknown as ReportListRow[];
+  }
+
+  /** Every report on one idea, newest first. */
+  listReportsForProposal(proposalId: number) {
+    return this.db
+      .prepare(`SELECT * FROM reports WHERE proposal_id = ? ORDER BY id DESC`)
+      .all(proposalId) as unknown as ReportRow[];
+  }
+
+  /** The newest report per idea, without bodies. An idea's latest report is the one that counts. */
+  latestReportsByProposal(): Map<number, ReportSummary> {
+    const rows = this.db
+      .prepare(
+        `SELECT id, proposal_id, verdict, viability_score, confidence, summary, created_at FROM reports
+         WHERE id IN (SELECT MAX(id) FROM reports GROUP BY proposal_id)`
+      )
+      .all() as unknown as ReportSummary[];
+    return new Map(rows.map((r) => [r.proposal_id, r]));
   }
 
   // ---- lessons --------------------------------------------------------------
@@ -1994,7 +1967,18 @@ interface ResearchNoteRow {
 export type Scored<T> = T & { score: number };
 
 /** What a research note is telling you. Drives filtering, not just display. */
-export const NOTE_KINDS = ["gap", "saturated", "competitor", "pricing", "spec", "inventory", "meta"] as const;
+export const NOTE_KINDS = [
+  "gap",
+  "demand",
+  "market_size",
+  "competitor",
+  "pricing",
+  "risk",
+  "saturated",
+  "spec",
+  "inventory",
+  "meta",
+] as const;
 export type NoteKind = (typeof NOTE_KINDS)[number];
 
 export type GoalStatus = "active" | "paused" | "retired" | "suggested";
@@ -2020,7 +2004,10 @@ export interface GoalHealthRow {
   weight: number;
   proposals: number;
   approved: number;
+  /** Legacy: proposals that ran a build-mode act phase. */
   shipped: number;
+  /** Ideas with at least one deep-dive report. */
+  deep_dives: number;
   outcomes: number;
   successes: number;
   api_spend: number;
@@ -2138,6 +2125,12 @@ export const REVENUE_MODELS = [
   "marketplace",
   "service",
   "lead_gen",
+  // For ideas whose first goal is an audience rather than a sale -- an open-source or free tool,
+  // a community -- so they can state their money path honestly instead of filing as "other".
+  "sponsorship_donations",
+  "open_core",
+  /** Audience first, charge later: pathToFirstDollar names the later mechanism, validationSignal is adoption. */
+  "deferred",
   "other",
 ] as const;
 export type RevenueModel = (typeof REVENUE_MODELS)[number];
@@ -2153,15 +2146,66 @@ export interface Monetization {
 }
 
 /**
- * One step between approval and revenue. `tool` on an agent-owned step is checked against
- * `required_tools` at create time, which is what keeps "the steps needed" and "what the fence
- * permits" from becoming two unrelated pieces of prose.
+ * One step in an idea's launch outline: what a human would do, in order, from approval to the
+ * first revenue. `owner` and `tool` exist only on legacy build-mode proposals, where agent-owned
+ * steps named the act-phase tool they needed.
  */
 export interface ProposalStep {
   title: string;
-  owner: "agent" | "human";
+  owner?: "agent" | "human";
   tool?: string;
   doneWhen: string;
+}
+
+export const CONFIDENCE_LEVELS = ["low", "medium", "high"] as const;
+export type Confidence = (typeof CONFIDENCE_LEVELS)[number];
+
+/** The research phase's read on an idea's market, filed with the idea and checked by its deep dive. */
+export interface MarketAssessment {
+  marketSize: string;
+  demandEvidence: { claim: string; sourceUrl: string }[];
+  competitors: { name: string; url?: string; pricing?: string; gap?: string }[];
+  keyRisks: string[];
+  viabilityScore: number;
+  confidence: Confidence;
+}
+
+export const REPORT_VERDICTS = ["pursue", "maybe", "drop"] as const;
+export type ReportVerdict = (typeof REPORT_VERDICTS)[number];
+
+export interface ReportSource {
+  title: string;
+  url: string;
+  note?: string;
+}
+
+/** A deep dive's feasibility report on one approved idea. */
+export interface ReportRow {
+  id: number;
+  proposal_id: number;
+  goal_id: number | null;
+  verdict: ReportVerdict;
+  viability_score: number;
+  confidence: Confidence;
+  summary: string;
+  /** Markdown. */
+  body: string;
+  /** JSON-encoded {@link ReportSource}[]. */
+  sources_json: string;
+  created_at: string;
+}
+
+/** A report without its body: what lists, digests and the ideas table need. */
+export type ReportSummary = Pick<
+  ReportRow,
+  "id" | "proposal_id" | "verdict" | "viability_score" | "confidence" | "summary" | "created_at"
+>;
+
+export interface ReportListRow extends ReportSummary {
+  goal_id: number | null;
+  proposal_domain: string;
+  proposal_description: string;
+  goal_title: string | null;
 }
 
 export interface ProposalRow {
@@ -2196,23 +2240,25 @@ export interface ProposalRow {
   monetization_json: string | null;
   /** JSON-encoded {@link ProposalStep}[]. */
   steps_json: string | null;
-  /** How the approved work went. NULL on anything that has never reached the act phase. */
+  /** How the deep dive (or, on legacy rows, the build) went. NULL on anything never approved and run. */
   act_status: ActStatus | null;
-  /** JSON-encoded string[] of what `verifyAct` objected to. NULL when it had no objections. */
+  /** JSON-encoded string[] of what the verifier objected to. NULL when it had no objections. */
   act_problems: string | null;
+  /** JSON-encoded {@link MarketAssessment}. NULL on legacy build-mode proposals. */
+  market_json: string | null;
 }
 
 /**
- * The life of an act phase, as the record sees it.
+ * The life of a deep dive (the persisted `act` phase), as the record sees it.
  *
- * - `running` — started, still going. Only ever true of the live process; see `reapInterruptedActPhases`.
- * - `interrupted` — started and the process went away before it finished. Nobody is coming back for it.
- * - `complete` — ran, did every agent-owned step, recorded an outcome.
- * - `incomplete` — ran and didn't. Truncated, out of turns, steps skipped, or no outcome recorded.
+ * - `running` — started, still going. Only ever true of the live process; see `reapInterruptedDeepDives`.
+ * - `interrupted` — started and the process went away before it finished.
+ * - `complete` — ran and submitted a report.
+ * - `incomplete` — ran and didn't. Truncated, out of turns, or no report submitted.
  *
  * `interrupted` and `incomplete` are separate because they need different responses: one is an
  * infrastructure failure that a re-run may simply fix, the other is the model not finishing the
- * job, which is a reason to look at the proposal.
+ * job, which is a reason to look at the idea.
  */
 export type ActStatus = "running" | "interrupted" | "complete" | "incomplete";
 
@@ -2223,6 +2269,26 @@ export function parseMonetization(row: Pick<ProposalRow, "monetization_json">): 
     return JSON.parse(row.monetization_json) as Monetization;
   } catch {
     return null;
+  }
+}
+
+/** Parses a proposal's stored market assessment. Null on legacy build-mode rows. */
+export function parseMarket(row: Pick<ProposalRow, "market_json">): MarketAssessment | null {
+  if (!row.market_json) return null;
+  try {
+    return JSON.parse(row.market_json) as MarketAssessment;
+  } catch {
+    return null;
+  }
+}
+
+/** Parses a report's stored source list. */
+export function parseSources(row: Pick<ReportRow, "sources_json">): ReportSource[] {
+  try {
+    const parsed = JSON.parse(row.sources_json);
+    return Array.isArray(parsed) ? (parsed as ReportSource[]) : [];
+  } catch {
+    return [];
   }
 }
 
@@ -2329,9 +2395,9 @@ interface ActionHistoryRow {
 // ---- tool definitions ---------------------------------------------------
 //
 // These are the only memory operations the agent itself can call. Notice
-// what's absent: no tool to approve a proposal, no tool to mark itself
-// successful, no tool that touches real money. Those stay in the
-// orchestrator's hands.
+// what's absent: no tool to approve a proposal, no tool to start a deep dive,
+// no tool that reaches anything outside this database. Those stay in the
+// orchestrator's and the operator's hands.
 //
 // The `mcp__memory__` prefix is a namespace, not a live MCP server -- see the
 // note in tools/registry.ts for why the persisted names kept it.
@@ -2355,9 +2421,12 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
         .enum(NOTE_KINDS)
         .optional()
         .describe(
-          "What kind of finding this is. 'saturated' means you checked and the space is already well covered -- " +
-            "mark those honestly, they are how you avoid re-checking the same dead ends next cycle. 'gap' means " +
-            "you found something underserved."
+          "What kind of finding this is. 'gap': something underserved. 'demand': evidence people want or pay " +
+            "for something. 'market_size': a size or volume figure. 'competitor' / 'pricing': who is already " +
+            "there and what they charge. 'risk': something that could sink an idea. 'saturated': you checked " +
+            "and the space is already well covered -- mark those honestly, they are how you avoid re-checking " +
+            "the same dead ends next cycle. These kinds are what the operator's market view of each goal is " +
+            "built from."
         ),
       domain: z
         .string()
@@ -2448,23 +2517,30 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
     }
   );
 
+  const httpUrl = (u: string) => /^https?:\/\/\S+$/i.test(u.trim());
+
   const proposalCreate = defineTool(
     "proposal_create",
-    "Propose a specific, boundable action for a human to approve. Every proposal needs a concrete cost/time/upside estimate, a monetization block saying how it actually earns and what the path to the first dollar is, an ordered step list, and the exact list of tools it needs -- no proposal is executed without human approval, and execution is locked to exactly the tools listed here.",
+    "File a business idea for the operator to review. Software or not -- a service, a product, a local business, " +
+      "a content or community play all count. Every idea needs a market assessment backed by sources, a " +
+      "monetization block saying how it earns, and a launch outline a human would follow. Nothing is built or " +
+      "launched by you: if the operator approves it, you investigate it in depth and write a feasibility report.",
     {
-      domain: z.string(),
+      domain: z.string().describe("The goal this belongs to, using the goal's title exactly as written"),
       description: z
         .string()
         .describe(
-          "What you'd do, specifically enough that a human can say yes or no. Format as Markdown, not one long " +
+          "The idea, specifically enough that a human can say yes or no. Format as Markdown, not one long " +
             "prose paragraph: a one-line **bold** headline (name + one-sentence pitch), a blank line, then a " +
-            "'- ' bullet list of 3-6 short points -- whichever of what/why-now/differentiation/act-phase " +
-            "scope/risks are relevant. Keep each bullet to one or two sentences."
+            "'- ' bullet list of 3-6 short points -- whichever of who-it's-for/why-now/differentiation/" +
+            "what-to-validate-first/risks are relevant. Keep each bullet to one or two sentences."
         ),
-      expectedCost: z.number().min(0).describe("Expected cost in your currency of choice, e.g. USD"),
-      expectedTimeHours: z.number().min(0),
-      expectedUpside: z.number().describe("Expected revenue or value if it works"),
-      requiredTools: z.array(z.string()).describe("Exact tool names needed for execution, e.g. ['WebSearch','WebFetch']"),
+      expectedCost: z
+        .number()
+        .min(0)
+        .describe("Estimated cash outlay to launch and validate it, in USD. An estimate -- label it so in the description if it's rough"),
+      expectedTimeHours: z.number().min(0).describe("Estimated human hours to reach the first validation signal"),
+      expectedUpside: z.number().describe("Estimated revenue in the first 12 months if it works, in USD"),
       revenueModel: z.enum(REVENUE_MODELS).describe("How money actually arrives"),
       monetization: z
         .object({
@@ -2473,55 +2549,63 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
           pathToFirstDollar: z
             .string()
             .describe(
-              "The concrete mechanism that collects the first payment -- a Stripe payment link, a named " +
-                "affiliate programme, a specific ad network. Not 'monetize later' and not 'add payments'."
+              "The concrete mechanism that collects the first payment, which a human operator could set up today " +
+                "-- a payment link, a named affiliate programme, a specific marketplace or ad network. Not " +
+                "'monetize later'. For a deferred model, name the later mechanism and what triggers it."
             ),
-          daysToFirstDollar: z.number().int().min(0).describe("Realistic days from approval to first payment"),
+          daysToFirstDollar: z.number().int().min(0).describe("Realistic days from starting to first payment"),
           keyAssumption: z.string().describe("The one thing that, if it turns out to be false, kills this"),
-          validationSignal: z.string().describe("What you would measure to know whether it is working"),
+          validationSignal: z
+            .string()
+            .describe("What a human would measure to know whether it is working (for a deferred model: adoption)"),
         })
         .describe("How this makes money. A human reviews this to decide; vagueness here is what gets rejected."),
+      market: z
+        .object({
+          marketSize: z
+            .string()
+            .describe("Size estimate and how you derived it (search volume, number of businesses, spend). Label estimates as such"),
+          demandEvidence: z
+            .array(z.object({ claim: z.string(), sourceUrl: z.string().describe("http(s) URL you actually read") }))
+            .min(1)
+            .max(8)
+            .describe("Concrete signs people want or pay for this, each with the source you read it in"),
+          competitors: z
+            .array(
+              z.object({
+                name: z.string(),
+                url: z.string().optional(),
+                pricing: z.string().optional(),
+                gap: z.string().optional().describe("What they leave unserved"),
+              })
+            )
+            .max(10)
+            .describe("Named incumbents or substitutes. An empty list is a claim too -- only make it if you looked"),
+          keyRisks: z.array(z.string()).min(1).max(6),
+          viabilityScore: z.number().int().min(1).max(5).describe("1 = very unlikely to work, 5 = strong case"),
+          confidence: z.enum(CONFIDENCE_LEVELS).describe("How well-evidenced the score is"),
+        })
+        .describe("Your read on the market. The deep dive checks these claims, so cite what you actually found."),
       steps: z
         .array(
           z.object({
             title: z.string(),
-            owner: z.enum(["agent", "human"]).describe("'agent' if the act phase does it, 'human' if you cannot"),
-            tool: z
-              .string()
-              .optional()
-              .describe("For an agent step, the exact tool name it needs -- it must also be in requiredTools"),
             doneWhen: z.string().describe("The observable condition that means this step is finished"),
           })
         )
         .min(2)
         .max(10)
-        .describe("Ordered steps from approval to the first dollar, including the ones only a human can do"),
+        .describe("Ordered launch outline a human would follow, cheapest validation test first, ending at the first revenue"),
     },
-    async ({
-      domain,
-      description,
-      expectedCost,
-      expectedTimeHours,
-      expectedUpside,
-      requiredTools,
-      revenueModel,
-      monetization,
-      steps,
-    }) => {
-      // The steps and the fence have to be the same statement, not two pieces of prose that
-      // happen to sit on one row. An agent-owned step naming a tool the proposal isn't asking
-      // for means one of the two is wrong, and which one it is isn't guessable from here --
-      // so it goes back to the model rather than being silently reconciled. Refused in band,
-      // like the duplicate check below.
-      const missing = steps
-        .filter((s) => s.owner === "agent" && s.tool && !requiredTools.includes(s.tool))
-        .map((s) => `"${s.title}" needs ${s.tool}`);
-      if (missing.length > 0) {
+    async ({ domain, description, expectedCost, expectedTimeHours, expectedUpside, revenueModel, monetization, market, steps }) => {
+      // In band, like the duplicate check below: a source that isn't a URL can't be checked by
+      // the deep dive or clicked by the operator, so it goes back to the model to fix.
+      const badSources = market.demandEvidence.filter((d) => !httpUrl(d.sourceUrl)).map((d) => d.sourceUrl);
+      if (badSources.length > 0) {
         return [
-          `Not created -- ${missing.length} step${missing.length === 1 ? "" : "s"} name a tool that isn't in requiredTools:`,
-          ...missing.map((m) => `  - ${m}`),
-          `requiredTools is: ${requiredTools.join(", ") || "(empty)"}`,
-          `The act phase is fenced to exactly requiredTools, so a step needing anything else cannot run. Either add the tool to requiredTools, or change that step's owner to "human" if a person has to do it.`,
+          `Not created -- every demandEvidence item needs an http(s) URL you actually read. These aren't:`,
+          ...badSources.map((u) => `  - ${JSON.stringify(u)}`),
+          `Replace them with the page the claim came from, or drop the claim.`,
         ].join("\n");
       }
 
@@ -2537,11 +2621,11 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
           `[proposal_create] refused a near-duplicate of #${proposal.id} (${score.toFixed(2)} overlap)`
         );
         return [
-          `Not created -- this is too close to proposal #${proposal.id}, which is ${state}.`,
+          `Not created -- this is too close to idea #${proposal.id}, which is ${state}.`,
           `Overlap: ${(score * 100).toFixed(0)}% of the distinctive terms in the two are shared (${shared.slice(0, 12).join(", ")}).`,
           `#${proposal.id} [${proposal.domain}]: ${proposal.description.split("\n").find((l) => l.trim()) ?? proposal.description}`,
-          `Re-proposing it doesn't get it built any sooner -- it only buries the original in the review queue.`,
-          `If there is real work left here, propose the concrete *next step* on #${proposal.id} instead: name that id in your description and scope it to what #${proposal.id} does not already cover. If your idea genuinely differs, say how in the description -- restating the same pitch in different words will be refused again.`,
+          `Re-proposing it doesn't get it reviewed any sooner -- it only buries the original in the review queue.`,
+          `If your idea genuinely differs (a different buyer, market, geography or price point), say how in the description -- restating the same pitch in different words will be refused again.`,
         ].join("\n");
       }
 
@@ -2551,44 +2635,69 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
         expectedCost,
         expectedTimeHours,
         expectedUpside,
-        requiredTools,
         goalId: store.resolveGoalId(domain),
         revenueModel,
         monetization,
         steps,
+        market,
       });
-      return `Created proposal #${id}, status: pending. Stop here and wait for review -- do not act on it.`;
+      return `Created idea #${id}, status: pending. A human reviews it next; if approved, you will investigate it in depth.`;
     }
   );
 
-  const actionHistorySearch = defineTool(
-    "action_history_search",
-    "See real-world actions already taken on approved proposals (repos created, sites deployed, files committed, etc.), optionally filtered to one domain. Call this before proposing new work so you don't duplicate something already built or deployed.",
+  const reportSubmit = defineTool(
+    "report_submit",
+    "Submit the feasibility report for the idea whose deep dive you are running. This is the deep dive's one " +
+      "required output, and calling it ends the investigation. A clear 'drop' is as valuable as a 'pursue'.",
     {
-      domain: z.string().optional().describe("Filter to one domain; omit to see recent action history across all domains"),
-      limit: z.number().int().positive().max(50).optional(),
+      proposalId: z.number().int().describe("The id of the idea you were asked to investigate"),
+      verdict: z.enum(REPORT_VERDICTS).describe("pursue = worth a human's time and money now; maybe = promising with open questions; drop = not viable"),
+      viabilityScore: z.number().int().min(1).max(5),
+      confidence: z.enum(CONFIDENCE_LEVELS),
+      summary: z.string().describe("Two to four sentences: the verdict and the reasons that decided it"),
+      body: z
+        .string()
+        .describe(
+          "The full report in Markdown: '## ' section headings, '- ' bullets, [text](url) links. No tables. " +
+            "Separate measured figures from estimates, and cite sources inline."
+        ),
+      sources: z
+        .array(z.object({ title: z.string(), url: z.string(), note: z.string().optional() }))
+        .min(1)
+        .max(40)
+        .describe("Every source the report relies on"),
     },
-    async ({ domain, limit }) => {
-      // Both filters, not either: goal_id reaches work filed under this goal, the text match
-      // reaches work built before goals existed (and under whatever the model called the domain
-      // that cycle). Filtering by id alone would report "nothing built here" for a lane that has
-      // shipped, which is the exact failure this tool exists to prevent.
-      const n = limit ?? 20;
-      const rows = store.listActionHistory({ goalId: store.resolveGoalId(domain) ?? undefined, text: domain }, n);
-      if (rows.length > 0 || !domain) return JSON.stringify(rows, null, 2);
+    async ({ proposalId, verdict, viabilityScore, confidence, summary, body, sources }) => {
+      const proposal = store.getProposal(proposalId);
+      if (!proposal) return `Not saved -- there is no idea #${proposalId}. Use the id you were asked to investigate.`;
+      // Only the idea whose deep dive is in flight. Without this a deep dive could file a report
+      // on some other idea, and the operator would read a verdict nobody asked for.
+      if (proposal.status !== "approved" || proposal.act_status !== "running") {
+        return `Not saved -- idea #${proposalId} is not the one being investigated right now. Submit the report for the idea named in your instructions.`;
+      }
+      if (body.trim().length < 600) {
+        return `Not saved -- the body is ${body.trim().length} characters. A feasibility report needs the full sections you were asked for, with evidence; write it out and submit again.`;
+      }
+      const badSources = sources.filter((s) => !httpUrl(s.url)).map((s) => s.url);
+      if (badSources.length > 0) {
+        return [
+          `Not saved -- every source needs an http(s) URL. These aren't:`,
+          ...badSources.map((u) => `  - ${JSON.stringify(u)}`),
+        ].join("\n");
+      }
 
-      // A filtered miss is not evidence that nothing has been built. The old exact-domain filter
-      // answered "[]" for every configured domain while 140 act-phase actions sat in the table,
-      // and "[]" reads as "this space is clear" -- the most expensive thing this tool can say
-      // wrongly. Widen to recent history across all goals and label it, so the model gets the
-      // real picture and knows the filter, not the record, is what came up empty.
-      const recent = store.listActionHistory({}, n);
-      if (recent.length === 0) return "[]";
-      return [
-        `No act-phase actions matched "${domain}" specifically. Showing recent history across all goals instead --`,
-        `the domain wording may differ from what past cycles used, so check these before assuming nothing exists here.`,
-        JSON.stringify(recent, null, 2),
-      ].join("\n");
+      const id = store.createReport({
+        proposalId,
+        goalId: proposal.goal_id,
+        verdict,
+        viabilityScore,
+        confidence,
+        summary,
+        body,
+        sources,
+      });
+      emitAgentEvent({ type: "report_submitted", proposalId, reportId: id, verdict, viabilityScore });
+      return `Saved report #${id} on idea #${proposalId}. The deep dive is complete -- stop here.`;
     }
   );
 
@@ -2648,30 +2757,12 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
 
   const proposalStatus = defineTool(
     "proposal_status",
-    "Check whether a previously created proposal has been approved, rejected, or is still pending.",
+    "Check whether a previously filed idea has been approved, rejected, or is still pending.",
     { id: z.number().int() },
     async ({ id }) => {
       const row = store.getProposal(id);
       if (!row) return "No such proposal";
       return JSON.stringify(row, null, 2);
-    }
-  );
-
-  const outcomeRecord = defineTool(
-    "outcome_record",
-    "Record what actually happened after executing an approved proposal -- real revenue, real cost (including time value if relevant), and whether it succeeded. Be honest here; the reflect phase depends on it.",
-    {
-      proposalId: z.number().int(),
-      actualRevenue: z.number(),
-      actualCost: z.number(),
-      actualTimeHours: z.number().optional(),
-      success: z.boolean(),
-      notes: z.string().optional(),
-    },
-    async ({ proposalId, actualRevenue, actualCost, actualTimeHours, success, notes }) => {
-      const id = store.recordOutcome({ proposalId, actualRevenue, actualCost, actualTimeHours, success, notes });
-      emitAgentEvent({ type: "outcome_recorded", proposalId });
-      return `Recorded outcome #${id}`;
     }
   );
 
@@ -2683,8 +2774,7 @@ export function buildMemoryTools(store: MemoryStore): ToolDefinition[] {
     lessonReinforce,
     proposalCreate,
     proposalStatus,
-    outcomeRecord,
-    actionHistorySearch,
+    reportSubmit,
     goalSuggest,
   ]);
 }

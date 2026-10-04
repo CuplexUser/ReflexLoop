@@ -151,17 +151,24 @@ describe("bundled connectors", () => {
   });
 
   it("reads configuration from the environment at call time, not at import", () => {
-    const stripe = CONNECTORS.find((c) => c.manifest.id === "stripe");
-    expect(stripe).toBeDefined();
-    const manifest = stripe!.manifest;
+    const dataforseo = CONNECTORS.find((c) => c.manifest.id === "dataforseo");
+    expect(dataforseo).toBeDefined();
+    const manifest = dataforseo!.manifest;
+    const tool = dataforseo!.operations[0].toolName;
 
-    delete process.env.STRIPE_API_KEY;
+    delete process.env.DATAFORSEO_AUTH;
     expect(isConfigured(manifest)).toBe(false);
-    expect(configuredConnectorTools()).not.toContain("mcp__integrations__stripe_list_products");
+    expect(configuredConnectorTools()).not.toContain(tool);
 
-    process.env.STRIPE_API_KEY = "sk_test_1";
+    process.env.DATAFORSEO_AUTH = "login:password";
     expect(isConfigured(manifest)).toBe(true);
-    expect(configuredConnectorTools()).toContain("mcp__integrations__stripe_list_products");
+    expect(configuredConnectorTools()).toContain(tool);
+  });
+
+  it("are all reads -- this agent has no write tools", () => {
+    for (const { operations } of CONNECTORS) {
+      for (const op of operations) expect(op.spec.risk).toBe("read");
+    }
   });
 });
 
@@ -201,22 +208,22 @@ describe("loading from AGENT_CONNECTORS_DIR", () => {
     expect(loaded.CONNECTOR_ERRORS).toEqual([]);
     expect(loaded.CONNECTOR_READ_TOOLS).toContain("mcp__integrations__custom_read_thing");
     // Bundled connectors are still there.
-    expect(loaded.CONNECTOR_READ_TOOLS).toContain("mcp__integrations__stripe_list_products");
+    expect(loaded.CONNECTOR_READ_TOOLS).toContain("mcp__integrations__hn_search");
   });
 
   it("refuses an operation name a bundled connector already owns, naming the owner", async () => {
     write("clash.json", {
       ...validManifest,
       id: "clash",
-      operations: [{ ...validOperation, name: "stripe_list_products" }],
+      operations: [{ ...validOperation, name: "hn_search" }],
     });
 
     const loaded = await loadFrom();
     // ToolRegistry would throw "Duplicate tool name" at startup with no clue which two
     // files disagree; this is the same refusal with the answer attached.
     expect(loaded.CONNECTOR_ERRORS).toHaveLength(1);
-    expect(loaded.CONNECTOR_ERRORS[0].message).toContain('operation "stripe_list_products" is already defined by');
-    expect(loaded.CONNECTOR_ERRORS[0].message).toContain("stripe.json");
+    expect(loaded.CONNECTOR_ERRORS[0].message).toContain('operation "hn_search" is already defined by');
+    expect(loaded.CONNECTOR_ERRORS[0].message).toContain("hackernews.json");
   });
 
   it("skips a malformed manifest instead of taking the process down with it", async () => {
@@ -231,6 +238,20 @@ describe("loading from AGENT_CONNECTORS_DIR", () => {
     expect(loaded.CONNECTOR_ERRORS).toHaveLength(1);
     expect(loaded.CONNECTOR_ERRORS[0].source).toContain("broken.json");
     expect(loaded.CONNECTOR_READ_TOOLS).toContain("mcp__integrations__fine_read_thing");
+  });
+
+  it("refuses a write operation -- research-only means no connector can change anything", async () => {
+    write("writer.json", {
+      ...validManifest,
+      id: "writer",
+      operations: [{ ...validOperation, name: "writer_send_thing", risk: "write", method: "POST" }],
+    });
+
+    const loaded = await loadFrom();
+    expect(loaded.CONNECTOR_ERRORS).toHaveLength(1);
+    expect(loaded.CONNECTOR_ERRORS[0].message).toContain("operations.0.risk");
+    expect(loaded.CONNECTOR_ERRORS[0].message).toContain("research-only");
+    expect(loaded.CONNECTOR_READ_TOOLS).not.toContain("mcp__integrations__writer_send_thing");
   });
 
   it("records a schema violation as a load error with the offending path", async () => {

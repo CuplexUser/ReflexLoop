@@ -66,7 +66,7 @@ export interface AgentRunOptions {
  */
 export type AgentStopReason = "end_turn" | "max_turns" | "truncated";
 
-/** A tool call the run made, as the nudge callback and the act verifier both see it. */
+/** A tool call the run made, as the nudge callback and the deep-dive verifier both see it. */
 export interface ObservedCall {
   name: string;
   isError: boolean;
@@ -75,10 +75,10 @@ export interface ObservedCall {
 /**
  * How many times one run may be told it isn't finished.
  *
- * Two, not one, because the realistic recovery is two-step: the first nudge gets the build
- * committed, and the model can then still stop without calling `outcome_record` -- a second
- * nudge catches that. Capped low regardless: a model that ignores being told twice is stuck,
- * and further nudges just spend money on the same turn. The act verdict handles it from there.
+ * Two, not one, because a first nudge is often answered with more research rather than the
+ * required output (a deep dive told to submit its report goes and checks one more source), and
+ * a second catches that. Capped low regardless: a model that ignores being told twice is stuck,
+ * and further nudges just spend money on the same turn. The caller's verdict handles it from there.
  */
 const MAX_NUDGES = 2;
 
@@ -92,10 +92,10 @@ const EMPTY_TURN_PLACEHOLDER = "(no output)";
 /**
  * How much of a cut-off turn is replayed to the model when it gets nudged.
  *
- * A turn that overflowed the output limit without calling a tool is a model writing a file
- * out as prose instead of putting it in the tool call -- 32k tokens of an unfinished
+ * A turn that overflowed the output limit without calling a tool is a model writing a long
+ * document out as prose instead of putting it in the tool call -- 32k tokens of an unfinished
  * something. Replaying it verbatim is the worst of both: the fragment is unusable (nothing
- * can be committed from it), and it stays in the context window for every remaining turn,
+ * can be saved from it), and it stays in the context window for every remaining turn,
  * making the *next* turn more likely to overflow the same way. Only the opening survives,
  * as a reminder of what it was starting, and the instruction below says what to do instead.
  */
@@ -113,14 +113,14 @@ function truncatedTurnSummary(text: string): string {
  *
  * Without it the model is told "you didn't finish, do X" -- advice it already agreed with, and
  * following it the same way overflows again. What it actually needs to know is that long
- * content belongs in the tool call, in pieces small enough to land.
+ * content belongs in the tool call, at a length that fits.
  */
 function truncationNudge(): string {
   return (
     `Your previous message ran past the ${MAX_OUTPUT_TOKENS}-token output limit and was cut off before ` +
     `you called any tool, so none of it was saved and it has been trimmed out of this conversation. ` +
-    `Don't write file contents or long explanations as a message -- put them in the tool call itself, ` +
-    `and split the work into several smaller calls (a large file per call, not the whole build in one).`
+    `Don't write a report or long explanations as a message -- put the content in the tool call itself, ` +
+    `and keep it to a length that fits in one call.`
   );
 }
 

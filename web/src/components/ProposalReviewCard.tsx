@@ -5,6 +5,7 @@ import { palette } from '../theme'
 import { timeAgo } from '../format'
 import { MarkdownLite } from './MarkdownLite'
 import { MonetizationSummary } from './MonetizationBlock'
+import { MarketSummary } from './MarketBlock'
 import { DecisionControls } from './DecisionControls'
 
 const { Title, Text } = Typography
@@ -20,10 +21,10 @@ export function ProposalReviewCard({ proposal }: { proposal: ProposalRow }) {
         <Space align="center" size={10} wrap>
           <WarningOutlined style={{ color: palette.pending, fontSize: 18 }} />
           <Title level={4} style={{ margin: 0 }}>
-            Proposal #{proposal.id} awaiting your decision
+            Idea #{proposal.id} awaiting your decision
           </Title>
           <Tag color="default">{proposal.domain}</Tag>
-          {/* How long someone has been sitting on this -- a proposal blocks its act phase until decided. */}
+          {/* How long someone has been sitting on this -- an idea waits for its deep dive until decided. */}
           <Tooltip title={new Date(proposal.created_at).toLocaleString()}>
             <Text type="secondary" style={{ fontSize: 12 }}>
               pending {timeAgo(proposal.created_at)}
@@ -34,17 +35,18 @@ export function ProposalReviewCard({ proposal }: { proposal: ProposalRow }) {
         <MarkdownLite text={proposal.description} style={{ maxWidth: 820 }} />
 
         {/*
-          Compact on purpose — this card is where the decision is made, and the money path is
-          the part of it that used to be missing entirely. The full block (assumption,
-          validation signal, per-step detail) is one click away in the dialog.
+          Compact on purpose — this card is where the decision is made. The market read and the
+          money path are the two things it turns on; the full blocks (evidence links, assumption,
+          launch outline) are one click away in the dialog.
         */}
+        <MarketSummary proposal={proposal} />
         <MonetizationSummary proposal={proposal} />
 
         <Space size={40} wrap>
-          <Statistic title="Expected cost" value={proposal.expected_cost} precision={2} prefix="$" />
-          <Statistic title="Expected time" value={proposal.expected_time_hours} suffix="h" />
+          <Statistic title="Est. cost to validate" value={proposal.expected_cost} precision={2} prefix="$" />
+          <Statistic title="Est. hours to first signal" value={proposal.expected_time_hours} suffix="h" />
           <Statistic
-            title="Expected upside"
+            title="Est. first-year revenue"
             value={proposal.expected_upside}
             precision={2}
             prefix="$"

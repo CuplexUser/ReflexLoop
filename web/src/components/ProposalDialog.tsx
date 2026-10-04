@@ -1,16 +1,19 @@
 import { useEffect, useState } from 'react'
-import { App, Button, Descriptions, Modal, Skeleton, Space, Statistic, Table, Tag, Tooltip, Typography } from 'antd'
-import { ClockCircleOutlined, EditOutlined, PlayCircleOutlined } from '@ant-design/icons'
-import type { ActionRow, OutcomeRow, ProposalRow, RunRow } from '../types'
+import { App, Button, Collapse, Descriptions, Modal, Skeleton, Space, Statistic, Table, Tag, Tooltip, Typography } from 'antd'
+import { ClockCircleOutlined, PlayCircleOutlined } from '@ant-design/icons'
+import { Link } from 'react-router-dom'
+import type { ActionRow, OutcomeRow, ProposalRow, ReportRow, RunRow } from '../types'
 import { api } from '../api'
 import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
 import { UNFINISHED_ACT, canRerun, rerunConfirm, rerunLabel } from '../actStatus'
-import { PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, preview, recurrenceLabel, timeAgo } from '../format'
+import { PHASE_LABEL, PRIORITY_LABEL, PRIORITY_TAG_COLOR, inWords, preview, recurrenceLabel, timeAgo } from '../format'
+import { VERDICT_LABEL, VERDICT_TAG } from '../report'
 import { palette } from '../theme'
 import { MarkdownLite } from './MarkdownLite'
 import { MonetizationBlock } from './MonetizationBlock'
+import { MarketBlock } from './MarketBlock'
+import { ReportView } from './ReportView'
 import { DecisionControls } from './DecisionControls'
-import { ToolFence } from './ToolFence'
 
 const STATUS_COLOR: Record<ProposalRow['status'], string> = {
   pending: 'warning',
@@ -33,18 +36,20 @@ export function ProposalDialog({
   const readOnly = useConsoleOnly()
   const [actions, setActions] = useState<ActionRow[] | null>(null)
   const [runs, setRuns] = useState<RunRow[]>([])
+  const [reports, setReports] = useState<ReportRow[] | null>(null)
   const [cancellingSchedule, setCancellingSchedule] = useState(false)
   const [rerunning, setRerunning] = useState(false)
-  const [editingScope, setEditingScope] = useState(false)
-  const [scopeTools, setScopeTools] = useState<string[]>([])
-  const [savingScope, setSavingScope] = useState(false)
 
   useEffect(() => {
     if (!open || !proposal) return
     setActions(null)
     setRuns([])
-    setEditingScope(false)
+    setReports(null)
     let cancelled = false
+    api
+      .proposalReports(proposal.id)
+      .then((rows) => !cancelled && setReports(rows))
+      .catch(() => !cancelled && setReports([]))
     api
       .proposalActions(proposal.id)
       .then((rows) => !cancelled && setActions(rows))
@@ -60,42 +65,18 @@ export function ProposalDialog({
 
   if (!proposal) return null
 
-  const tools = proposal.required_tools
+  // Only legacy build-mode proposals carry a fence. Shown as plain history: those tools no
+  // longer exist, and nothing reads the column any more.
+  const legacyTools = proposal.required_tools
     .split(',')
-    .map((t) => t.trim())
+    .map((t) => t.trim().replace(/^mcp__(memory|integrations)__/, ''))
     .filter(Boolean)
-  const originalTools = proposal.original_required_tools
-    ?.split(',')
-    .map((t) => t.trim())
-    .filter(Boolean)
+  const latestReport = reports?.[0]
+  const earlierReports = reports?.slice(1) ?? []
 
-  // The server enforces the same rule and 409s if we get it wrong; this just keeps the
-  // button from appearing when it would obviously fail. `actions === null` means the fetch
-  // hasn't landed yet, so hold off rather than offering an edit we may have to reject.
-  const hasActed = (actions ?? []).some((a) => a.phase === 'act')
-  // Read-only console: this endpoint is refused there, and narrowing a fence that no act phase
-  // will read is meaningless anyway, so don't offer the edit at all.
-  const scopeEditable = proposal.status === 'approved' && actions !== null && !hasActed && !readOnly
-
-  async function saveScope() {
+  function rerunDeepDive() {
     if (!proposal) return
-    setSavingScope(true)
-    try {
-      await api.editScope(proposal.id, { requiredTools: scopeTools })
-      message.success(`Fence updated on proposal #${proposal.id}`)
-      setEditingScope(false)
-    } catch (err) {
-      message.error(err instanceof Error ? err.message : 'Editing the fence failed')
-    } finally {
-      setSavingScope(false)
-    }
-  }
-
-  function rerunBuild() {
-    if (!proposal) return
-    // A finished build is re-run deliberately or not at all -- see rerunConfirm. The dialog is
-    // the same one the Deliverables card raises, from the same helper, because the two buttons
-    // dispatch the same act phase.
+    // A finished deep dive is re-run deliberately or not at all -- see rerunConfirm.
     const confirm = rerunConfirm(proposal.act_status)
     if (confirm) {
       modal.confirm({ ...confirm, onOk: () => dispatchRerun() })
@@ -108,13 +89,13 @@ export function ProposalDialog({
     if (!proposal) return
     setRerunning(true)
     try {
-      await api.rerunBuild(proposal.id)
+      await api.rerunDeepDive(proposal.id)
       // "Queued" rather than "started": the scheduler picks it up on its own tick, and telling
-      // someone a build is running when it hasn't begun sends them looking for output that
-      // isn't there yet.
-      message.success(`Build queued — proposal #${proposal.id} runs on the next scheduler tick`)
+      // someone it is running when it hasn't begun sends them looking for output that isn't
+      // there yet.
+      message.success(`Deep dive queued — idea #${proposal.id} runs on the next scheduler tick`)
     } catch (err) {
-      message.error(err instanceof Error ? err.message : 'Queueing the build failed')
+      message.error(err instanceof Error ? err.message : 'Queueing the deep dive failed')
     } finally {
       setRerunning(false)
     }
@@ -143,9 +124,14 @@ export function ProposalDialog({
       destroyOnClose
       title={
         <Space align="center" size={10} wrap>
-          <span>Proposal #{proposal.id}</span>
+          <span>Idea #{proposal.id}</span>
           <Tag color={STATUS_COLOR[proposal.status]}>{proposal.status}</Tag>
           <Tag color="default">{proposal.domain}</Tag>
+          {latestReport && (
+            <Tag color={VERDICT_TAG[latestReport.verdict]}>
+              {VERDICT_LABEL[latestReport.verdict]} {latestReport.viability_score}/5
+            </Tag>
+          )}
           {proposal.status === 'pending' && (
             <Typography.Text type="secondary" style={{ fontSize: 12, fontWeight: 400 }}>
               pending {timeAgo(proposal.created_at)}
@@ -166,18 +152,80 @@ export function ProposalDialog({
 
         {proposal.human_notes && (
           <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-            <Typography.Text strong>Human notes: </Typography.Text>
+            <Typography.Text strong>
+              {proposal.status === 'rejected' ? 'Rejection reason: ' : 'Operator notes / focus questions: '}
+            </Typography.Text>
             {proposal.human_notes}
           </Typography.Paragraph>
         )}
 
+        {/* The deep dive's verdict leads, once there is one -- it is what this idea came to. */}
+        {proposal.status === 'approved' && (
+          <div>
+            <Space align="center" size={8} style={{ marginBottom: 8 }}>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                DEEP-DIVE REPORT
+              </Typography.Text>
+              {latestReport && (
+                <Link to={`/reports/${latestReport.id}`} onClick={onClose} style={{ fontSize: 12 }}>
+                  open report #{latestReport.id}
+                </Link>
+              )}
+            </Space>
+            {reports === null ? (
+              <Skeleton active paragraph={{ rows: 3 }} />
+            ) : latestReport ? (
+              <>
+                <ReportView report={latestReport} />
+                {earlierReports.length > 0 && (
+                  <Collapse
+                    size="small"
+                    style={{ marginTop: 12 }}
+                    items={[
+                      {
+                        key: 'earlier',
+                        label: `${earlierReports.length} earlier report${earlierReports.length === 1 ? '' : 's'}`,
+                        children: (
+                          <Space direction="vertical" size={4}>
+                            {earlierReports.map((r) => (
+                              <Space key={r.id} size={6} wrap>
+                                <Link to={`/reports/${r.id}`} onClick={onClose}>
+                                  #{r.id}
+                                </Link>
+                                <Tag color={VERDICT_TAG[r.verdict]}>
+                                  {VERDICT_LABEL[r.verdict]} {r.viability_score}/5
+                                </Tag>
+                                <Typography.Text type="secondary">{timeAgo(r.created_at)}</Typography.Text>
+                              </Space>
+                            ))}
+                          </Space>
+                        ),
+                      },
+                    ]}
+                  />
+                )}
+              </>
+            ) : (
+              <Typography.Text type="secondary">
+                {proposal.market_json === null && legacyTools.length > 0
+                  ? 'Approved in the retired build mode, so it has no deep-dive report. Run a deep dive to get one.'
+                  : proposal.act_status === 'running'
+                    ? 'The deep dive is running; its report lands here when it is submitted.'
+                    : 'No report yet.'}
+              </Typography.Text>
+            )}
+          </div>
+        )}
+
+        <MarketBlock proposal={proposal} />
+
         <MonetizationBlock proposal={proposal} />
 
         <Space size={40} wrap>
-          <Statistic title="Expected cost" value={proposal.expected_cost} precision={2} prefix="$" />
-          <Statistic title="Expected time" value={proposal.expected_time_hours} suffix="h" />
+          <Statistic title="Est. cost to validate" value={proposal.expected_cost} precision={2} prefix="$" />
+          <Statistic title="Est. hours to first signal" value={proposal.expected_time_hours} suffix="h" />
           <Statistic
-            title="Expected upside"
+            title="Est. first-year revenue"
             value={proposal.expected_upside}
             precision={2}
             prefix="$"
@@ -194,72 +242,25 @@ export function ProposalDialog({
           )}
         </Space>
 
-        {/*
-          Pending proposals get the editable fence inside DecisionControls. An approved one
-          stays editable here until its act phase starts — a queued or scheduled proposal you
-          can see is slightly wrong should be narrowable without cancelling it outright.
-          Once it has acted the fence is history, so it's read-only.
-        */}
-        {proposal.status !== 'pending' && (
-          <div>
-            <Space align="center" size={8} style={{ marginBottom: editingScope ? 4 : 0 }}>
-              {scopeEditable && !editingScope && (
-                <Button
-                  size="small"
-                  icon={<EditOutlined />}
-                  onClick={() => {
-                    setScopeTools(tools)
-                    setEditingScope(true)
-                  }}
-                >
-                  Edit fence
-                </Button>
-              )}
-              {editingScope && (
-                <>
-                  <Button size="small" type="primary" loading={savingScope} onClick={saveScope}>
-                    Save fence
-                  </Button>
-                  <Button
-                    size="small"
-                    onClick={() => {
-                      setEditingScope(false)
-                      setScopeTools(tools)
-                    }}
-                  >
-                    Cancel
-                  </Button>
-                </>
-              )}
-            </Space>
-            <ToolFence
-              tools={editingScope ? scopeTools : tools}
-              editable={editingScope}
-              onChange={setScopeTools}
-            />
-            {originalTools && (
-              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                Fence edited — the model asked for: {originalTools.join(', ')}
-              </Typography.Text>
-            )}
-          </div>
+        {legacyTools.length > 0 && (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            Legacy build-mode tool fence: <span className="mono">{legacyTools.join(', ')}</span>
+          </Typography.Text>
         )}
 
         {proposal.status === 'approved' && (
           <Space align="center" size={10} wrap>
             <Tag color={PRIORITY_TAG_COLOR[proposal.priority]}>{PRIORITY_LABEL[proposal.priority]} priority</Tag>
-            {/* Why the build isn't done, next to the button that does something about it. An
-                unfinished act phase is descheduled at startup rather than re-run, so without a
-                control here the only way to resume one was a curl. */}
+            {/* Why there is no report, next to the button that does something about it. */}
             {UNFINISHED_ACT[proposal.act_status ?? ''] && (
               <Tooltip title={UNFINISHED_ACT[proposal.act_status ?? '']}>
                 <Tag color={proposal.act_status === 'running' ? 'processing' : 'error'}>
-                  build {proposal.act_status}
+                  deep dive {proposal.act_status}
                 </Tag>
               </Tooltip>
             )}
             {canRerun(proposal) && (
-              <Tooltip title={readOnly ? READ_ONLY_HINT : 'Queue this proposal’s act phase to run again'}>
+              <Tooltip title={readOnly ? READ_ONLY_HINT : 'Queue a deep dive on this idea'}>
                 <Button
                   size="small"
                   type="primary"
@@ -267,7 +268,7 @@ export function ProposalDialog({
                   icon={<PlayCircleOutlined />}
                   loading={rerunning}
                   disabled={readOnly}
-                  onClick={rerunBuild}
+                  onClick={rerunDeepDive}
                 >
                   {rerunLabel(proposal.act_status)}
                 </Button>
@@ -297,7 +298,7 @@ export function ProposalDialog({
         )}
 
         {outcome && (
-          <Descriptions size="small" column={4} bordered>
+          <Descriptions size="small" column={4} bordered title="Legacy outcome (build mode)">
             <Descriptions.Item label="Actual revenue">${outcome.actual_revenue.toFixed(2)}</Descriptions.Item>
             <Descriptions.Item label="Actual cost">${outcome.actual_cost.toFixed(2)}</Descriptions.Item>
             <Descriptions.Item label="Actual time">{outcome.actual_time_hours ?? '—'}h</Descriptions.Item>
@@ -328,7 +329,7 @@ export function ProposalDialog({
               scroll={{ x: 620 }}
               locale={{ emptyText: 'No tool calls logged' }}
               columns={[
-                { title: 'Phase', dataIndex: 'phase', width: 110 },
+                { title: 'Phase', dataIndex: 'phase', width: 110, render: (v: string) => PHASE_LABEL[v] ?? v },
                 { title: 'Tool', dataIndex: 'tool_name', width: 200, render: (v) => <span className="mono">{v}</span> },
                 { title: 'Input', dataIndex: 'tool_input', render: (v) => <span className="mono">{preview(v, 100)}</span> },
                 {

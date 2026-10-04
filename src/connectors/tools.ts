@@ -1,8 +1,8 @@
 // src/connectors/tools.ts
 //
 // Turns loaded manifests into ordinary ToolDefinitions. Everything downstream --
-// the fence in agent-loop.ts, `actions.tool_name`, the console's prefix-stripping,
-// the deliverables derivation -- sees a connector tool and a native one as the same
+// the fence in agent-loop.ts, `actions.tool_name`, the console's prefix-stripping --
+// sees a connector tool and a native one as the same
 // kind of thing, which is the point: the manifest layer is a cheaper way to write a
 // tool, not a second class of tool with its own rules.
 //
@@ -95,7 +95,7 @@ function authQuery(manifest: ConnectorManifest): [string, string] | null {
 
 /**
  * Values go on the wire under the provider's own name (`as`), so a tool argument can
- * read as `priceId` while Stripe receives `line_items[0][price]`.
+ * read as `priceId` while a form-encoded API receives `line_items[0][price]`.
  */
 function wireName(name: string, param: ParamSpec): string {
   return param.as ?? name;

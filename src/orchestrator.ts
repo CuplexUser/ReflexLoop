@@ -1,29 +1,35 @@
 // src/orchestrator.ts
 //
-// Drives agents through: RESEARCH+PLAN -> HUMAN REVIEW -> ACT -> OUTCOME+REFLECT.
+// Drives agents through: RESEARCH -> HUMAN REVIEW -> DEEP DIVE -> REFLECT.
 // No subagents anywhere -- the tool registry has no tool that spawns one, and the
 // loop in agent-loop.ts only ever dispatches tools from that registry.
+//
+// This is a research agent. It never builds, launches, buys, publishes or contacts
+// anyone: no tool in the registry changes anything outside its own database (see
+// tool-catalog.ts). What a human approval buys is a deep dive -- a longer, read-only
+// investigation of one idea that ends in a written feasibility report.
 //
 // The model behind this is whatever AGENT_PROVIDER/AGENT_MODEL name (OpenRouter,
 // OpenAI, Anthropic, xAI or Moonshot); nothing in this file is provider-specific.
 //
 // Concurrency model: research runs one cycle at a time (on CYCLE_INTERVAL_MS),
-// and can produce more than one proposal per cycle across AGENT_DOMAINS.
-// Every new proposal immediately starts waiting for review in parallel with
-// any others already pending -- a human can triage several at once. Once
-// approved, a proposal's act+reflect phases are serialized through a single
-// queue (scheduleActAndReflect) so real-world side-effecting tool calls
-// never run concurrently with each other, even if several proposals are
-// approved back to back.
+// and can file more than one idea per cycle across the active goals. Every new
+// idea immediately starts waiting for review in parallel with any others already
+// pending -- a human can triage several at once. Once approved, an idea's deep
+// dive and reflect run through a single priority-ordered queue, one at a time,
+// which bounds spend and provider rate limits rather than guarding side effects.
+//
+// The deep dive keeps the persisted phase key "act" (runs.phase, actions.phase, the
+// actModel setting, AGENT_ACT_*): that history predates the switch to research-only,
+// and renaming the key would split one ledger column in two for no behavioral gain.
 //
 // Run with: npx tsx src/orchestrator.ts
 
 import "dotenv/config";
 import { runAgent, type AgentRunOptions, type AgentStopReason } from "./agent-loop.js";
-import { verifyAct, type ActVerdict } from "./act-verification.js";
+import { deepDiveNudge, verifyDeepDive, type DeepDiveVerdict } from "./deep-dive.js";
 import { isAbortError } from "./aborted.js";
 import { describeClients, getLlmClients } from "./llm/index.js";
-import { isTruncationStop } from "./llm/types.js";
 import { isConsoleOnlyMode } from "./console-mode.js";
 import { getSearchConfig } from "./search/index.js";
 import { ToolRegistry } from "./tools/registry.js";
@@ -33,26 +39,27 @@ import {
   buildMemoryTools,
   compareByPriorityThenDue,
   goalTitleFromDomain,
+  parseMarket,
   parseMonetization,
   parseSteps,
   preview,
   type GoalRow,
   type Priority,
   type ProposalRow,
+  type ReportRow,
 } from "./memory-server.js";
 import { buildIntegrationsTools } from "./integrations-server.js";
 import { buildConnectorTools } from "./connectors/tools.js";
 import { configuredConnectorTools, connectorOperation } from "./connectors/load.js";
 import {
+  DEEP_DIVE_OUTPUT_TOOLS,
   MEMORY_TOOLS,
   READONLY_BUILTIN_TOOLS,
   READONLY_INTEGRATION_TOOLS,
   RESEARCH_OUTPUT_TOOLS,
-  WRITE_INTEGRATION_TOOLS,
 } from "./tool-catalog.js";
 import { emitAgentEvent } from "./events.js";
 import { hasPendingDecision, waitForDecision } from "./review-gateway.js";
-import { onReactiveTrigger } from "./reactive-triggers.js";
 import {
   consumeDirective,
   getControlState,
@@ -67,7 +74,7 @@ import { createShutdown, SHUTDOWN_SIGNALS } from "./shutdown.js";
 import { ControlSettingsWriter } from "./control-settings-writer.js";
 import { getSetting, initSettings, onSettingsChanged } from "./settings.js";
 
-const DOMAINS = (process.env.AGENT_DOMAINS ?? "micro-SaaS tool for developers (self-built and self-hosted),Chrome extension for developers,VS Code extension for developers")
+const DOMAINS = (process.env.AGENT_DOMAINS ?? "low-startup-cost service businesses,underserved B2B niches for small businesses,consumer subscription or digital products")
   .split(",")
   .map((d) => d.trim())
   .filter(Boolean);
@@ -114,9 +121,10 @@ function loadConfigOrExit<T>(load: () => T): T {
 }
 
 // One client per phase. They're usually the same model, but they don't have to be:
-// research is wide and cheap to get wrong, act writes real code into real repos with
-// no build step to catch mistakes, and reflect is two short memory calls. See the
-// AGENT_*_PROVIDER / AGENT_*_MODEL overrides in llm/index.ts.
+// research is wide and cheap to get wrong, the deep dive (persisted phase key "act") is
+// the longest and most source-heavy phase and the one whose report a human acts on, and
+// reflect is two short memory calls. See the AGENT_*_PROVIDER / AGENT_*_MODEL overrides
+// in llm/index.ts.
 //
 // Skipped in console-only mode: no phase runs there, so requiring a provider key and a
 // valid AGENT_MODEL just to look at the database would defeat the point of the mode.
@@ -144,7 +152,7 @@ onSettingsChanged((changed) => {
 // when an HTTP search provider is configured -- in native mode the provider searches
 // server-side instead, and agent-loop.ts handles that from the same "WebSearch" grant.
 // Connector tools are registered whether or not their credential is set, exactly like
-// the hand-written integrations: an unconfigured one answers "Error: STRIPE_API_KEY is
+// the hand-written integrations: an unconfigured one answers "Error: DATAFORSEO_AUTH is
 // not set" in band. Gating *registration* on the key would mean a key filled in later
 // needs a restart before the tool exists, which is the wrong trade -- what a missing
 // credential should change is what the research phase is told about (see
@@ -159,10 +167,8 @@ const registry = loadConfigOrExit(
     ])
 );
 
-// MEMORY_TOOLS (always available, every phase) and WRITE_INTEGRATION_TOOLS
-// (act-phase-only, and only when an approved proposal names them) both live in
-// tool-catalog.ts now -- server.ts validates operator edits to a proposal's
-// required_tools against the same lists, and they can't be allowed to drift.
+// Every tool list a phase is granted from lives in tool-catalog.ts, which is also where
+// the "no tool here changes the outside world" guarantee is stated and checked.
 
 /**
  * Shared framing for every phase. The Agent SDK supplied a system prompt of its own
@@ -171,10 +177,10 @@ const registry = loadConfigOrExit(
  * repeated in each phase prompt.
  */
 const BASE_SYSTEM = [
-  "You are an autonomous agent that researches money-making opportunities, proposes concrete plans, and -- only after a human approves -- executes them and records what actually happened.",
-  "You work entirely through the tools you are given. You have no filesystem, no shell, and no ability to run code: if a tool doesn't exist for something, you cannot do it, and you should say so rather than pretending otherwise.",
-  "Only the tools listed for the current phase are available. Do not invent tool names or describe a tool call in prose instead of calling it.",
-  "Be concrete and honest. Estimates are estimates and must be labelled as such; recorded outcomes must be what actually happened, including failures.",
+  "You are an autonomous market-research agent. The operator gives you goals; you research them, file business ideas worth a human's attention (software or not), and when the operator approves one you investigate it in depth and write a feasibility report.",
+  "You never build, launch, buy, publish or contact anyone. None of your tools changes anything outside your own memory: you read the web and public data sources, and you write notes, lessons, ideas and reports.",
+  "You work entirely through the tools you are given. Only the tools listed for the current phase are available. Do not invent tool names or describe a tool call in prose instead of calling it.",
+  "Be concrete and honest. Cite the source of every figure you rely on. Label estimates as estimates, and say \"unknown\" rather than guess. A well-evidenced \"this won't work\" is as useful to the operator as a promising idea.",
 ].join("\n");
 
 interface PhaseResult {
@@ -297,20 +303,17 @@ async function runPhase(opts: {
   return { finalText, costUsd, toolCalls, calls, stopReason, providerStopReason };
 }
 
-// ---- phase 1: research + plan -------------------------------------------
+// ---- phase 1: research ------------------------------------------------------
 //
-// Returns every proposal newly created this cycle (0 to a few) -- research
-// can favor whichever domain looks most promising rather than being forced
-// to propose evenly across AGENT_DOMAINS, and can surface more than one
-// idea per cycle when several are genuinely strong.
+// Returns every idea newly filed this cycle (0 to a few) -- research can favor
+// whichever goal looks most promising rather than being forced to cover them
+// evenly, and can surface more than one idea per cycle when several are strong.
 
-// Shared by the periodic research cycle and the reactive (needs_refinement)
-// pass below -- same read-only/memory tool grant either way, only the prompt
-// differs. Reused as-is so the two can't drift apart on what's allowed.
+// The read tools this cycle can use, shared by research and the deep dive.
 //
-// Everything here is read-only or writes only to the agent's own memory DB, which
-// is why this phase can be granted its whole list up front with no human in the
-// loop. WebSearch is listed whether or not a local WebSearch tool exists -- in
+// Everything a phase is granted is read-only or writes only to the agent's own memory
+// DB, which is why research gets its whole list up front with no human in the loop.
+// WebSearch is listed whether or not a local WebSearch tool exists -- in
 // native mode agent-loop.ts reads this grant and turns on the provider's own
 // server-side search instead. Nothing outside this list is described to the model
 // or dispatchable by it; see the fence note in agent-loop.ts.
@@ -319,25 +322,16 @@ async function runPhase(opts: {
 // isn't set is dropped from the grant, so the model is never shown a read tool that
 // can only answer "KEY is not set" -- and a credential filled in while the loop runs
 // takes effect on the next cycle instead of the next restart.
-function availableIntegrationTools(): { read: string[]; write: string[] } {
+function availableReadTools(): string[] {
   const configured = new Set(configuredConnectorTools());
   // A native integration is always "available" here -- it reports its own missing token
-  // in band. Only manifest-declared connectors are filtered, because there are many of
+  // in band. Only manifest-declared connectors are filtered, because there are several of
   // them and most operators will have keys for a few.
-  const available = (name: string) => !connectorOperation(name) || configured.has(name);
-  return {
-    read: READONLY_INTEGRATION_TOOLS.filter(available),
-    write: WRITE_INTEGRATION_TOOLS.filter(available),
-  };
+  return READONLY_INTEGRATION_TOOLS.filter((name) => !connectorOperation(name) || configured.has(name));
 }
 
 function researchAllowedTools(): string[] {
-  return [
-    ...MEMORY_TOOLS,
-    ...RESEARCH_OUTPUT_TOOLS,
-    ...READONLY_BUILTIN_TOOLS,
-    ...availableIntegrationTools().read,
-  ];
+  return [...MEMORY_TOOLS, ...RESEARCH_OUTPUT_TOOLS, ...READONLY_BUILTIN_TOOLS, ...availableReadTools()];
 }
 
 /** `mcp__integrations__github_read_repo` -> `github_read_repo`, for prose that reads better short. */
@@ -347,8 +341,8 @@ function unqualified(toolName: string): string {
 
 const RESEARCH_SYSTEM = [
   BASE_SYSTEM,
-  "You are in the RESEARCH+PLAN phase. Nothing you do here touches the real world: you can read the web, read existing repos and deployments, and write to your own memory. That is all.",
-  "Your only output that matters is proposals. You cannot execute anything in this phase, and a proposal you create will sit until a human approves it.",
+  "You are in the RESEARCH phase. Your outputs are research notes, lessons, and ideas filed with proposal_create for the operator to review.",
+  "Filing an idea does not start anything. It waits for a human; if they approve it, a later deep dive investigates it further.",
 ].join("\n");
 
 const RESEARCH_MAX_TURNS = 60;
@@ -450,17 +444,17 @@ async function explorationMandate(goals: GoalRow[]): Promise<string> {
 }
 
 /**
- * The research phase's view of what has already been proposed.
+ * The research phase's view of what has already been proposed, and how each idea fared.
  *
- * Without this it has none: `action_history_search` only covers work that already *ran*
- * (approved proposals with act-phase actions), and `proposal_status` needs an id the model
- * has no way to know. So everything sitting in the review queue, and everything approved but
- * not yet executed, was invisible -- which is exactly how a cycle ends up re-proposing an
- * idea that's already pending. Injected as prompt context rather than offered as a tool: a
+ * Without this it has none: `proposal_status` needs an id the model has no way to know. So
+ * everything sitting in the review queue, and every verdict a deep dive reached, was invisible
+ * -- which is exactly how a cycle ends up re-proposing an idea that's already pending, or one a
+ * deep dive already found unviable. Injected as prompt context rather than offered as a tool: a
  * duplicate has to be prevented on every cycle, and a tool only helps on the cycles the model
  * remembers to call it.
  */
 function openProposalDigest(): string {
+  const reports = store.latestReportsByProposal();
   const open = store
     .listAllProposals()
     .filter((p) => p.status === "pending" || p.status === "approved")
@@ -471,10 +465,18 @@ function openProposalDigest(): string {
     // Descriptions are Markdown whose first line is a bold headline -- that line alone
     // identifies the idea, and the bullets underneath would bloat the prompt for no gain.
     const headline = p.description.split("\n").find((l) => l.trim().length > 0) ?? p.description;
-    const state = p.status === "pending" ? "awaiting review" : store.hasActed(p.id) ? "already built" : "approved, not yet run";
-    return `- #${p.id} [${p.domain}] (${state}): ${preview(headline.replace(/[*_#`]/g, "").trim(), 160)}`;
+    return `- #${p.id} [${p.domain}] (${ideaState(p, reports.get(p.id))}): ${preview(headline.replace(/[*_#`]/g, "").trim(), 160)}`;
   });
   return lines.join("\n");
+}
+
+function ideaState(p: ProposalRow, report: { verdict: string; viability_score: number } | undefined): string {
+  if (p.status === "pending") return "awaiting review";
+  if (report) return `deep-dived: ${report.verdict} ${report.viability_score}/5`;
+  if (p.act_status === "running") return "deep dive running";
+  // A build-mode proposal: approved and acted on before this agent became research-only.
+  if (p.market_json === null && store.hasActed(p.id)) return "built (legacy)";
+  return p.next_run_at ? "deep dive queued" : "approved, deep dive not finished";
 }
 
 async function researchAndPlanPhase(): Promise<ProposalRow[]> {
@@ -482,12 +484,13 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
   const goals = store.activeGoals();
   // A directive steers exactly one cycle, then clears itself -- it's a nudge for this
   // run, not a standing instruction that quietly reshapes every future cycle. It can
-  // only redirect what gets researched; the output is still a proposal needing approval.
+  // only redirect what gets researched; the output is still an idea needing approval.
   const directive = consumeDirective();
   const openProposals = openProposalDigest();
   const lessons = await lessonDigest(goals);
   const saturated = saturationDigest(goals);
   const exploration = await explorationMandate(goals);
+  const readTools = availableReadTools();
 
   const { finalText, toolCalls } = await runPhase({
     phase: "research_plan",
@@ -499,11 +502,11 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
       // as a label rather than as direction.
       `Goals to research this cycle (pick whichever look most promising -- you don't need to cover all of them evenly):`,
       goals.map((g) => `- ${g.title}${g.brief && g.brief !== g.title ? `\n    ${g.brief}` : ""}`).join("\n"),
-      `When you record anything against a goal -- a proposal's \`domain\`, a lesson's \`domain\`, a note's \`domain\` -- use that goal's title above exactly as written. Inventing a new phrasing each cycle is how the same lane ended up recorded under thirteen different names, none of which could be matched against each other.`,
+      `When you record anything against a goal -- an idea's \`domain\`, a lesson's \`domain\`, a note's \`domain\` -- use that goal's title above exactly as written. Inventing a new phrasing each cycle is how the same lane ended up recorded under thirteen different names, none of which could be matched against each other.`,
       ...(directive ? [`The operator left a directive for this cycle -- weight it heavily: ${directive}`] : []),
       ...(openProposals
         ? [
-            `Proposals that already exist -- do NOT propose any of these again, or a near-identical variant of one (same product, same audience, reworded):\n${openProposals}\nIf one of them is the right direction, the useful move is a concrete next step on it -- say which #id it builds on in your description -- not a second proposal for the same thing. A pending one hasn't been rejected; it just hasn't been reviewed yet, and re-proposing it only buries the original.`,
+            `Ideas already on file -- do NOT propose any of these again, or a near-identical variant of one (same product, same buyer, reworded):\n${openProposals}\nA pending one hasn't been rejected; it just hasn't been reviewed yet, and re-proposing it only buries the original. A "drop" verdict from a deep dive is settled: do not re-pitch that idea unless you can name specific new evidence the deep dive did not have.`,
           ]
         : []),
       ...(lessons ? [`Lessons already learned that apply here. Treat these as settled unless this cycle turns up something that contradicts one -- in which case call lesson_reinforce with direction "contradicted" rather than quietly working around it:\n${lessons}`] : []),
@@ -518,20 +521,14 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
           ]
         : []),
       `The digests above are a floor, not the whole record. Call lesson_search and research_note_search for anything you're about to look into -- both do semantic matching, so they surface relevant history even when your wording doesn't match the original.`,
-      `Also call action_history_search for each goal -- it shows what's actually been built/deployed/committed on approved proposals so far, so you don't propose duplicate work (e.g. a second repo for something already shipped). Prefer proposing the next step on existing work over starting over.`,
-      `You can use the read-only tools ${availableIntegrationTools().read.map(unqualified).join(", ")} to check the existing landscape (competing projects, your own prior projects, and whether anything already shipped is getting traffic or earning) before proposing.`,
-      `Research for concrete, boundable opportunities to earn money. Use WebSearch/WebFetch and the read-only integration tools above. Save distilled findings with research_note_add as you go, and set \`kind\` on each one -- 'gap' when you find something underserved, 'saturated' when you check a space and it is already well covered. Marking the dead ends honestly is what stops a future cycle spending itself re-checking them, so they are worth recording even though they feel like nothing.`,
+      `Research the market for each goal you pick: who the buyers are, what they pay for today, who already serves them and at what price, where demand shows up (search volume, forums, marketplaces, tenders), and what is underserved. Use WebSearch/WebFetch${readTools.length > 0 ? ` and the read-only data tools (${readTools.map(unqualified).join(", ")})` : ""}. Ideas do not have to be software.`,
+      `Save distilled findings with research_note_add as you go, with \`kind\` set: 'gap' (underserved), 'demand' (evidence people want or pay for something), 'market_size', 'competitor', 'pricing', 'risk', or 'saturated' (you checked and it is already well covered). These notes are what the operator's market view of each goal is built from, and marking dead ends honestly is what stops a future cycle re-checking them.`,
       `When you have specific ideas, call proposal_create for each one worth a human's attention -- typically 1, up to 3 per cycle if multiple goals turned up genuinely strong, distinct opportunities. Don't pad the count with weak ideas just to fill a quota.`,
-      `Every proposal has to say how it makes money, in the \`monetization\` block: who specifically pays, at what price, and through what mechanism the first payment is actually collected. That mechanism has to exist today and be reachable either by an act-phase tool or by the operator -- a hosted payment link, a named affiliate programme you checked is open to new applicants, a specific ad network. "Add payments later", "monetize through partnerships" and "we'll figure out pricing" are the kinds of answer that get a proposal rejected, and rightly.`,
-      `\`steps\` is the ordered path from approval to that first dollar. Include the steps only a human can do (registering for the affiliate programme, pointing a domain, verifying a sending domain) with owner "human" -- leaving them out doesn't make them unnecessary, it just hides that the plan depends on them. For an agent step, name the tool it needs; that tool must also be in requiredTools, since the act phase is fenced to exactly that list and a step needing anything else cannot run.`,
-      `Each proposal needs a real cost/time/upside estimate and the exact tool names execution would need. Built-in tools are unprefixed (e.g. 'WebSearch'). MCP tools need their full qualified name -- the act-phase write tools available are: ${availableIntegrationTools().write.join(", ")}. For GitHub work: prefer github_commit_files (one commit, many files) over repeated github_commit_file calls; and either commit straight to the default branch, or if you use github_create_pr, list github_merge_pr in required_tools too and merge it during the act phase -- an approved proposal has no further GitHub-side review to wait for, so an unmerged PR just leaves the default branch empty.`,
-      // Recurrence has existed since proposals got a schedule, and the prompt had never
-      // said so, so every cycle reasoned as if the act phase runs once. A whole lane got
-      // written off in a research note for that reason -- "the recurring schedule cannot
-      // run agent-side" -- when the operator only had to pick an interval at approval.
-      `A proposal can be approved as a *recurring* run: the human picks an interval (daily, weekly, or a custom one) at approval time and each occurrence re-runs the act phase against the same approved fence. So work whose whole value is repetition -- a digest, a monitor, a periodic refresh of something already shipped -- belongs in one proposal that says plainly that it repeats and how often, not in a fresh proposal every cycle. Write the steps as what one occurrence does.`,
-      `Then stop -- do not act on any proposal, a human reviews each one next.`,
-      `If nothing concrete and boundable comes out of the research, don't force a proposal -- just stop.`,
+      `Every idea needs a \`market\` block: demand evidence with the URL you read it at, named competitors with their pricing, a market size with how you derived it, the key risks, and a 1-5 viability score with your confidence in it. Score honestly; the deep dive will check these claims.`,
+      `Every idea also has to say how it makes money, in the \`monetization\` block: who specifically pays, at what price, and the mechanism that collects the first payment -- one a human operator could set up today (a payment link, a named affiliate programme you checked is open to new applicants, a specific marketplace or ad network). "Monetize through partnerships" and "we'll figure out pricing" are the kinds of answer that get an idea rejected. For an audience-first idea (an open-source or free tool, a community), use revenueModel "deferred", "open_core" or "sponsorship_donations", name the later mechanism, and make the validation signal adoption.`,
+      `\`steps\` is the launch outline a human would follow, in order: the cheapest test that would validate demand first, ending at the first revenue.`,
+      `Then stop -- a human reviews each idea next, and approved ones get a deeper investigation.`,
+      `If nothing concrete comes out of the research, don't force an idea -- just stop.`,
     ].join("\n"),
     system: RESEARCH_SYSTEM,
     allowedTools: researchAllowedTools(),
@@ -541,11 +538,11 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
 
   const created = store.listPendingProposals().filter((p) => !beforeIds.has(p.id));
 
-  // Proposing nothing is allowed -- the prompt explicitly tells it not to force a weak
-  // proposal -- but several quiet cycles in a row look exactly like a stuck loop from the
-  // console. Emit the model's own stated reason so the operator can tell "it researched and
-  // found nothing worth your time" from "it never ran", and act on it (the domains, a
-  // directive and lesson muting are all levers for the first case).
+  // Filing nothing is allowed -- the prompt explicitly tells it not to force a weak idea --
+  // but several quiet cycles in a row look exactly like a stuck loop from the console. Emit
+  // the model's own stated reason so the operator can tell "it researched and found nothing
+  // worth your time" from "it never ran", and act on it (the goals, a directive and lesson
+  // muting are all levers for the first case).
   if (created.length === 0) {
     emitAgentEvent({
       type: "no_proposal",
@@ -555,59 +552,6 @@ async function researchAndPlanPhase(): Promise<ProposalRow[]> {
   }
 
   return created;
-}
-
-// ---- reactive: a human action (marking a proposal "needs refinement") -----
-//
-// Feeds straight back into research+plan instead of sitting inert -- but
-// still only ever produces a *proposal*, gated behind the exact same human
-// review as everything else. Guarded against duplicate/overlapping runs for
-// the same proposal (in-flight set + a cooldown after each run).
-
-const REACTIVE_COOLDOWN_MS = 60 * 60 * 1000; // 1h
-const reactiveInFlight = new Set<number>();
-const reactiveLastRunAt = new Map<number, number>();
-
-async function handleReactiveTrigger(proposalId: number): Promise<void> {
-  if (reactiveInFlight.has(proposalId)) return;
-  const lastRun = reactiveLastRunAt.get(proposalId);
-  if (lastRun && Date.now() - lastRun < REACTIVE_COOLDOWN_MS) return;
-
-  const proposal = store.getProposal(proposalId);
-  if (!proposal) return;
-
-  reactiveInFlight.add(proposalId);
-  try {
-    const beforeIds = new Set(store.listPendingProposals().map((p) => p.id));
-    const openProposals = openProposalDigest();
-
-    await runPhase({
-      phase: "research_plan",
-      proposalId: proposal.id,
-      prompt: [
-        `Proposal #${proposal.id} in domain "${proposal.domain}" was marked "needs refinement" by a human reviewer after its deliverable was built: ${proposal.description}`,
-        `Call lesson_search and research_note_search for this domain first -- don't re-research what's already known.`,
-        `Investigate what's likely missing or broken -- re-read the shipped repo with github_read_repo/github_read_file if that helps.`,
-        ...(openProposals
-          ? [
-              `Proposals that already exist -- don't duplicate one of these. A refinement is a tightly-scoped next step on #${proposal.id}, never a re-proposal of it:\n${openProposals}`,
-            ]
-          : []),
-        `If you find something concrete and boundable, call proposal_create for a tightly-scoped follow-up fix addressing the refinement need.`,
-        `If there isn't enough signal yet to propose something concrete, save a research_note explaining what's unclear and stop -- don't force a proposal.`,
-      ].join("\n"),
-      system: RESEARCH_SYSTEM,
-      allowedTools: researchAllowedTools(),
-      maxTurns: RESEARCH_MAX_TURNS,
-      signal: shutdownController.signal,
-    });
-
-    const created = store.listPendingProposals().filter((p) => !beforeIds.has(p.id));
-    for (const p of created) enqueueForReview(p);
-  } finally {
-    reactiveInFlight.delete(proposalId);
-    reactiveLastRunAt.set(proposalId, Date.now());
-  }
 }
 
 // ---- phase 2: human review -------------------------------------------------
@@ -622,8 +566,8 @@ async function handleReactiveTrigger(proposalId: number): Promise<void> {
 
 const REFLECT_SYSTEM = [
   BASE_SYSTEM,
-  "You are in the REFLECT phase. You can only read and write your own memory -- no web access, no integrations, nothing that touches the outside world.",
-  "Write lessons that will still be useful to a future cycle looking at a different opportunity in the same domain. A retelling of this one event is not a lesson.",
+  "You are in the REFLECT phase. You can only read and write your own memory -- no web access and no data sources.",
+  "Write lessons that will still be useful to a future cycle looking at a different idea in the same domain. A retelling of this one event is not a lesson.",
 ].join("\n");
 
 const REFLECT_MAX_TURNS = 10;
@@ -631,17 +575,17 @@ const REFLECT_MAX_TURNS = 10;
 /**
  * A rejection is a signal too -- without this the agent learns nothing from being told no,
  * and the next cycle is free to re-propose the same idea. Runs the same memory-only reflect
- * grant as a post-outcome reflection; there is no outcome row here, just the human's reason.
+ * grant as the post-deep-dive reflection; there is no report here, just the human's reason.
  */
 async function reflectOnRejectionPhase(proposal: ProposalRow): Promise<void> {
   await runPhase({
     phase: "reflect",
     proposalId: proposal.id,
     prompt: [
-      `Proposal #${proposal.id} in domain "${proposal.domain}" was REJECTED by the human reviewer: ${proposal.description}`,
+      `Idea #${proposal.id} in domain "${proposal.domain}" was REJECTED by the human reviewer: ${proposal.description}`,
       `Their stated reason: ${proposal.human_notes?.trim() || "(none given)"}`,
       `Call lesson_search for this domain first. If an existing lesson already covers why this kind of proposal gets rejected, call lesson_reinforce on it rather than duplicating it.`,
-      `Otherwise call lesson_add exactly once with a generalized takeaway about what makes a proposal in this domain not worth approving -- something that would stop you re-proposing this same idea next cycle. Don't record the rejection as a play-by-play.`,
+      `Otherwise call lesson_add exactly once with a generalized takeaway about what makes an idea in this domain not worth approving -- something that would stop you re-proposing this same idea next cycle. Don't record the rejection as a play-by-play.`,
       `If no reason was given, infer nothing beyond the obvious and keep the lesson conservative -- a low-confidence, narrowly-worded note is better than a confident guess about why.`,
     ].join("\n"),
     system: REFLECT_SYSTEM,
@@ -652,33 +596,28 @@ async function reflectOnRejectionPhase(proposal: ProposalRow): Promise<void> {
 }
 
 async function humanReviewPhase(proposal: ProposalRow): Promise<ProposalRow> {
-  console.log("\n=== Proposal awaiting review ===");
+  console.log("\n=== Idea awaiting review ===");
   console.log(`#${proposal.id} [${proposal.domain}]`);
   console.log(proposal.description);
   console.log(
     `Expected: cost ${proposal.expected_cost}, time ${proposal.expected_time_hours}h, upside ${proposal.expected_upside}`
   );
-  console.log(`Tools required: ${proposal.required_tools}`);
 
   emitAgentEvent({ type: "proposal_pending", proposal });
   const decision = await waitForDecision(proposal.id);
 
-  // Scope edits land before the status flips, so what gets approved is exactly what
-  // actPhase will later be fenced to -- there is never a window where the proposal is
-  // approved but still carries the pre-edit tool list.
-  if (decision.approved && (decision.editedDescription !== undefined || decision.editedRequiredTools !== undefined)) {
-    store.applyProposalEdits(proposal.id, {
-      description: decision.editedDescription,
-      requiredTools: decision.editedRequiredTools,
-    });
+  // A description edit lands before the status flips, so the deep dive investigates the
+  // idea as the operator approved it, not as the model first pitched it.
+  if (decision.approved && decision.editedDescription !== undefined) {
+    store.applyProposalEdits(proposal.id, { description: decision.editedDescription });
   }
 
   store.decideProposal(proposal.id, decision.approved ? "approved" : "rejected", decision.notes);
 
   if (decision.approved) {
     // Priority/schedule/recurrence are set by the human right here, at the moment
-    // they already approve the proposal -- never by the model, and never editable
-    // after the fact except via cancelSchedule.
+    // they approve the idea -- never by the model, and never editable after the fact
+    // except via cancelSchedule. A recurring deep dive re-investigates on an interval.
     store.scheduleApprovedProposal(proposal.id, {
       priority: decision.priority ?? "normal",
       scheduledAt: decision.scheduledAt ?? null,
@@ -701,213 +640,129 @@ async function humanReviewPhase(proposal: ProposalRow): Promise<ProposalRow> {
   return updated;
 }
 
-// ---- phase 3: act -----------------------------------------------------------
+// ---- phase 3: deep dive -----------------------------------------------------
 //
-// Side-effecting tool access is hard-limited to exactly what the proposal
-// declared. On top of that it always gets the same no-side-effect set the
-// research phase gets freely: memory tools, the read-only integration tools
-// (so it can read back what it just committed/deployed and self-check it),
-// and WebSearch/WebFetch.
-//
-// The web tools are auto-granted rather than requiring the proposal to have
-// named them: act is where the model actually writes code, and it routinely
-// needs to check an API's current shape or a package's real export names
-// mid-build. Making that depend on the model having predicted the need at
-// proposal time meant it usually couldn't, and a proposal that forgot to ask
-// had to be rejected and re-proposed. None of these can change anything
-// outside this process, so granting them widens what the act phase can
-// *learn*, never what it can *do* -- the fence that matters, on tools that
-// create/commit/deploy, is still exactly proposal.required_tools.
-//
-// `allowedTools` is now the whole fence rather than one layer of three: this
-// process owns tool dispatch outright, so a tool missing from the list is never
-// described to the model and is refused if it names one anyway. See agent-loop.ts.
+// What a human approval buys: a longer, read-only investigation of one idea that ends
+// in a written feasibility report. The grant is the research phase's read tools plus
+// `report_submit`, which only accepts a report for the idea being investigated. There
+// is nothing to fence: no tool in the registry changes anything outside this process.
 
-const ACT_SYSTEM = [
+const DEEP_DIVE_SYSTEM = [
   BASE_SYSTEM,
-  "You are in the ACT phase, executing a proposal a human has approved. This is the only phase where your tool calls change anything real -- repos, deployments, live sites.",
-  "You are fenced to exactly the tools the approved proposal named, plus memory and read-only tools. That fence is the whole reason you are trusted to run unattended: do the approved work and nothing beyond it.",
-  "You cannot run, build or test the code you write. Compensate by re-reading it before you commit and by reading back what actually landed afterwards.",
-  "Build a site of more than a few files by committing it with github_commit_files over as many calls as it takes -- commits are additive -- and then deploying it once with vercel_deploy's `fromRepo`. Do not try to inline a whole site into one deploy call: a deployment is a complete snapshot that replaces the project, so it cannot be split, and the call will be cut off at the output limit instead.",
+  "You are in the DEEP DIVE phase, investigating one idea a human approved for a closer look. Nothing you do here launches or changes anything; your job is to find out whether the idea is viable.",
+  "Your one required output is a feasibility report, submitted with report_submit. A clear, well-evidenced \"drop\" is a successful deep dive.",
+  "Prefer primary sources: competitors' own pricing pages, official statistics, public filings, marketplace listings, search-volume data. Separate what you measured from what you estimated, and cite both.",
 ].join("\n");
 
-const ACT_MAX_TURNS = 60;
+const DEEP_DIVE_MAX_TURNS = 60;
 
 /**
- * Set while an act phase is executing, so the operator's abort button has something to
- * cancel. Aborting stops the model mid-run: whatever side effects already landed stay
- * landed (there is no rollback), but nothing further is attempted, and reflect is skipped
- * because the run didn't reach an outcome.
+ * Set while a deep dive is executing, so the operator's abort button has something to cancel.
+ * Aborting stops the model mid-run and skips reflect; a report already submitted stays.
  */
-let actAbortController: AbortController | null = null;
+let deepDiveAbortController: AbortController | null = null;
 
 /**
- * The monetization block and step list as the act phase should see them: the plan a human
- * said yes to, restated so execution follows it rather than re-deriving one from the prose.
- *
- * Human-owned steps are included and explicitly marked as not the agent's to do. Dropping
- * them would read as a shorter plan rather than a plan with a dependency in it, and the
- * agent claiming an outcome while a human step is outstanding is exactly the overstatement
- * outcome_record is supposed to avoid. Empty for a proposal created before these fields
- * existed, which is why this returns lines to spread rather than a string.
+ * What the research phase claimed about the idea, restated for the deep dive as claims to check
+ * rather than facts to build on. Empty for a legacy build-mode proposal, which is why this
+ * returns lines to spread rather than a string.
  */
-function approvedPlanBrief(proposal: ProposalRow): string[] {
+function researchClaims(proposal: ProposalRow): string[] {
   const monetization = parseMonetization(proposal);
+  const market = parseMarket(proposal);
   const steps = parseSteps(proposal);
   const lines: string[] = [];
 
+  if (market) {
+    lines.push(
+      [
+        `The research phase's market read (viability ${market.viabilityScore}/5, ${market.confidence} confidence) -- verify or refute each claim:`,
+        `  Market size: ${market.marketSize}`,
+        ...market.demandEvidence.map((d) => `  Demand: ${d.claim} (${d.sourceUrl})`),
+        ...market.competitors.map(
+          (c) => `  Competitor: ${c.name}${c.url ? ` ${c.url}` : ""}${c.pricing ? ` -- ${c.pricing}` : ""}${c.gap ? `; gap: ${c.gap}` : ""}`
+        ),
+        ...market.keyRisks.map((r) => `  Risk: ${r}`),
+      ].join("\n")
+    );
+  }
   if (monetization) {
     lines.push(
-      `How this is supposed to make money (${proposal.revenue_model ?? "unspecified"}): ${monetization.whoPays} pays ${monetization.pricePoint}. Path to the first dollar: ${monetization.pathToFirstDollar}. Build toward that specifically -- it is what the proposal was approved on.`
+      `How it is supposed to make money (${proposal.revenue_model ?? "unspecified"}): ${monetization.whoPays} pays ${monetization.pricePoint}. Path to the first payment: ${monetization.pathToFirstDollar} (~${monetization.daysToFirstDollar} days). Key assumption: ${monetization.keyAssumption}.`
     );
   }
   if (steps.length > 0) {
-    lines.push(
-      `The approved plan, in order:\n${steps
-        .map(
-          (s, i) =>
-            `  ${i + 1}. [${s.owner}] ${s.title}${s.tool ? ` (${unqualified(s.tool)})` : ""} -- done when: ${s.doneWhen}`
-        )
-        .join("\n")}`,
-      `Do the [agent] steps. The [human] ones are not yours to do and you have no tool for them -- when you reach one, note in outcome_record that it is outstanding rather than reporting the work as complete or pretending it was done.`
-    );
+    lines.push(`The proposed launch outline:\n${steps.map((s, i) => `  ${i + 1}. ${s.title} -- done when: ${s.doneWhen}`).join("\n")}`);
   }
   return lines;
 }
 
 /**
- * Runs the approved work, then checks that it actually got done.
+ * Investigates one approved idea, then checks that a report actually landed.
  *
- * The check is the point. Before it, this function returned as soon as `runPhase` did and the
- * loop went straight to reflect -- so an act phase that created a repo and then stopped, which
- * is what happened to proposal #27, was indistinguishable from one that built and deployed the
- * whole thing. The verdict is returned so the caller can hand reflect an honest description of
- * what it is reflecting on; see act-verification.ts for what "done" is decided from.
- *
- * Deliberately **not** a retry. Re-running act on a phase that half-executed would repeat
- * whatever side effects already landed, and the loop's whole safety story is that side effects
- * happen once, inside a human-approved fence. An incomplete run is reported and left for the
- * operator, exactly like a rejected proposal.
+ * The check matters for the same reason it did in build mode: `runAgent` returns whenever the
+ * model stops calling tools, and a model that announces "now I'll write the report" and stops is
+ * otherwise indistinguishable from one that wrote it. The nudge pushes back before the run is
+ * allowed to end; the verdict records what happened if that didn't work.
  */
-async function actPhase(proposal: ProposalRow): Promise<ActVerdict> {
-  const requiredTools = proposal.required_tools.split(",").map((s) => s.trim()).filter(Boolean);
-  const readOnlyTools = availableIntegrationTools().read;
+async function deepDivePhase(proposal: ProposalRow): Promise<{ verdict: DeepDiveVerdict; report: ReportRow | null }> {
+  const readTools = availableReadTools();
   const allowedTools = [
-    ...new Set([
-      ...MEMORY_TOOLS,
-      ...readOnlyTools,
-      ...READONLY_BUILTIN_TOOLS,
-      // requiredTools is unfiltered on purpose: this is the approved fence, and a tool
-      // whose credential is missing must report that itself rather than vanish from a
-      // grant the human signed off on.
-      ...requiredTools,
-    ]),
+    ...new Set([...MEMORY_TOOLS, ...READONLY_BUILTIN_TOOLS, ...readTools, ...DEEP_DIVE_OUTPUT_TOOLS]),
   ];
   const abortController = new AbortController();
-  actAbortController = abortController;
+  deepDiveAbortController = abortController;
 
-  // Before the model is called, not after: everything between here and the verdict below --
-  // an abort, a crash, the machine going away -- leaves the row saying `running`, which the
-  // next startup reaps into `interrupted`. Without this marker an act phase that died halfway
-  // is indistinguishable from one that never started, and the proposal sits approved forever
-  // looking like it's still queued.
+  // Before the model is called, not after: anything between here and the verdict -- an abort,
+  // a crash -- leaves the row saying `running`, which the next startup reaps into
+  // `interrupted`. report_submit also reads it, to accept a report only for this idea.
   store.markActStarted(proposal.id);
 
-  const steps = parseSteps(proposal);
-
-  // Snapshotted before the model is called, so it means "done by an earlier run" and never
-  // shadows this one's own calls. This is what makes a re-run judgeable: without it every step
-  // the previous attempt completed reads as unrun, the phase is filed `incomplete` however well
-  // it went, and the nudge below orders side effects that already happened to happen again --
-  // which for `github_create_repo` is a 422 that can never clear, and for `github_commit_files`
-  // is a duplicate commit. Both landed on #40.
-  //
-  // Empty for a **recurring** proposal on purpose: there each occurrence is meant to do the work
-  // again, so a previous occurrence's success says nothing about this one, and crediting it would
-  // let every occurrence after the first pass having done nothing.
-  const priorSuccessfulTools =
-    proposal.recurrence_ms === null
-      ? store.succeededActTools(
-          proposal.id,
-          steps.flatMap((s) => (s.owner === "agent" && s.tool ? [s.tool] : []))
-        )
-      : [];
+  const goalTitle = (proposal.goal_id !== null ? store.getGoal(proposal.goal_id)?.title : undefined) ?? proposal.domain;
+  const previous = store.listReportsForProposal(proposal.id)[0];
+  const focus = proposal.human_notes?.trim();
 
   const result = await runPhase({
-    // Consulted when the model stops calling tools, before the run is allowed to end. Twice the
-    // act phase has read everything it needed, announced "now I'll write the full prototype and
-    // commit it in one call", and returned nothing -- and the phase ended there with an empty
-    // repo. The plan says exactly which tools were meant to run, so "it stopped early" is a fact
-    // here, not a guess, and telling the model beats writing the failure down and moving on.
-    //
-    // Only ever names what's outstanding, and only tools already in the approved fence. It
-    // cannot widen anything: a nudge is text, and the model still can't call what it wasn't
-    // granted. Nor can it cause a repeat -- a step whose tool already ran successfully isn't
-    // mentioned.
-    nudge: ({ calls, stopReason: providerStop }) => {
-      const check = verifyAct(steps, { toolCalls: calls, stopReason: "end_turn", priorSuccessfulTools });
-      if (check.unrunSteps.length === 0 && check.outcomeRecorded) return null;
-
-      const outstanding = check.unrunSteps.map((s) => `  - step ${s.position}: ${s.title} -- call ${unqualified(s.tool)}`);
-      return [
-        `Stop. You have not finished, and this run does not end until you have.`,
-        ...(isTruncationStop(providerStop)
-          ? [
-              `Your last turn was cut off at the output limit, so whatever you were writing never arrived. Commit the files in several smaller ${unqualified("mcp__integrations__github_commit_files")} calls instead of one large one.`,
-            ]
-          : []),
-        ...(outstanding.length > 0
-          ? [`These approved steps have not run:`, ...outstanding, `Make those calls now. Do not describe them -- call them.`]
-          : []),
-        ...(check.outcomeRecorded ? [] : [`Then call outcome_record with what actually happened.`]),
-        `If a step genuinely cannot be done, call outcome_record saying so plainly. What you must not do is stop silently.`,
-      ].join("\n");
-    },
+    nudge: ({ calls, stopReason }) => deepDiveNudge(calls, stopReason),
     phase: "act",
     proposalId: proposal.id,
     prompt: [
-      `Execute approved proposal #${proposal.id}: ${proposal.description}`,
-      // The plan the human actually approved. Until this was passed through, the act phase
-      // never saw the steps at all -- it re-derived an approach from the description and
-      // could diverge from the one that got a yes.
-      ...approvedPlanBrief(proposal),
-      // Told, not left to be rediscovered. In the re-run that produced #40's wrong verdict the
-      // model worked this out for itself by reading the repo back, which cost turns and still
-      // ended with it re-attempting a create. Naming what already landed is also what makes
-      // "don't repeat a side effect" an instruction rather than a hope.
-      ...(priorSuccessfulTools.length > 0
+      `Investigate approved idea #${proposal.id} [${proposal.domain}]:\n${proposal.description}`,
+      ...(proposal.original_description
+        ? [`(The operator edited the description at approval. The model's original pitch was:\n${proposal.original_description})`]
+        : []),
+      ...(focus ? [`The operator's notes on approval -- questions your report must answer first:\n${focus}`] : []),
+      ...researchClaims(proposal),
+      ...(previous
         ? [
-            `This proposal has been acted on before. These steps already ran successfully in an earlier attempt: ${priorSuccessfulTools
-              .map(unqualified)
-              .join(", ")}. Do not run them again -- confirm the real state with the read-only tools instead, and re-run one only if the read-back shows it did not actually land.`,
+            `This idea was investigated before (report #${previous.id}, ${previous.created_at.slice(0, 10)}): ${previous.verdict}, ${previous.viability_score}/5. Its summary: ${previous.summary}\nUpdate that picture rather than repeating it, and say in the report what changed.`,
           ]
         : []),
-      `The only tools that can change anything real are the ones this proposal was approved for: ${requiredTools.join(", ")}. On top of those you always have memory tools for logging/recall, the read-only integration tools (${readOnlyTools.map(unqualified).join(", ")}) for checking real state, and WebSearch/WebFetch.`,
-      `Use WebSearch/WebFetch while you build, not just before: check a library's current API, a package's real export names, or a config format rather than writing what you half-remember. You have no build step to catch a wrong import.`,
-      `This is a real deliverable, not a stub -- fully implement the scope described above. Do not leave placeholder/TODO files, an empty repo, or a README-only scaffold standing in for the actual code.`,
-      `You have no build or compile step available -- you cannot run the code you write. Before each commit, deliberately re-read every file you're about to write: confirm every import resolves to a file actually being committed, that the syntax is valid, and that package.json's dependencies/scripts match what the code actually uses.`,
-      `After committing (and deploying, if applicable), use the read-only tools above to read back what actually landed -- confirm no file is missing, truncated, or empty, and that the deploy succeeded -- before you call outcome_record.`,
-      `When finished, call outcome_record with the real numbers -- do not estimate, report what actually happened.`,
+      `Call lesson_search and research_note_search first, so you start from what is already known.`,
+      `Use WebSearch/WebFetch${readTools.length > 0 ? ` and the read-only data tools (${readTools.map(unqualified).join(", ")})` : ""}. Save the important findings with research_note_add as you go, with \`kind\` set (competitor, pricing, demand, market_size, risk, gap, saturated) and \`domain\` set to exactly "${goalTitle}" -- they feed the operator's market view of that goal.`,
+      `Then call report_submit with proposalId ${proposal.id}. The body is Markdown with these sections, in order: "## Summary", "## Market size", "## Competitors", "## Demand evidence", "## Pricing and unit economics", "## Risks", "## How a human would launch it" (the first 30 and 90 days, starting with the cheapest test that would validate demand), and "## Open questions". Cite sources inline as [text](url) and list them all in \`sources\`. No tables.`,
+      `The verdict is yours to call: "pursue" if it is worth a human's time and money now, "maybe" if it is promising but hinges on open questions, "drop" if the evidence says it won't work.`,
     ].join("\n"),
-    system: ACT_SYSTEM,
+    system: DEEP_DIVE_SYSTEM,
     allowedTools,
-    maxTurns: ACT_MAX_TURNS,
+    maxTurns: DEEP_DIVE_MAX_TURNS,
     signal: abortController.signal,
   }).finally(() => {
-    // Only clear if this run still owns the slot -- a later act phase may have claimed it.
-    if (actAbortController === abortController) actAbortController = null;
+    // Only clear if this run still owns the slot -- a later deep dive may have claimed it.
+    if (deepDiveAbortController === abortController) deepDiveAbortController = null;
   });
 
-  const verdict = verifyAct(steps, {
+  const verdict = verifyDeepDive({
     toolCalls: result.calls,
     stopReason: result.stopReason,
     providerStopReason: result.providerStopReason,
-    priorSuccessfulTools,
   });
   store.recordActVerdict(proposal.id, verdict);
-  if (verdict.complete) return verdict;
+  const latest = store.listReportsForProposal(proposal.id)[0];
+  const report = latest && latest.id !== previous?.id ? latest : null;
+  if (verdict.complete) return { verdict, report };
 
-  console.warn(`[act] proposal #${proposal.id} did not complete:\n  - ${verdict.problems.join("\n  - ")}`);
+  console.warn(`[deep dive] idea #${proposal.id} did not complete:\n  - ${verdict.problems.join("\n  - ")}`);
   emitAgentEvent({
     type: "act_incomplete",
     proposalId: proposal.id,
@@ -916,72 +771,50 @@ async function actPhase(proposal: ProposalRow): Promise<ActVerdict> {
     stopReason: result.stopReason,
     providerStopReason: result.providerStopReason,
   });
-
-  // Only when the agent recorded nothing at all. If it *did* call outcome_record and the plan
-  // is still unfinished, its own account stands -- overwriting a self-reported outcome with a
-  // second row would double-count in the scoreboard, and the event above already says the plan
-  // didn't run. This row exists so the silent case stops being silent: #27's act phase left the
-  // ledger with no outcome whatsoever, which reads as "hasn't reported yet", forever.
-  //
-  // Written by the orchestrator rather than the model on purpose -- recording what actually
-  // happened is not a model-callable capability, and this is the same boundary the rest of the
-  // outcome bookkeeping already sits on.
-  if (!verdict.outcomeRecorded) {
-    store.recordOutcome({
-      proposalId: proposal.id,
-      actualRevenue: 0,
-      actualCost: result.costUsd,
-      success: false,
-      notes: [
-        "Recorded by the orchestrator, not the agent: the act phase ended without calling outcome_record.",
-        ...verdict.problems,
-      ].join(" "),
-    });
-    emitAgentEvent({ type: "outcome_recorded", proposalId: proposal.id });
-  }
-  return verdict;
+  return { verdict, report };
 }
 
 // ---- phase 4: reflect ---------------------------------------------------
 
-async function reflectPhase(proposal: ProposalRow, verdict?: ActVerdict): Promise<void> {
-  // Told the truth about what it's reflecting on. The old prompt asserted "has an outcome
-  // recorded now" unconditionally, which for #27 was simply false -- act had recorded nothing,
-  // and reflect was left to infer that from action_history_search or not at all.
-  const incomplete =
-    verdict && !verdict.complete
-      ? [
-          `The act phase did NOT complete the approved plan. What went wrong:\n  - ${verdict.problems.join("\n  - ")}`,
-          `Draw the lesson from that failure, not from an imagined success. A partial build -- a repo created but never filled, a deploy that never ran -- is a failure to record honestly, not a partial win.`,
-        ]
-      : [];
+async function reflectPhase(
+  proposal: ProposalRow,
+  { verdict, report }: { verdict: DeepDiveVerdict; report: ReportRow | null }
+): Promise<void> {
+  const researchScore = parseMarket(proposal)?.viabilityScore;
+  const context = report
+    ? [
+        `The deep dive on idea #${proposal.id} in domain "${proposal.domain}" concluded: ${report.verdict}, viability ${report.viability_score}/5 (${report.confidence} confidence).`,
+        `Its summary: ${report.summary}`,
+        `The report, abridged:\n${preview(report.body, 1500)}`,
+        ...(researchScore !== undefined
+          ? [
+              `The research phase had scored this idea ${researchScore}/5 before the deep dive. Did research over- or under-rate it, and what signal would have predicted the deep dive's verdict earlier? That calibration is worth a lesson.`,
+            ]
+          : []),
+      ]
+    : [
+        `The deep dive on idea #${proposal.id} in domain "${proposal.domain}" did NOT produce a report. What went wrong:\n  - ${verdict.problems.join("\n  - ")}`,
+        `Draw the lesson from that failure, not from an imagined finding.`,
+      ];
 
   const result = await runPhase({
-    // Reflect's own counterpart to act's nudge: a turn that ends before `lesson_search` has
-    // run once isn't "nothing worth recording", it's the phase never having looked. Proposal
-    // #30's reflect pass did exactly this -- zero tool calls, 3.3 seconds, $0 -- because its act
-    // phase had already logged the relevant lesson itself (act keeps the same memory-tool grant
-    // reflect does) and the model apparently took that as license to skip its own turn entirely.
-    // Unlike act's nudge this doesn't name outstanding steps -- reflect has no plan to check
-    // against -- so it just insists on the one call the prompt already requires before ending is
-    // allowed. Search-then-decide-nothing-more-is-needed still counts as done: this only catches
-    // the phase skipping the search itself.
+    // A turn that ends before `lesson_search` has run once isn't "nothing worth recording", it's
+    // the phase never having looked -- proposal #30's reflect pass did exactly this, zero tool
+    // calls in 3.3 seconds. This insists on the one call the prompt already requires; searching
+    // and then deciding nothing more is needed still counts as done.
     nudge: ({ calls }) => {
       if (calls.some((c) => c.name === "mcp__memory__lesson_search")) return null;
       return [
         `Stop. You have not called lesson_search yet, and this reflect pass does not end until you have.`,
-        `Call lesson_search for this domain now. If it turns up a lesson this outcome confirmed or contradicted, call lesson_reinforce on it; otherwise call lesson_add exactly once.`,
+        `Call lesson_search for this domain now. If it turns up a lesson this deep dive confirmed or contradicted, call lesson_reinforce on it; otherwise call lesson_add exactly once.`,
       ].join("\n");
     },
     phase: "reflect",
     proposalId: proposal.id,
     prompt: [
-      verdict && !verdict.complete
-        ? `Proposal #${proposal.id} in domain "${proposal.domain}" has just finished its act phase.`
-        : `Proposal #${proposal.id} in domain "${proposal.domain}" has an outcome recorded now.`,
-      ...incomplete,
-      `Call lesson_search for this domain first. If an existing lesson was confirmed or contradicted by this outcome, call lesson_reinforce on it instead of duplicating it.`,
-      `Otherwise, call lesson_add exactly once with a generalized, reusable takeaway -- not a play-by-play retelling of what happened this one time.`,
+      ...context,
+      `Call lesson_search for this domain first. If an existing lesson was confirmed or contradicted by this deep dive, call lesson_reinforce on it instead of duplicating it.`,
+      `Otherwise, call lesson_add exactly once with a generalized, reusable takeaway about this kind of market or idea -- not a retelling of this one report.`,
     ].join("\n"),
     system: REFLECT_SYSTEM,
     allowedTools: [...MEMORY_TOOLS],
@@ -991,23 +824,20 @@ async function reflectPhase(proposal: ProposalRow, verdict?: ActVerdict): Promis
 
   // The nudge above gives the model two chances to search before the phase is allowed to end;
   // if it still never did, that's the same "phase completed without doing its job" failure
-  // research (`no_proposal`) and act (`act_incomplete`) both surface as an event rather than
-  // leaving it visible only in stdout. Not raised on the nudge itself, only on the phase
-  // actually ending having never searched -- a nudged phase that recovers is not incomplete.
+  // research (`no_proposal`) and the deep dive (`act_incomplete`) both surface as an event.
   if (!result.calls.some((c) => c.name === "mcp__memory__lesson_search")) {
-    console.warn(`[reflect] proposal #${proposal.id} ended without ever calling lesson_search.`);
+    console.warn(`[reflect] idea #${proposal.id} ended without ever calling lesson_search.`);
     emitAgentEvent({ type: "reflect_incomplete", proposalId: proposal.id, toolCalls: result.toolCalls });
   }
 }
 
-// ---- concurrency: parallel review, priority-ordered serialized act+reflect --
+// ---- concurrency: parallel review, priority-ordered serialized deep dives --
 //
-// Execution stays fully serialized -- one real side-effecting run at a time,
-// same safety property as before -- but which approved proposal goes next now
-// respects priority (then earliest due) instead of pure arrival order. A
-// proposal lands in runQueue either immediately on approval (humanReviewPhase,
-// when it's due right now) or later via the scheduler tick (schedulerTick,
-// for anything with a future scheduled_at or a recurring next_run_at).
+// Deep dives run one at a time, which bounds spend and provider rate limits, and
+// which approved idea goes next respects priority (then earliest due) rather than
+// pure arrival order. An idea lands in runQueue either immediately on approval
+// (humanReviewPhase, when it's due right now) or later via the scheduler tick
+// (schedulerTick, for anything with a future scheduled_at or a recurring next_run_at).
 
 // Ordering lives in memory-server.ts (`compareByPriorityThenDue`) so this and GET /api/queue
 // can't disagree about what runs next -- see the note there.
@@ -1031,10 +861,9 @@ function enqueueDue(proposal: ProposalRow, wasScheduled: boolean): void {
   if (isQueuedOrRunning(proposal.id)) return;
   runQueue.push({ proposal, wasScheduled });
   // Reported here, not just when the worker picks something up: `drainQueue` returns
-  // immediately (a no-op) whenever the worker is already busy, so without this a proposal
-  // queued behind a running build sat in `runQueue` for the build's whole 8-32 minutes
-  // without ever showing in `/api/queue`'s "queued" list -- the console's Build queue page
-  // looked like it never held more than the one thing already running.
+  // immediately (a no-op) whenever the worker is already busy, so without this an idea
+  // queued behind a running deep dive sat in `runQueue` for its whole run without ever
+  // showing in `/api/queue`'s "queued" list.
   reportExecutionState(runningProposalId, runQueue.map((r) => r.proposal.id));
   void drainQueue();
 }
@@ -1047,9 +876,8 @@ function pickNext(): QueuedRun | undefined {
 
 /** The single worker: runs the best-ranked queued proposal, then recurses to drain anything else already due. */
 async function drainQueue(): Promise<void> {
-  // Nothing new starts once a shutdown is under way. An act phase is the one thing here that
-  // touches the real world, and starting one we're about to abort would create side effects
-  // with no chance of the follow-through that makes them safe.
+  // Nothing new starts once a shutdown is under way: starting a deep dive we're about to abort
+  // would only spend money on a run that cannot finish.
   if (workerBusy || shuttingDown) return;
   const next = pickNext();
   if (!next) return;
@@ -1061,20 +889,18 @@ async function drainQueue(): Promise<void> {
     if (next.wasScheduled) {
       emitAgentEvent({ type: "scheduled_run_starting", proposal: next.proposal });
     }
-    const verdict = await actPhase(next.proposal);
-    // Reflect only after an act phase that actually ran to completion -- an aborted or
-    // failed act throws past this, so there's no outcome for it to draw a lesson from.
-    // A phase that *ran* but didn't finish the plan still reflects, and now gets told so.
-    await reflectPhase(next.proposal, verdict);
+    const result = await deepDivePhase(next.proposal);
+    // Reflect only after a deep dive that actually ran -- an aborted or failed one throws past
+    // this. One that ran but submitted no report still reflects, and is told so.
+    await reflectPhase(next.proposal, result);
   } catch (err) {
-    // An abort is the operator stopping this build, or the process shutting down -- both are
-    // things they asked for, so neither is an error. Reported as one, a clean Ctrl-C printed a
-    // stack trace pointing at our own abort() directly above "Bye.". The row stays `running`
-    // (markActStarted wrote it before the model was called) and the next startup reaps it.
+    // An abort is the operator stopping this deep dive, or the process shutting down -- both are
+    // things they asked for, so neither is an error. The row stays `running` (markActStarted
+    // wrote it before the model was called) and the next startup reaps it.
     if (isAbortError(err)) {
-      console.log(`[act] proposal #${next.proposal.id} interrupted; it is marked interrupted on the next start.`);
+      console.log(`[deep dive] idea #${next.proposal.id} interrupted; it is marked interrupted on the next start.`);
     } else {
-      console.error(`[act] proposal #${next.proposal.id} failed:`, err);
+      console.error(`[deep dive] idea #${next.proposal.id} failed:`, err);
     }
   } finally {
     store.advanceOrClearSchedule(next.proposal.id, {
@@ -1108,8 +934,7 @@ function schedulerTick(): void {
  *
  * Written as a reconciliation sweep rather than a notification on create, because "the row is
  * pending and nothing is waiting on it" is the condition that actually matters, and it has more
- * causes than one: a research phase aborted midway, a reactive pass that threw, a decision
- * endpoint that raced a restart. Fixing only the notification would leave the rest.
+ * causes than one: a research phase aborted midway, a decision endpoint that raced a restart. Fixing only the notification would leave the rest.
  *
  * Runs on the scheduler interval, so worst case a new proposal is decidable ~15s after it exists.
  */
@@ -1134,11 +959,11 @@ function enqueueForReview(proposal: ProposalRow): void {
       const decided = await humanReviewPhase(proposal);
       if (decided.status !== "approved") {
         console.log(`Proposal #${decided.id} rejected. Reason: ${decided.human_notes ?? "(none given)"}`);
-        // Memory-only, no side effects, so this doesn't need the act queue's serialization.
+        // Memory-only and short, so this doesn't go through the deep-dive queue.
         await reflectOnRejectionPhase(decided);
       }
     } catch (err) {
-      // Same as the act queue: a shutdown mid-rejection-reflect is not a failure of this review.
+      // Same as the deep-dive queue: a shutdown mid-rejection-reflect is not a failure of this review.
       if (isAbortError(err)) {
         console.log(`[review] proposal #${proposal.id} interrupted by shutdown.`);
       } else {
@@ -1155,7 +980,7 @@ function enqueueForReview(proposal: ProposalRow): void {
  *
  * No research cycle, no scheduler, no pending-review queue, no model client -- every one
  * of those exists to write something, and this mode exists to write nothing to *the record*:
- * no proposal, action, lesson, note, outcome or run can change here.
+ * no idea, report, action, lesson, note or run can change here.
  *
  * The one exception is the three operator settings the next real run reads at startup --
  * domains, cycle interval, and the pause switch. Without them, retargeting the loop before
@@ -1255,20 +1080,11 @@ async function mainLoop() {
   // console-only mode blocks on nothing and has nothing to announce. Registered before the
   // first cycle so a proposal from that cycle is announced like any other.
   extraClosers.push(startNotifier());
-  // Caught rather than voided: this runs a research phase under the shutdown signal, so a
-  // Ctrl-C during one rejected a floating promise and took the process down as an unhandled
-  // rejection -- mid-shutdown, before the handles were closed.
-  onReactiveTrigger((t) => {
-    handleReactiveTrigger(t.proposalId).catch((err: unknown) => {
-      if (isAbortError(err)) return;
-      console.error(`[reactive] proposal #${t.proposalId} failed:`, err);
-    });
-  });
   onRunNow(() => wakeCycle());
   onAbort((proposalId) => {
-    if (actAbortController && runningProposalId === proposalId) {
-      console.log(`[control] aborting act phase for proposal #${proposalId}`);
-      actAbortController.abort();
+    if (deepDiveAbortController && runningProposalId === proposalId) {
+      console.log(`[control] aborting the deep dive on idea #${proposalId}`);
+      deepDiveAbortController.abort();
     }
   });
   // The effective domains, not the env ones -- the console's "3 domains" and the feed's
@@ -1284,30 +1100,18 @@ async function mainLoop() {
     enqueueForReview(leftover);
   }
 
-  // Repair whatever the previous process left mid-flight, before the scheduler below gets a
-  // look at it. Both halves matter and they do different things -- see reapAfterUncleanShutdown.
-  const reaped = store.reapAfterUncleanShutdown();
-  for (const stranded of reaped.interrupted) {
-    console.warn(
-      `[act] proposal #${stranded.id} was mid-act when the previous process stopped; marked interrupted. Whatever it already committed or deployed stands.`
-    );
+  // Record whatever the previous process left mid-flight, before the scheduler below gets a
+  // look at it. An interrupted deep dive whose next_run_at survived resumes on the first tick;
+  // see reapInterruptedDeepDives for why that is safe now.
+  for (const stranded of store.reapInterruptedDeepDives()) {
+    console.warn(`[deep dive] idea #${stranded.id} was mid-deep-dive when the previous process stopped; marked interrupted.`);
     emitAgentEvent({
       type: "act_incomplete",
       proposalId: stranded.id,
-      problems: ["The act phase was still running when the previous process stopped, so it never finished or reported."],
+      problems: ["The deep dive was still running when the previous process stopped, so it never finished or reported."],
       toolCalls: 0,
       stopReason: "interrupted",
     });
-  }
-  if (reaped.descheduled.length > 0) {
-    // Said out loud because it is the difference between "the agent quietly re-committed
-    // everything on restart" and "nothing happened until you asked" -- an operator who doesn't
-    // know which of those they're in can't reason about what the repo contains.
-    console.warn(
-      `[act] descheduled ${reaped.descheduled.length} proposal(s) whose act phase had already started (#${reaped.descheduled
-        .map((p) => p.id)
-        .join(", #")}) so they don't silently re-run and repeat side effects. Check what landed, then POST /api/proposals/:id/rerun to resume one.`
-    );
   }
 
   // Catch up on anything already due (scheduled/recurring proposals whose time
@@ -1327,14 +1131,14 @@ async function mainLoop() {
       console.log("Loop is paused by the operator; skipping research this cycle.");
     } else if (pendingCount >= getSetting("maxPendingProposals")) {
       console.log(
-        `${pendingCount} proposals already pending review (max ${getSetting("maxPendingProposals")}); skipping research this cycle.`
+        `${pendingCount} ideas already pending review (max ${getSetting("maxPendingProposals")}); skipping research this cycle.`
       );
     } else {
       const proposals = await researchAndPlanPhase();
       if (proposals.length > 0) {
         for (const p of proposals) enqueueForReview(p);
       } else {
-        console.log("No proposal this cycle.");
+        console.log("No new idea this cycle.");
       }
     }
 
@@ -1390,12 +1194,12 @@ function installSignalHandlers(server?: { close(): unknown }): void {
       if (schedulerTimer) clearInterval(schedulerTimer);
     },
     closeServer: () => void server?.close(),
-    // Both controllers: the shared one research and reflect listen on, and act's own -- which
-    // is the same one the console's abort button fires, so an act phase can only ever be
-    // interrupted through a path that already knows how to leave the record consistent.
+    // Both controllers: the shared one research and reflect listen on, and the deep dive's own
+    // -- the same one the console's abort button fires, so a deep dive is only ever interrupted
+    // through a path that already knows how to leave the record consistent.
     abortPhases: () => {
       shutdownController.abort();
-      actAbortController?.abort();
+      deepDiveAbortController?.abort();
     },
     wakeLoop: () => wakeCycle(),
     inFlight: () => phasesInFlight > 0 || workerBusy,

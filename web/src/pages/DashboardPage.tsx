@@ -1,5 +1,5 @@
 import { Button, Space, Typography } from 'antd'
-import type { FeedEntry, OutcomeRow, ProposalRow } from '../types'
+import type { FeedEntry, ProposalRow } from '../types'
 import { ProposalReviewCard } from '../components/ProposalReviewCard'
 import { StatTiles } from '../components/StatTiles'
 import { LiveConsole } from '../components/LiveConsole'
@@ -7,14 +7,12 @@ import { LiveConsole } from '../components/LiveConsole'
 export function DashboardPage({
   pendingProposals,
   proposals,
-  outcomes,
   totalCostUsd,
   feed,
   onOpenLiveFeed,
 }: {
   pendingProposals: ProposalRow[]
   proposals: ProposalRow[]
-  outcomes: OutcomeRow[]
   totalCostUsd: number
   feed: FeedEntry[]
   onOpenLiveFeed: () => void
@@ -29,7 +27,7 @@ export function DashboardPage({
         </Space>
       )}
 
-      <StatTiles proposals={proposals} outcomes={outcomes} totalCostUsd={totalCostUsd} />
+      <StatTiles proposals={proposals} totalCostUsd={totalCostUsd} />
 
       <div>
         <Space style={{ marginBottom: 8, width: '100%', justifyContent: 'space-between' }}>

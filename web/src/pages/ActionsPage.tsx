@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { LinkOutlined } from '@ant-design/icons'
-import { Input, Segmented, Select, Space, Table, Tag, Tooltip, Typography } from 'antd'
+import { Input, Segmented, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import type { ActionWithProposal, OutcomeRow, Priority, ProposalRow } from '../types'
 import { api } from '../api'
-import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
+import { VERDICT_LABEL, VERDICTS, VERDICT_TAG } from '../report'
 import {
   PHASE_LABEL,
   PRIORITY_LABEL,
@@ -22,7 +22,6 @@ import { useTableView } from '../hooks/useTableView'
 import { exportCsv, exportJson } from '../export'
 
 type PhaseFilter = 'all' | 'act' | 'reflect'
-type ReviewStatus = ProposalRow['review_status']
 
 const PRIORITY_RANK: Record<Priority, number> = { urgent: 3, high: 2, normal: 1, low: 0 }
 
@@ -33,16 +32,17 @@ interface ProposalGroup {
   lastActivity: string
 }
 
-const REVIEW_OPTIONS: { value: NonNullable<ReviewStatus> | 'unreviewed'; label: string }[] = [
-  { value: 'unreviewed', label: 'Unreviewed' },
-  { value: 'mvp_done', label: '✓ MVP done' },
-  { value: 'needs_refinement', label: '⚠ Needs refinement' },
-]
+/** Sort key for the Result column: reports by verdict, then legacy outcomes, then nothing. */
+function resultRank(g: ProposalGroup): number {
+  const report = g.proposal.latest_report
+  if (report) return 10 - VERDICTS.indexOf(report.verdict)
+  return g.outcome ? 1 : 0
+}
 
-function reviewRank(status: ReviewStatus): number {
-  if (status === 'mvp_done') return 2
-  if (status === 'needs_refinement') return 1
-  return 0
+/** Legacy build-mode review verdicts, shown read-only. Nothing sets these any more. */
+const LEGACY_REVIEW_LABEL: Record<NonNullable<ProposalRow['review_status']>, string> = {
+  mvp_done: 'MVP done',
+  needs_refinement: 'needs refinement',
 }
 
 /** "commit files ×12 · web search ×8" — what a proposal's action count is actually made of. */
@@ -107,15 +107,12 @@ export function ActionsPage({
   historyVersion,
   proposals,
   outcomes,
-  onSetReview,
 }: {
   historyVersion: number
   proposals: ProposalRow[]
   outcomes: OutcomeRow[]
-  onSetReview: (id: number, reviewStatus: ReviewStatus) => void
 }) {
   const navigate = useNavigate()
-  const consoleOnly = useConsoleOnly()
   const { id } = useParams()
   const [actions, setActions] = useState<ActionWithProposal[]>([])
   const [loading, setLoading] = useState(true)
@@ -248,47 +245,41 @@ export function ActionsPage({
       ),
     },
     {
-      title: 'Actual',
-      width: 230,
-      sorter: (a, b) => (a.outcome?.actual_revenue ?? -Infinity) - (b.outcome?.actual_revenue ?? -Infinity),
-      render: (_, g) =>
-        g.outcome ? (
-          <span className="mono" style={{ fontSize: 12 }}>
-            <Tag color={g.outcome.success ? 'success' : 'error'} style={{ marginRight: 4 }}>
-              {g.outcome.success ? 'ok' : 'failed'}
+      // What the work came to: the deep dive's verdict, or for a legacy build-mode proposal its
+      // recorded outcome and the review a human gave it at the time.
+      title: 'Result',
+      width: 240,
+      sorter: (a, b) => resultRank(a) - resultRank(b),
+      render: (_, g) => {
+        const report = g.proposal.latest_report
+        if (report) {
+          return (
+            <Tag color={VERDICT_TAG[report.verdict]}>
+              {VERDICT_LABEL[report.verdict]} {report.viability_score}/5
             </Tag>
-            ${g.outcome.actual_revenue} · ${g.outcome.actual_cost} · {g.outcome.actual_time_hours ?? '—'}h
-          </span>
-        ) : (
+          )
+        }
+        if (g.outcome || g.proposal.review_status) {
+          return (
+            <span className="mono" style={{ fontSize: 12 }}>
+              {g.outcome && (
+                <Tag color={g.outcome.success ? 'success' : 'error'} style={{ marginRight: 4 }}>
+                  {g.outcome.success ? 'ok' : 'failed'}
+                </Tag>
+              )}
+              {g.proposal.review_status && <Tag>{LEGACY_REVIEW_LABEL[g.proposal.review_status]}</Tag>}
+              <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                legacy build
+              </Typography.Text>
+            </span>
+          )
+        }
+        return (
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            no outcome yet
+            —
           </Typography.Text>
-        ),
-    },
-    {
-      title: 'Review',
-      width: 180,
-      sorter: (a, b) => reviewRank(a.proposal.review_status) - reviewRank(b.proposal.review_status),
-      filters: [
-        { text: 'Unreviewed', value: 'unreviewed' },
-        { text: 'MVP done', value: 'mvp_done' },
-        { text: 'Needs refinement', value: 'needs_refinement' },
-      ],
-      onFilter: (value, record) => (record.proposal.review_status ?? 'unreviewed') === value,
-      render: (_, g) => (
-        <div onClick={(e) => e.stopPropagation()}>
-          <Tooltip title={consoleOnly ? READ_ONLY_HINT : undefined}>
-            <Select<'unreviewed' | 'mvp_done' | 'needs_refinement'>
-              size="small"
-              style={{ width: 168 }}
-              value={g.proposal.review_status ?? 'unreviewed'}
-              disabled={consoleOnly}
-              onChange={(v) => onSetReview(g.proposal.id, v === 'unreviewed' ? null : v)}
-              options={REVIEW_OPTIONS}
-            />
-          </Tooltip>
-        </div>
-      ),
+        )
+      },
     },
     {
       title: 'Last activity',
@@ -318,7 +309,7 @@ export function ActionsPage({
           />
           <Input.Search
             allowClear
-            placeholder="Search proposal, action, or description…"
+            placeholder="Search idea, action, or description…"
             style={{ width: 320 }}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -329,7 +320,7 @@ export function ActionsPage({
           onExportCsv={() =>
             exportCsv('actions', filteredActions, [
               { key: 'id', title: '#' },
-              { key: 'proposal_id', title: 'Proposal' },
+              { key: 'proposal_id', title: 'Idea' },
               { key: 'proposal_domain', title: 'Domain' },
               { key: 'phase', title: 'Phase' },
               { key: 'tool_name', title: 'Tool' },
@@ -348,7 +339,7 @@ export function ActionsPage({
         components={components}
         scroll={scroll}
         columns={columns}
-        locale={{ emptyText: 'No actions taken on approved proposals yet' }}
+        locale={{ emptyText: 'No tool calls on approved ideas yet' }}
         expandable={{
           expandRowByClick: true,
           expandedRowKeys: expandedProposalId === null ? [] : [expandedProposalId],

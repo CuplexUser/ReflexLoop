@@ -4,17 +4,18 @@
 //
 // A connector is a JSON file describing a REST API -- base URL, auth, and a list
 // of operations -- which the loader turns into ordinary ToolDefinitions. The point
-// is that adding a connector stops being a nine-file change (a client module, two
-// hand-maintained risk lists, a deliverables switch, a frontend label map) and
-// becomes one file, with the risk classification declared next to the operation it
-// describes rather than in a list three modules away.
+// is that adding a research data source is one file rather than a client module plus
+// the wiring around it.
+//
+// **Read operations only.** This agent researches; nothing it calls may change
+// anything outside its own database. `risk` must be "read", so a manifest declaring a
+// write operation fails validation at load and is skipped (logged in CONNECTOR_ERRORS)
+// rather than registered. A POST is still allowed -- some search APIs (TED) only take
+// their query as a POST body -- because the method is not what makes an operation a
+// write; what it does is, and that is what the operator declares here.
 //
 // What this layer deliberately cannot express:
 //
-//   - File-upload deploys. Netlify's sha1 digest manifest and Vercel's file payload
-//     aren't a JSON request shape, and pretending otherwise would mean a manifest
-//     format that's really a programming language. Those stay native TS in
-//     src/integrations/; both kinds of tool look identical to the model.
 //   - OAuth token round trips (Reddit, X, LinkedIn, Google Search Console). They need a
 //     token fetched before the call, and the user-delegated ones a consent screen on top.
 //     Adding `auth.type: "oauth2_refresh"` later is contained to tools.ts.
@@ -24,18 +25,6 @@
 // it's worth saying plainly.
 
 import { z } from "zod";
-import type { ArtifactKind } from "../deliverables.js";
-
-/**
- * Artifact kinds a connector operation may declare. Type-only import above, so this
- * file can be checked against deliverables.ts without a runtime import cycle
- * (deliverables.ts -> load.ts -> manifest.ts).
- */
-const ARTIFACT_KINDS = ["site", "repo", "pull_request", "payment_link"] as const;
-
-// Fails to compile if deliverables.ts and this list drift apart.
-const _kindsAreArtifactKinds: readonly ArtifactKind[] = ARTIFACT_KINDS;
-void _kindsAreArtifactKinds;
 
 /**
  * Parameter types are deliberately few. Each maps to a zod primitive that
@@ -56,7 +45,7 @@ const paramSpec = z
      * `{"variables": {"siteTag": ...}}`. That is what lets a flat, model-friendly tool
      * signature drive a GraphQL request, whose body is always `{query, variables}` --
      * the alternative was an `object` param type, i.e. asking the model to hand-write
-     * the nested payload. Form encoding is unaffected (Stripe's bracket syntax has no
+     * the nested payload. Form encoding is unaffected (bracketed form names have no
      * dots) and a name without a dot behaves exactly as before.
      */
     as: z.string().min(1).optional(),
@@ -83,11 +72,12 @@ const operationSpec = z
       .string()
       .regex(/^[a-z][a-z0-9_]*$/, "must be lower_snake_case, starting with a letter"),
     /**
-     * Whether this operation touches the real world. Drives `toolRisk`, so it decides
-     * both whether the operation needs an approved proposal naming it and whether it
-     * may be dispatched concurrently with other calls in the same turn.
+     * Declares that this operation changes nothing in the outside world. Required, and
+     * "read" is the only accepted value: see the note at the top of this file.
      */
-    risk: z.enum(["read", "write"]),
+    risk: z.literal("read", {
+      error: 'write operations are not supported -- this agent is research-only, so risk must be "read"',
+    }),
     description: z.string().min(1),
     method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]),
     /** Appended to the connector's baseUrl. `{name}` placeholders take `in: "path"` params. */
@@ -101,11 +91,9 @@ const operationSpec = z
      */
     bodyStyle: z.enum(["object", "array"]).default("object"),
     /**
-     * Output key -> dot-path into the JSON response. This is how an API that nests its
-     * link (Cloudflare wraps everything in `{result: ...}`) still satisfies the codebase
-     * convention that a write tool returns a top-level `url` -- see tool-output.ts's
-     * extractResultUrl, which finds it by field name and not by knowing the tool.
-     * Omit it and the whole response body comes back.
+     * Output key -> dot-path into the JSON response, for an API that nests the part worth
+     * reading (e.g. everything wrapped in `{result: ...}`). Omit it and the whole response
+     * body comes back.
      */
     result: z.record(z.string().min(1), z.string().min(1)).optional(),
     /**
@@ -127,15 +115,6 @@ const operationSpec = z
         item: z.string().min(1).optional(),
         fields: z.array(z.string().min(1)).min(1).optional(),
         limit: z.number().int().positive().optional(),
-      })
-      .strict()
-      .optional(),
-    /** Declares that this operation produces something browsable, for the Deliverables page. */
-    deliverable: z
-      .object({
-        kind: z.enum(ARTIFACT_KINDS),
-        /** Qualifier shown next to the label, e.g. "test mode". */
-        detail: z.string().optional(),
       })
       .strict()
       .optional(),
@@ -168,7 +147,7 @@ export const connectorManifest = z
     label: z.string().min(1),
     baseUrl: z.string().url(),
     auth: authSpec,
-    /** How body params are encoded. Stripe wants form encoding; most others want JSON. */
+    /** How body params are encoded. Most APIs want JSON; some older ones want form encoding. */
     encoding: z.enum(["json", "form"]).default("json"),
     defaultHeaders: z.record(z.string().min(1), z.string()).default({}),
     /** Docs link for the operator, carried through to the console. */

@@ -454,7 +454,7 @@ export function EconomicsPage({
         <Col xs={24} sm={12} lg={6}>
           <Card size="small">
             <Tooltip
-              title={`Self-reported: the sum of actualRevenue across ${outcomes.length} outcome${outcomes.length === 1 ? '' : 's'} the agent recorded via outcome_record at the end of an act phase. No payment processor is connected, so nothing here is measured.`}
+              title={`Self-reported, and from the retired build mode only: the sum of actualRevenue across ${outcomes.length} outcome${outcomes.length === 1 ? '' : 's'} the agent recorded when it still built things. The research-only agent records no outcomes, so this no longer grows.`}
             >
               <Statistic
                 title="Reported revenue"
@@ -649,7 +649,7 @@ export function EconomicsPage({
 
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                 {funnel.actedEvidence.withOutcome} recorded an outcome ·{' '}
-                <Tooltip title="outcome_record is a model call at the end of the act phase, so a crashed or abandoned phase leaves no row. A human review verdict is the other evidence that real work exists.">
+                <Tooltip title="Legacy build-mode figures: outcomes and review verdicts were recorded when the agent still built things. Research-mode ideas end in a deep-dive report instead.">
                   <span>{funnel.actedEvidence.reviewedOnly} carry a human review verdict without one</span>
                 </Tooltip>
               </Typography.Text>

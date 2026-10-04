@@ -12,9 +12,10 @@ MCP client, read-only access to the agent's record.
 | `research_notes_list` | The most recent research notes |
 | `lessons_search` | What has it learned about a topic? |
 | `lessons_list` | The most recently updated lessons |
-| `proposals_list` | What is waiting for my decision? Also lists stalled builds. |
-| `proposal_get` | One proposal in full: tools, money path, steps and result |
-| `deliverables_list` | What exists now, and where can I find it? |
+| `proposals_list` | Which ideas are waiting for my decision, and what did the others come to? |
+| `proposal_get` | One idea in full: verdict, market read, money path and launch outline |
+| `reports_list` | What did the deep dives conclude? Filter by verdict or goal. |
+| `report_get` | One feasibility report in full, with its sources |
 
 ### Parameters
 
@@ -26,23 +27,25 @@ MCP client, read-only access to the agent's record.
 
 ### What the answers include
 
-- **`goals_list`** shows each goal's health: proposals, approvals, shipped work, spend, and the
+- **`goals_list`** shows each goal's health: ideas, approvals, deep dives, spend, and the
   number of empty cycles since it last produced anything. A goal with the status `suggested` was
   proposed by the agent and has no effect until you accept it in the console.
-- **`proposal_get`** shows the approved tools (each labeled as write, read or memory), the
-  monetization details, the ordered steps and who owns each one, whether the work finished, and
-  how much the proposal cost in model API spend.
+- **`proposal_get`** shows the latest report's verdict, the market assessment, the monetization
+  details, the launch outline, whether the deep dive finished, and how much the idea cost in model
+  API spend. Ideas from before the switch to research-only also show their old tool list and
+  recorded outcome.
+- **`report_get`** takes a report id, or an idea id to get that idea's newest report.
 - **Search results** carry a relevance score when [Qdrant](semantic-search.md) is configured. Without
   it, search uses plain text matching and no score is shown.
 
 ## Deliberate limits
 
-- **There are no write tools.** You cannot add, edit, mute or delete anything, approve a
-  proposal, or accept a suggested goal. Those actions belong in the console. Muted lessons are
+- **There are no write tools.** You cannot add, edit, mute or delete anything, approve an
+  idea, or accept a suggested goal. Those actions belong in the console. Muted lessons are
   also hidden here, just as they are hidden from the agent.
 - **There is no live status tool.** What is running right now lives in the agent process's
-  memory, not in the database, so this server cannot see it. To find approved work that stopped
-  and needs a manual re-run, use `proposals_list` with `status: "stalled"`.
+  memory, not in the database, so this server cannot see it. To find approved ideas whose deep
+  dive stopped without a report, use `proposals_list` with `status: "stalled"`.
 
 The server reads `data/agent.db` directly in read-only mode. It works whether or not `npm start`
 is running, and needs no port and no `AGENT_API_TOKEN`.

@@ -55,7 +55,7 @@ export function isErrorResult(result: unknown): boolean {
 }
 
 /**
- * Tool results that create or deploy something (github_create_repo,
+ * Legacy build-mode tool results that created or deployed something (github_create_repo,
  * github_create_pr, vercel_deploy, netlify_create_site, netlify_deploy) all
  * return a plain `url` field, so this pulls it out generically by field name
  * rather than switching per tool.

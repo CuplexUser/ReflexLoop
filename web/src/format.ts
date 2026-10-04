@@ -70,13 +70,20 @@ export const PRIORITY_TAG_COLOR: Record<'low' | 'normal' | 'high' | 'urgent', st
   urgent: 'red',
 }
 
+/**
+ * `act` is the persisted key of the deep dive -- the phase that ran builds before this agent
+ * became research-only, and investigates approved ideas now. Rows from both share the key.
+ */
 export const PHASE_LABEL: Record<string, string> = {
-  research_plan: 'Research + Plan',
-  act: 'Act',
+  research_plan: 'Research',
+  act: 'Deep dive',
   reflect: 'Reflect',
 }
 
+// The write-tool entries are legacy: those tools no longer exist, but their calls are still in
+// the actions table and should keep reading as what they were.
 const ACTION_LABEL: Record<string, string> = {
+  report_submit: 'Submit report',
   github_read_repo: 'Read repo',
   github_read_file: 'Read file',
   github_search_repos: 'Search repos',
@@ -106,7 +113,7 @@ function shortToolName(toolName: string): string {
  *
  * The fallback is deliberately generic rather than a map entry per tool: connectors are
  * declared in manifests now, so a new one must read acceptably here without a frontend
- * change. `stripe_create_payment_link` becomes "Stripe create payment link"; only tools
+ * change. `dataforseo_search_volume` becomes "Dataforseo search volume"; only tools
  * whose default reads badly earn a hand-written entry above.
  */
 export function actionLabel(toolName: string): string {

@@ -5,15 +5,13 @@ import { parseMonetization, parseSteps, revenueModelLabel } from '../monetizatio
 import { palette } from '../theme'
 
 /**
- * How a proposal is supposed to make money, and what stands between approval and the first
- * dollar. This is the block the review decision actually turns on — before it existed the
- * only structured money field was a single `expected_upside` number, and everything else
- * (the mechanism, the buyer, the price, the steps) was prose buried in the description, if
- * it was stated at all.
+ * How an idea is supposed to make money, and the launch outline a human would follow to the
+ * first revenue. Together with the market block, this is what the review decision turns on.
  *
- * Everything renders from structured fields rather than Markdown, so MarkdownLite's
- * bold-and-bullets-only limit doesn't apply here. Proposals written before these columns
- * existed have nulls and render nothing — an absent section rather than a row of dashes.
+ * Everything renders from structured fields rather than Markdown. Proposals written before
+ * these columns existed have nulls and render nothing — an absent section rather than a row of
+ * dashes. Legacy build-mode steps carry an agent/human owner and a tool; a research-mode
+ * launch outline is all the human's and has neither.
  */
 
 function shortTool(name: string) {
@@ -22,7 +20,7 @@ function shortTool(name: string) {
 
 /**
  * The one-line version, for the Dashboard card where the decision is actually made. Two lines
- * at most: the mechanism and the price, then how many steps and how many of them need a person.
+ * at most: the mechanism and the price, then how long the launch outline is.
  */
 export function MonetizationSummary({ proposal }: { proposal: ProposalRow }) {
   const monetization = parseMonetization(proposal)
@@ -30,6 +28,7 @@ export function MonetizationSummary({ proposal }: { proposal: ProposalRow }) {
   const model = revenueModelLabel(proposal.revenue_model)
   if (!monetization && steps.length === 0) return null
 
+  const legacy = steps.some((s) => s.owner)
   const humanSteps = steps.filter((s) => s.owner === 'human').length
 
   return (
@@ -45,18 +44,20 @@ export function MonetizationSummary({ proposal }: { proposal: ProposalRow }) {
       </Space>
       {steps.length > 0 && (
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          {steps.length} step{steps.length === 1 ? '' : 's'}
-          {humanSteps > 0 && `, ${humanSteps} needing you`}
+          {steps.length}-step {legacy ? 'plan' : 'launch outline'}
+          {legacy && humanSteps > 0 && `, ${humanSteps} needing you`}
         </Typography.Text>
       )}
     </Space>
   )
 }
 
-/** The full block, for the proposal dialog. */
+/** The full block, for the idea dialog. */
 export function MonetizationBlock({ proposal }: { proposal: ProposalRow }) {
   const monetization = parseMonetization(proposal)
   const steps = parseSteps(proposal)
+  const legacy = steps.some((s) => s.owner)
+  const humanSteps = steps.filter((s) => s.owner === 'human').length
   const model = revenueModelLabel(proposal.revenue_model)
   if (!monetization && steps.length === 0) return null
 
@@ -77,7 +78,7 @@ export function MonetizationBlock({ proposal }: { proposal: ProposalRow }) {
           {
             key: 'days',
             label: 'Time to first dollar',
-            children: `${monetization.daysToFirstDollar} days from approval`,
+            children: `~${monetization.daysToFirstDollar} days from starting`,
           },
           {
             key: 'assumption',
@@ -92,27 +93,26 @@ export function MonetizationBlock({ proposal }: { proposal: ProposalRow }) {
       {steps.length > 0 && (
         <div>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            PLAN — {steps.filter((s) => s.owner === 'human').length} step
-            {steps.filter((s) => s.owner === 'human').length === 1 ? '' : 's'} need you
+            {legacy
+              ? `PLAN (legacy build mode) — ${humanSteps} step${humanSteps === 1 ? '' : 's'} needed a human`
+              : 'LAUNCH OUTLINE — what a human would do, in order'}
           </Typography.Text>
           <ol style={{ margin: '6px 0 0', paddingLeft: 22 }}>
             {steps.map((step, i) => (
               <li key={`${i}-${step.title}`} style={{ marginBottom: 6 }}>
                 <Space size={6} wrap>
-                  <Tooltip
-                    title={
-                      step.owner === 'agent'
-                        ? 'The act phase does this'
-                        : 'Only you can do this — the agent has no tool for it'
-                    }
-                  >
-                    <Tag
-                      icon={step.owner === 'agent' ? <RobotOutlined /> : <UserOutlined />}
-                      color={step.owner === 'agent' ? 'default' : 'warning'}
+                  {step.owner && (
+                    <Tooltip
+                      title={step.owner === 'agent' ? 'The build-mode act phase did this' : 'A step for a human'}
                     >
-                      {step.owner}
-                    </Tag>
-                  </Tooltip>
+                      <Tag
+                        icon={step.owner === 'agent' ? <RobotOutlined /> : <UserOutlined />}
+                        color={step.owner === 'agent' ? 'default' : 'warning'}
+                      >
+                        {step.owner}
+                      </Tag>
+                    </Tooltip>
+                  )}
                   <span>{step.title}</span>
                   {step.tool && (
                     <Tag className="mono" color="default">

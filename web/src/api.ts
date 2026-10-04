@@ -4,10 +4,10 @@ import type {
   ActionRow,
   ActionWithProposal,
   ControlState,
-  Deliverable,
   DuplicateNotePair,
   EconomicsResponse,
   GoalHealth,
+  GoalLandscape,
   GoalRow,
   GoalStatus,
   LessonRow,
@@ -15,6 +15,10 @@ import type {
   PersistedEvent,
   Priority,
   ProposalRow,
+  ReportDetail,
+  ReportListRow,
+  ReportRow,
+  ReportVerdict,
   ResearchNoteRow,
   RunRow,
   SearchHit,
@@ -22,7 +26,6 @@ import type {
   SettingsResponse,
   StatusResponse,
   ConnectorStatus,
-  ToolInfo,
 } from './types'
 
 export interface ScheduleOptions {
@@ -31,10 +34,9 @@ export interface ScheduleOptions {
   recurrenceMs?: number | null
 }
 
-/** Human edits to a proposal's scope, applied server-side just before approval. */
+/** A human's rewrite of an idea, applied server-side just before approval. */
 export interface ScopeEdits {
   editedDescription?: string
-  editedRequiredTools?: string[]
 }
 
 /** Thrown for a 401 so the UI can prompt for the token instead of showing a generic failure. */
@@ -68,7 +70,6 @@ async function send<T = { ok: true }>(path: string, method: string, body?: unkno
 
 export const api = {
   status: () => getJson<StatusResponse>('/api/status'),
-  tools: () => getJson<ToolInfo[]>('/api/tools'),
   connectors: () => getJson<ConnectorStatus[]>('/api/connectors'),
   settings: () => getJson<SettingsResponse>('/api/settings'),
   /** Applies a patch atomically -- the server rejects the whole thing if any value is bad. */
@@ -85,7 +86,15 @@ export const api = {
   economics: () => getJson<EconomicsResponse>('/api/economics'),
   events: () => getJson<PersistedEvent[]>('/api/events'),
   actions: () => getJson<ActionWithProposal[]>('/api/actions'),
-  deliverables: () => getJson<Deliverable[]>('/api/deliverables'),
+  reports: (filter: { goalId?: number; verdict?: ReportVerdict } = {}) => {
+    const params = new URLSearchParams()
+    if (filter.goalId !== undefined) params.set('goalId', String(filter.goalId))
+    if (filter.verdict) params.set('verdict', filter.verdict)
+    const qs = params.toString()
+    return getJson<ReportListRow[]>(`/api/reports${qs ? `?${qs}` : ''}`)
+  },
+  report: (id: number) => getJson<ReportDetail>(`/api/reports/${id}`),
+  proposalReports: (id: number) => getJson<ReportRow[]>(`/api/proposals/${id}/reports`),
   search: (q: string) => getJson<SearchHit[]>(`/api/search?q=${encodeURIComponent(q)}`),
 
   decide: (id: number, approved: boolean, notes?: string, schedule?: ScheduleOptions, edits?: ScopeEdits) =>
@@ -99,29 +108,16 @@ export const api = {
       priority,
     }),
 
-  setProposalReview: (id: number, reviewStatus: ProposalRow['review_status']) =>
-    send(`/api/proposals/${id}/review`, 'POST', { reviewStatus }),
-
   cancelSchedule: (id: number) => send(`/api/proposals/${id}/cancel-schedule`, 'POST'),
 
   /**
-   * Put an approved proposal's act phase back in the run queue.
-   *
-   * The manual counterpart to the startup sweep, which deschedules anything whose act phase
-   * started and didn't finish rather than silently re-running it and repeating side effects.
-   * The scheduler picks this up on its next tick, so the build starts within ~15s.
+   * Put an approved idea back in the deep-dive queue: a retry after an unfinished deep dive, or
+   * a fresh report beside an existing one. The scheduler picks it up within ~15s.
    */
-  rerunBuild: (id: number) => send<{ ok: true; proposal: ProposalRow }>(`/api/proposals/${id}/rerun`, 'POST'),
+  rerunDeepDive: (id: number) => send<{ ok: true; proposal: ProposalRow }>(`/api/proposals/${id}/rerun`, 'POST'),
 
-  /** What is building, what is queued behind it, what is due later, and how long act phases take. */
+  /** Which deep dive is running, what is queued behind it, what is due later, and how long one takes. */
   queue: () => getJson<BuildQueue>('/api/queue'),
-  /**
-   * Narrow or widen an already-approved proposal's scope, up until its act phase starts.
-   * Pending proposals use `decide` instead, which applies edits before the status flips.
-   * 409s once the proposal is running or has acted.
-   */
-  editScope: (id: number, edits: { description?: string; requiredTools?: string[] }) =>
-    send<{ ok: true; proposal: ProposalRow }>(`/api/proposals/${id}/scope`, 'POST', edits),
 
   // ---- memory curation ----
   editLesson: (id: number, fields: { domain?: string; lesson?: string }) => send(`/api/lessons/${id}`, 'PATCH', fields),
@@ -136,6 +132,7 @@ export const api = {
   // operator's edits and the activation in one call, so a goal is never briefly active carrying
   // text they were still correcting.
   goals: () => getJson<{ goals: GoalRow[]; health: GoalHealth[] }>('/api/goals'),
+  goalLandscape: (id: number) => getJson<GoalLandscape>(`/api/goals/${id}/landscape`),
   createGoal: (fields: { title: string; brief?: string; weight?: number }) =>
     send<{ ok: true; id: number; control: ControlState }>('/api/goals', 'POST', fields),
   updateGoal: (id: number, fields: { title?: string; brief?: string; status?: GoalStatus; weight?: number }) =>

@@ -9,7 +9,7 @@
 // Tool names keep their `mcp__memory__` / `mcp__integrations__` prefixes even though
 // no MCP server exists any more. Those strings are persisted -- every row in
 // `actions.tool_name`, every approved proposal's `required_tools`, and the console's
-// display code (web/src/format.ts, ToolFence.tsx) all strip or match on them. Renaming
+// display code (web/src/format.ts) all strip or match on them. Renaming
 // would invalidate the fence on already-approved proposals for no behavioural gain, so
 // the prefixes stay as opaque namespaces.
 //

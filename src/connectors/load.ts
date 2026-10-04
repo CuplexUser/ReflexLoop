@@ -29,7 +29,7 @@ import { connectorManifest, type ConnectorManifest, type OperationSpec } from ".
 export const CONNECTOR_PREFIX = "mcp__integrations__";
 
 export interface LoadedOperation {
-  /** Fully-qualified tool name, e.g. "mcp__integrations__stripe_create_payment_link". */
+  /** Fully-qualified tool name, e.g. "mcp__integrations__hn_search". */
   toolName: string;
   spec: OperationSpec;
   connector: ConnectorManifest;
@@ -126,11 +126,11 @@ for (const err of CONNECTOR_ERRORS) {
 
 export const CONNECTOR_OPERATIONS: LoadedOperation[] = CONNECTORS.flatMap((c) => c.operations);
 
-/** Fully-qualified names by risk. Every operation, configured or not -- see tool-catalog.ts. */
+/**
+ * Fully-qualified names of every operation, configured or not -- see tool-catalog.ts. All of
+ * them are reads: the manifest schema refuses anything else at load.
+ */
 export const CONNECTOR_READ_TOOLS = CONNECTOR_OPERATIONS.filter((o) => o.spec.risk === "read").map(
-  (o) => o.toolName
-);
-export const CONNECTOR_WRITE_TOOLS = CONNECTOR_OPERATIONS.filter((o) => o.spec.risk === "write").map(
   (o) => o.toolName
 );
 
@@ -161,7 +161,7 @@ export interface ConnectorStatus {
   configured: boolean;
   envVar: string | null;
   docsUrl: string | null;
-  operations: { name: string; toolName: string; risk: "read" | "write"; description: string }[];
+  operations: { name: string; toolName: string; risk: "read"; description: string }[];
 }
 
 /** What the console shows: which connectors exist, and which are missing a key. */

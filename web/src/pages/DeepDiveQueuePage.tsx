@@ -13,7 +13,7 @@ import { palette } from '../theme'
 
 const { Text, Title } = Typography
 
-/** Ticks once a second so the elapsed clock on a running build actually moves. */
+/** Ticks once a second so the elapsed clock on a running deep dive actually moves. */
 function useNow(active: boolean): number {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
@@ -34,9 +34,10 @@ function duration(ms: number): string {
 /**
  * Median plus range plus sample size, never a bare number.
  *
- * Real act phases in this agent's ledger have run anywhere from 8 to 32 minutes. A single
+ * Real phases in this agent's ledger have run anywhere from 8 to 32 minutes. A single
  * "estimated 12 minutes" would be wrong nearly every time and would be believed anyway; showing
- * the spread is what makes it a forecast rather than a promise.
+ * the spread is what makes it a forecast rather than a promise. The ledger key is `act`, which
+ * includes the build-mode runs from before this agent became research-only.
  */
 function ForecastLine({ forecast, allModels }: { forecast: DurationForecast; allModels: DurationForecast }) {
   // Falls back to the all-model figure when the pinned model has no history of its own, which is
@@ -47,20 +48,20 @@ function ForecastLine({ forecast, allModels }: { forecast: DurationForecast; all
   if (shown.samples === 0 || shown.medianMs === null) {
     return (
       <Text type="secondary" style={{ fontSize: 12 }}>
-        No completed act phases yet — no basis for an estimate.
+        No completed deep dives yet — no basis for an estimate.
       </Text>
     )
   }
   return (
     <Text type="secondary" style={{ fontSize: 12 }}>
-      Typically <Text strong>{duration(shown.medianMs)}</Text> per build — median of the last {shown.samples} act{' '}
-      {shown.samples === 1 ? 'phase' : 'phases'} on {scope}, ranging {duration(shown.minMs ?? 0)} to{' '}
+      Typically <Text strong>{duration(shown.medianMs)}</Text> per deep dive — median of the last {shown.samples}{' '}
+      {shown.samples === 1 ? 'run' : 'runs'} on {scope}, ranging {duration(shown.minMs ?? 0)} to{' '}
       {duration(shown.maxMs ?? 0)}.
     </Text>
   )
 }
 
-function RunningBuild({
+function RunningDeepDive({
   running,
   feed,
   elapsedMs,
@@ -75,9 +76,9 @@ function RunningBuild({
 }) {
   const readOnly = useConsoleOnly()
 
-  // The build log. Not a new stream -- the activity feed already carries every tool call and
-  // every line of model text with the proposal id on it, so this is that feed narrowed to the
-  // one build. `phase_start` is kept because "act started" is the first line you want to see.
+  // The deep dive's log. Not a new stream -- the activity feed already carries every tool call
+  // and every line of model text with the proposal id on it, so this is that feed narrowed to
+  // the one idea. `phase_start` is kept because "deep dive started" is the first line you want.
   const log = useMemo(
     () =>
       feed.filter((entry) => {
@@ -102,7 +103,7 @@ function RunningBuild({
               style={{ width: 8, height: 8, borderRadius: '50%', background: palette.active, display: 'inline-block' }}
             />
             <Title level={5} style={{ margin: 0 }}>
-              Building proposal #{running.proposalId}
+              Investigating idea #{running.proposalId}
             </Title>
             <Tag color={PRIORITY_TAG_COLOR[running.priority]}>{PRIORITY_LABEL[running.priority]}</Tag>
             <Tag>{running.domain}</Tag>
@@ -116,9 +117,9 @@ function RunningBuild({
             {elapsedMs === null ? '—' : duration(elapsedMs)}
           </Text>
           <Button size="small" onClick={onOpen}>
-            Open proposal
+            Open idea
           </Button>
-          <Tooltip title={readOnly ? READ_ONLY_HINT : 'Stop this build. Anything already committed or deployed stays.'}>
+          <Tooltip title={readOnly ? READ_ONLY_HINT : 'Stop this deep dive. Notes it already saved stay; no report is filed.'}>
             <Button size="small" danger ghost icon={<StopOutlined />} disabled={readOnly} onClick={onAbort}>
               Abort
             </Button>
@@ -138,14 +139,14 @@ function RunningBuild({
 }
 
 /**
- * The build queue: what is running, what is queued behind it, and what is due later.
+ * The deep-dive queue: which approved idea is being investigated, what is queued behind it, and
+ * what is due later.
  *
- * This is the one question the console could not answer. The Dashboard says a phase is running,
- * the Live feed says what it is doing, and Proposals says what was approved -- but "what is the
- * agent going to build, in what order, and how long will it take" was spread across three pages
- * and an in-memory array nothing exposed.
+ * The Dashboard says a phase is running, the Live feed says what it is doing, and Ideas says
+ * what was approved -- but "what is the agent going to investigate, in what order, and how long
+ * will it take" lives in an in-memory queue only this page exposes.
  */
-export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; historyVersion: number }) {
+export function DeepDiveQueuePage({ feed, historyVersion }: { feed: FeedEntry[]; historyVersion: number }) {
   const navigate = useNavigate()
   const { message, modal } = App.useApp()
   const readOnly = useConsoleOnly()
@@ -177,10 +178,10 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
   async function abort() {
     if (!running) return
     modal.confirm({
-      title: `Abort the build of proposal #${running.proposalId}?`,
+      title: `Abort the deep dive on idea #${running.proposalId}?`,
       content:
-        'Whatever it has already committed or deployed stays — there is no rollback. It will be marked interrupted and will not re-run on its own.',
-      okText: 'Abort build',
+        'Nothing it does has side effects; notes it already saved stay, and no report is filed. It will be marked interrupted and will not re-run on its own.',
+      okText: 'Abort deep dive',
       okButtonProps: { danger: true },
       onOk: async () => {
         try {
@@ -199,10 +200,10 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
   const rerun = useCallback(
     async (proposalId: number) => {
       try {
-        await api.rerunBuild(proposalId)
-        message.success(`Build queued — proposal #${proposalId} runs on the next scheduler tick`)
+        await api.rerunDeepDive(proposalId)
+        message.success(`Deep dive queued — idea #${proposalId} runs on the next scheduler tick`)
       } catch (err) {
-        message.error(err instanceof Error ? err.message : 'Queueing the build failed')
+        message.error(err instanceof Error ? err.message : 'Queueing the deep dive failed')
       }
     },
     [message]
@@ -222,7 +223,7 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
       },
       { title: 'Goal', dataIndex: 'domain', width: 200, ellipsis: true },
       {
-        title: 'What it builds',
+        title: 'Idea',
         dataIndex: 'description',
         ellipsis: true,
         render: (text: string) => markdownPreview(text, 200),
@@ -253,7 +254,7 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
   const queuedView = useTableView('builds-queued', columns)
   const scheduledView = useTableView('builds-scheduled', columns)
   // Its own column set: the point of this table is the button, and "Due" is always empty here
-  // by definition -- a stalled build is precisely one with no next_run_at.
+  // by definition -- an unfinished deep dive here is precisely one with no next_run_at.
   const stalledView = useTableView(
     'builds-stalled',
     useMemo(
@@ -265,7 +266,7 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
           key: 'retry',
           width: 130,
           render: (id: number) => (
-            <Tooltip title={readOnly ? READ_ONLY_HINT : 'Queue this build to run again'}>
+            <Tooltip title={readOnly ? READ_ONLY_HINT : 'Queue this deep dive to run again'}>
               <Button size="small" type="primary" ghost icon={<PlayCircleOutlined />} disabled={readOnly} onClick={() => rerun(id)}>
                 Retry
               </Button>
@@ -277,7 +278,7 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
     )
   )
 
-  if (error) return <Alert type="error" showIcon message="Could not load the build queue" description={error} />
+  if (error) return <Alert type="error" showIcon message="Could not load the deep-dive queue" description={error} />
 
   const queued = queue?.queued ?? []
   const scheduled = queue?.scheduled ?? []
@@ -287,13 +288,13 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
     <Space direction="vertical" size={20} style={{ width: '100%' }}>
       <div>
         <Title level={4} style={{ marginBottom: 4 }}>
-          Build queue
+          Deep-dive queue
         </Title>
         {queue && <ForecastLine forecast={queue.forecast} allModels={queue.forecastAllModels} />}
       </div>
 
       {running ? (
-        <RunningBuild
+        <RunningDeepDive
           running={running}
           feed={feed}
           elapsedMs={elapsedMs}
@@ -306,8 +307,8 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
             image={Empty.PRESENTED_IMAGE_SIMPLE}
             description={
               queued.length > 0
-                ? 'Nothing building right now — the worker picks the next one up within about 15 seconds.'
-                : 'Nothing building, and nothing queued. Approve a proposal, or retry one from Deliverables.'
+                ? 'Nothing running right now — the worker picks the next one up within about 15 seconds.'
+                : 'Nothing running, and nothing queued. Approve an idea to start a deep dive on it.'
             }
           />
         </Card>
@@ -362,11 +363,10 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
       <div>
         <Space align="center" style={{ marginBottom: 8 }} wrap>
           <Title level={5} style={{ margin: 0 }}>
-            Stalled — needs a decision
+            Unfinished deep dives
           </Title>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            approved, unfinished, and nothing will run it: a build that stopped is descheduled rather than re-run, so it
-            waits here until you say so
+            approved, no report, and nothing will run it: a deep dive that stopped waits here until you retry it
           </Text>
         </Space>
         <Table
@@ -378,7 +378,7 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
           dataSource={stalled}
           size="small"
           pagination={false}
-          locale={{ emptyText: 'Nothing stalled — every approved build has either run or is queued.' }}
+          locale={{ emptyText: 'Nothing unfinished — every approved idea has a report or is queued.' }}
         />
       </div>
     </Space>
@@ -386,4 +386,4 @@ export function BuildsPage({ feed, historyVersion }: { feed: FeedEntry[]; histor
 }
 
 /** Kept exported so the page can be lazy-loaded alongside every other route. */
-export default BuildsPage
+export default DeepDiveQueuePage

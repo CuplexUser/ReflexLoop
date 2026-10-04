@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { MemoryStore, parseMonetization, parseSteps } from "./memory-server.js";
+import { MemoryStore, parseMarket, parseMonetization, parseSteps } from "./memory-server.js";
 
 /**
  * Qdrant is mocked so these tests are deterministic and need no cluster, independent of any
@@ -161,30 +161,27 @@ describe("act status and the duplicate carve-out", () => {
     store.markActStarted(id);
 
     // The process dies here; the next one sweeps.
-    expect(store.reapAfterUncleanShutdown().interrupted.map((p) => p.id)).toEqual([id]);
+    expect(store.reapInterruptedDeepDives().map((p) => p.id)).toEqual([id]);
     expect(store.getProposal(id)!.act_status).toBe("interrupted");
     expect(store.findDuplicateProposal(FOLLOW_UP)).toBeNull();
   });
 
-  it("lists unfinished acts for the operator, and clears one on a fresh attempt", () => {
-    const interrupted = approvedMachwatch();
-    store.markActStarted(interrupted);
-    store.reapAfterUncleanShutdown();
+  it("clears the previous verdict's problems when a fresh attempt starts", () => {
+    const id = approvedMachwatch();
+    store.markActStarted(id);
+    store.recordActVerdict(id, { complete: false, problems: ["No report was submitted."] });
 
-    expect(store.listUnfinishedActs().map((p) => p.id)).toEqual([interrupted]);
-
-    // Re-running act on it clears the marker until the new run reaches its own verdict.
-    store.markActStarted(interrupted);
-    expect(store.listUnfinishedActs()).toEqual([]);
-    expect(store.getProposal(interrupted)!.act_problems).toBeNull();
+    // Re-running clears the marker until the new run reaches its own verdict.
+    store.markActStarted(id);
+    expect(store.getProposal(id)!.act_status).toBe("running");
+    expect(store.getProposal(id)!.act_problems).toBeNull();
   });
 
-  it("leaves a proposal that never acted out of every act-status list", () => {
+  it("leaves a proposal that never ran out of the reap", () => {
     const id = store.createProposal(MACHWATCH);
     store.decideProposal(id, "approved");
     expect(store.getProposal(id)!.act_status).toBeNull();
-    expect(store.listUnfinishedActs()).toEqual([]);
-    expect(store.reapAfterUncleanShutdown()).toEqual({ interrupted: [], descheduled: [] });
+    expect(store.reapInterruptedDeepDives()).toEqual([]);
   });
 });
 
@@ -207,57 +204,31 @@ describe("recovering from an unclean shutdown", () => {
     return id;
   }
 
-  it("descheduled an act phase that died, so it does not silently re-run", () => {
+  it("marks a deep dive that died as interrupted and leaves it due, so it resumes", () => {
     const id = approved();
     // Approval always sets next_run_at; drainQueue's finally is what clears it, and a killed
-    // process never gets there.
+    // process never gets there. A deep dive has no side effects, so resuming it is safe.
     expect(store.getProposal(id)!.next_run_at).not.toBeNull();
     store.markActStarted(id);
 
-    const reaped = store.reapAfterUncleanShutdown();
-    expect(reaped.interrupted.map((p) => p.id)).toEqual([id]);
-    expect(reaped.descheduled.map((p) => p.id)).toEqual([id]);
-    expect(store.getProposal(id)!.next_run_at).toBeNull();
-    expect(store.listDueProposals(new Date().toISOString()).map((p) => p.id)).not.toContain(id);
+    expect(store.reapInterruptedDeepDives().map((p) => p.id)).toEqual([id]);
+    expect(store.getProposal(id)!.act_status).toBe("interrupted");
+    expect(store.listDueProposals(new Date().toISOString()).map((p) => p.id)).toContain(id);
   });
 
-  it("also descheduled an act phase that finished but whose reflect was cut short", () => {
+  it("does not touch an approved idea that has not run yet", () => {
     const id = approved();
-    store.markActStarted(id);
-    store.recordActVerdict(id, { complete: true, problems: [] });
-    // Process dies between act and reflect: act_status is 'complete' but next_run_at survives.
-
-    const reaped = store.reapAfterUncleanShutdown();
-    expect(reaped.interrupted).toEqual([]);
-    expect(reaped.descheduled.map((p) => p.id)).toEqual([id]);
-    expect(store.getProposal(id)!.next_run_at).toBeNull();
-  });
-
-  it("leaves a recurring proposal's schedule alone -- skipping real scheduled work is worse", () => {
-    const id = approved({ recurrenceMs: 3_600_000 });
-    store.markActStarted(id);
-
-    const reaped = store.reapAfterUncleanShutdown();
-    expect(reaped.interrupted.map((p) => p.id)).toEqual([id]);
-    expect(reaped.descheduled).toEqual([]);
-    expect(store.getProposal(id)!.next_run_at).not.toBeNull();
-  });
-
-  it("does not touch an approved proposal that has not acted yet", () => {
-    const id = approved();
-    const reaped = store.reapAfterUncleanShutdown();
-
-    expect(reaped).toEqual({ interrupted: [], descheduled: [] });
-    expect(store.getProposal(id)!.next_run_at).not.toBeNull();
+    expect(store.reapInterruptedDeepDives()).toEqual([]);
+    expect(store.getProposal(id)!.act_status).toBeNull();
     expect(store.listDueProposals(new Date().toISOString()).map((p) => p.id)).toContain(id);
   });
 
   it("is idempotent -- a clean second start finds nothing to repair", () => {
     const id = approved();
     store.markActStarted(id);
-    store.reapAfterUncleanShutdown();
+    store.reapInterruptedDeepDives();
 
-    expect(store.reapAfterUncleanShutdown()).toEqual({ interrupted: [], descheduled: [] });
+    expect(store.reapInterruptedDeepDives()).toEqual([]);
     expect(store.getProposal(id)!.act_status).toBe("interrupted");
   });
 
@@ -313,7 +284,8 @@ describe("recovering from an unclean shutdown", () => {
   it("re-runs only on an explicit request, and only for approved work", () => {
     const id = approved();
     store.markActStarted(id);
-    store.reapAfterUncleanShutdown();
+    store.recordActVerdict(id, { complete: false, problems: ["No report was submitted."] });
+    store.advanceOrClearSchedule(id, { recurring: false, recurrenceMs: null });
     expect(store.getProposal(id)!.next_run_at).toBeNull();
 
     expect(store.requeueApprovedProposal(id)).toBe(true);
@@ -434,25 +406,7 @@ describe("research note dedupe", () => {
   });
 });
 
-describe("proposal scope edits", () => {
-  it("records what the model originally proposed when a human narrows the fence", () => {
-    const id = store.createProposal({
-      domain: "saas",
-      description: "Build and deploy a landing page",
-      expectedCost: 10,
-      expectedTimeHours: 2,
-      expectedUpside: 100,
-      requiredTools: ["mcp__integrations__github_create_repo", "mcp__integrations__vercel_deploy"],
-    });
-
-    store.applyProposalEdits(id, { requiredTools: ["mcp__integrations__github_create_repo"] });
-    const edited = store.getProposal(id)!;
-    expect(edited.required_tools).toBe("mcp__integrations__github_create_repo");
-    expect(edited.original_required_tools).toBe(
-      "mcp__integrations__github_create_repo,mcp__integrations__vercel_deploy"
-    );
-  });
-
+describe("description edits", () => {
   it("keeps the first original through a second edit", () => {
     const id = store.createProposal({
       domain: "saas",
@@ -762,72 +716,81 @@ describe("semantic search path", () => {
   });
 });
 
-describe("action history reach", () => {
-  it("matches on goal id OR text, so work predating goals is still found", () => {
-    const goalId = store.createGoal({ title: "Comparison sites" });
-    const filed = store.createProposal({
-      domain: "Comparison sites",
-      description: "new work",
-      expectedCost: 1,
-      expectedTimeHours: 1,
-      expectedUpside: 1,
-      requiredTools: ["WebSearch"],
+describe("reports", () => {
+  function approvedIdea(goalId: number | null = null) {
+    const id = store.createProposal({
+      domain: "invoicing",
+      description: "**Invoice Lint** -- a linter for invoice templates",
+      expectedCost: 20,
+      expectedTimeHours: 6,
+      expectedUpside: 400,
       goalId,
     });
-    const legacy = store.createProposal({
-      domain: "affiliate comparison site",
-      description: "old work",
-      expectedCost: 1,
-      expectedTimeHours: 1,
-      expectedUpside: 1,
-      requiredTools: ["WebSearch"],
-    });
-    for (const id of [filed, legacy]) {
-      store.decideProposal(id, "approved");
-      store.logAction(id, "act", "mcp__integrations__github_create_repo", { name: "r" }, { url: "u" });
-    }
-
-    // goal_id alone reaches only the new one; that was the old exact-domain filter's failure,
-    // which reported "nothing built here" for a lane that had shipped.
-    expect(store.listActionHistory({ goalId }).map((r) => r.proposalId)).toEqual([filed]);
-    expect(store.listActionHistory({ goalId, text: "affiliate comparison" }).map((r) => r.proposalId).sort()).toEqual(
-      [filed, legacy].sort()
-    );
-    expect(store.listActionHistory({})).toHaveLength(2);
-  });
-});
-
-describe("succeededActTools", () => {
-  it("credits only successful act-phase calls, and only the tools asked about", () => {
-    const id = store.createProposal({
-      domain: "sweden-funding",
-      description: "dossier",
-      expectedCost: 1,
-      expectedTimeHours: 1,
-      expectedUpside: 1,
-      requiredTools: ["mcp__integrations__github_create_repo"],
-    });
     store.decideProposal(id, "approved");
+    return id;
+  }
 
-    // Proposal #40's real first run: a 422 on the over-long description, then a create that
-    // worked, then the commit. The error is stored exactly as the handler returned it.
-    store.logAction(id, "act", "mcp__integrations__github_create_repo", {}, "Error: GitHub API POST /user/repos -> 422");
-    store.logAction(id, "act", "mcp__integrations__github_create_repo", {}, { url: "https://github.com/x/y" });
-    store.logAction(id, "act", "mcp__integrations__github_commit_files", {}, { commitSha: "abc" });
-    store.logAction(id, "act", "mcp__integrations__vercel_deploy", {}, "Error: no VERCEL_TOKEN");
-    store.logAction(id, "reflect", "mcp__memory__lesson_add", {}, "Saved lesson #1");
+  const report = (proposalId: number, verdict: "pursue" | "maybe" | "drop", goalId: number | null = null) =>
+    store.createReport({
+      proposalId,
+      goalId,
+      verdict,
+      viabilityScore: verdict === "pursue" ? 4 : 2,
+      confidence: "medium",
+      summary: `${verdict} summary`,
+      body: "## Summary\nbody",
+      sources: [{ title: "src", url: "https://example.com" }],
+    });
 
-    const asked = [
-      "mcp__integrations__github_create_repo",
-      "mcp__integrations__github_commit_files",
-      "mcp__integrations__vercel_deploy",
-      "mcp__memory__lesson_add",
-    ];
-    expect(store.succeededActTools(id, asked).sort()).toEqual([
-      "mcp__integrations__github_commit_files",
-      "mcp__integrations__github_create_repo",
-    ]);
-    expect(store.succeededActTools(id, [])).toEqual([]);
+  it("keeps every report and treats the newest as the one that counts", () => {
+    const id = approvedIdea();
+    const first = report(id, "maybe");
+    const second = report(id, "drop");
+
+    expect(store.listReportsForProposal(id).map((r) => r.id)).toEqual([second, first]);
+    expect(store.latestReportsByProposal().get(id)).toMatchObject({ id: second, verdict: "drop" });
+    expect(store.getReport(first)?.verdict).toBe("maybe");
+  });
+
+  it("lists reports without bodies, filtered by goal and verdict", () => {
+    const goalId = store.createGoal({ title: "Invoicing" });
+    const a = approvedIdea(goalId);
+    const b = approvedIdea();
+    report(a, "pursue", goalId);
+    report(b, "drop");
+
+    const all = store.listReports();
+    expect(all).toHaveLength(2);
+    expect(all[0]).not.toHaveProperty("body");
+    expect(store.listReports({ goalId }).map((r) => r.proposal_id)).toEqual([a]);
+    expect(store.listReports({ goalId }).map((r) => r.goal_title)).toEqual(["Invoicing"]);
+    expect(store.listReports({ verdict: "drop" }).map((r) => r.proposal_id)).toEqual([b]);
+  });
+
+  it("detaches reports from a deleted goal rather than losing them", () => {
+    const goalId = store.createGoal({ title: "Invoicing" });
+    const id = approvedIdea(goalId);
+    const reportId = report(id, "maybe", goalId);
+    store.deleteGoal(goalId);
+    expect(store.getReport(reportId)?.goal_id).toBeNull();
+  });
+
+  it("counts deep-dived ideas in goal health", () => {
+    const goalId = store.createGoal({ title: "Invoicing" });
+    report(approvedIdea(goalId), "pursue", goalId);
+    approvedIdea(goalId);
+    expect(store.goalHealth().find((h) => h.goal_id === goalId)).toMatchObject({ proposals: 2, deep_dives: 1 });
+  });
+
+  it("lists a goal's own notes and ideas, and nothing unassigned", async () => {
+    const goalId = store.createGoal({ title: "Invoicing" });
+    await store.addResearchNote("filed", "under the goal", undefined, undefined, { goalId, kind: "gap" });
+    await store.addResearchNote("loose", "unassigned");
+    const filed = approvedIdea(goalId);
+    approvedIdea();
+
+    expect(store.listResearchNotesForGoal(goalId).map((n) => n.topic)).toEqual(["filed"]);
+    expect(store.listProposalsForGoal(goalId).map((p) => p.id)).toEqual([filed]);
   });
 });
 
@@ -849,10 +812,15 @@ describe("unified search", () => {
   });
 });
 
-// The tool wrapper, not just the store: the monetization block and the steps↔fence
-// cross-check only exist at the proposal_create boundary, and that check is the whole
-// reason the step list is worth storing -- a plan whose steps need tools the fence
-// doesn't grant is a plan that cannot run, stated as though it can.
+async function invoke(name: string, args: Record<string, unknown>) {
+  const { buildMemoryTools } = await import("./memory-server.js");
+  const { ToolRegistry } = await import("./tools/registry.js");
+  const registry = new ToolRegistry(buildMemoryTools(store));
+  return registry.invoke(name, args);
+}
+
+// The tool wrapper, not just the store: the market block, the monetization block and the
+// source-URL check only exist at the proposal_create boundary.
 describe("proposal_create", () => {
   const baseArgs = {
     domain: "saas",
@@ -860,7 +828,6 @@ describe("proposal_create", () => {
     expectedCost: 20,
     expectedTimeHours: 6,
     expectedUpside: 400,
-    requiredTools: ["mcp__integrations__github_create_repo"],
     revenueModel: "one_off" as const,
     monetization: {
       whoPays: "Freelance bookkeepers",
@@ -870,53 +837,55 @@ describe("proposal_create", () => {
       keyAssumption: "Bookkeepers will pay for a linter rather than eyeballing templates",
       validationSignal: "First 3 paid downloads within two weeks",
     },
+    market: {
+      marketSize: "~30k freelance bookkeepers in the US (estimate from BLS)",
+      demandEvidence: [{ claim: "Template errors are a recurring forum complaint", sourceUrl: "https://example.com/thread" }],
+      competitors: [{ name: "Manual review", pricing: "free" }],
+      keyRisks: ["Accounting suites add the check themselves"],
+      viabilityScore: 3,
+      confidence: "low" as const,
+    },
     steps: [
-      { title: "Create the repo", owner: "agent" as const, tool: "mcp__integrations__github_create_repo", doneWhen: "Repo exists with the CLI committed" },
-      { title: "Publish the payment link", owner: "human" as const, doneWhen: "Link resolves and accepts a test card" },
+      { title: "Post the idea in two bookkeeping forums", doneWhen: "20 replies asking for it" },
+      { title: "Publish the payment link", doneWhen: "Link resolves and accepts a test card" },
     ],
   };
 
-  async function create(args: Record<string, unknown>) {
-    const { buildMemoryTools } = await import("./memory-server.js");
-    const { ToolRegistry } = await import("./tools/registry.js");
-    const registry = new ToolRegistry(buildMemoryTools(store));
-    return registry.invoke("mcp__memory__proposal_create", args);
-  }
+  const create = (args: Record<string, unknown>) => invoke("mcp__memory__proposal_create", args);
 
-  it("stores the monetization block and steps on the row", async () => {
+  it("stores the market block, monetization block and launch outline on the row", async () => {
     const res = await create(baseArgs);
     expect(res.isError).toBe(false);
+    expect(res.text).toContain("Created idea");
 
     const [row] = store.listAllProposals();
     expect(row.revenue_model).toBe("one_off");
+    expect(row.required_tools).toBe("");
     expect(parseMonetization(row)?.pathToFirstDollar).toBe("Stripe payment link on the README");
-    expect(parseSteps(row).map((s) => s.owner)).toEqual(["agent", "human"]);
+    expect(parseMarket(row)?.viabilityScore).toBe(3);
+    expect(parseSteps(row).map((s) => s.owner)).toEqual([undefined, undefined]);
   });
 
-  it("refuses when an agent step needs a tool the fence doesn't grant", async () => {
+  it("refuses demand evidence that doesn't cite an http(s) URL", async () => {
     const res = await create({
       ...baseArgs,
-      steps: [
-        ...baseArgs.steps,
-        { title: "Deploy the landing page", owner: "agent", tool: "mcp__integrations__vercel_deploy", doneWhen: "Site is live" },
-      ],
+      market: { ...baseArgs.market, demandEvidence: [{ claim: "people want it", sourceUrl: "my own experience" }] },
     });
-
     expect(res.isError).toBe(false); // refused in band, like the duplicate check -- not an exception
     expect(res.text).toContain("Not created");
-    expect(res.text).toContain("mcp__integrations__vercel_deploy");
     expect(store.listAllProposals()).toHaveLength(0);
   });
 
-  it("allows a human step to have no tool -- that's the point of marking it human", async () => {
-    const res = await create({
-      ...baseArgs,
-      steps: [
-        baseArgs.steps[0],
-        { title: "Register for the affiliate programme", owner: "human", doneWhen: "Approval email received" },
-      ],
-    });
-    expect(res.text).toContain("Created proposal");
+  it("rejects an idea with no market block", async () => {
+    const { market: _omitted, ...withoutMarket } = baseArgs;
+    const res = await create(withoutMarket);
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("market");
+  });
+
+  it("accepts the audience-first revenue models", async () => {
+    const res = await create({ ...baseArgs, revenueModel: "deferred" });
+    expect(res.text).toContain("Created idea");
   });
 
   it("rejects a proposal with no monetization block at all", async () => {
@@ -925,5 +894,57 @@ describe("proposal_create", () => {
     expect(res.isError).toBe(true);
     expect(res.text).toContain("monetization");
     expect(store.listAllProposals()).toHaveLength(0);
+  });
+});
+
+describe("report_submit", () => {
+  const body = "## Summary\n" + "Evidence and reasoning. ".repeat(40);
+  const args = (proposalId: number) => ({
+    proposalId,
+    verdict: "maybe",
+    viabilityScore: 3,
+    confidence: "medium",
+    summary: "Promising if bookkeepers can be reached cheaply.",
+    body,
+    sources: [{ title: "Forum thread", url: "https://example.com/thread" }],
+  });
+
+  function approvedIdea() {
+    const id = store.createProposal({
+      domain: "invoicing",
+      description: "**Invoice Lint**",
+      expectedCost: 0,
+      expectedTimeHours: 1,
+      expectedUpside: 0,
+    });
+    store.decideProposal(id, "approved");
+    return id;
+  }
+
+  it("saves a report for the idea whose deep dive is running", async () => {
+    const id = approvedIdea();
+    store.markActStarted(id);
+    const res = await invoke("mcp__memory__report_submit", args(id));
+    expect(res.text).toContain("Saved report");
+    expect(store.latestReportsByProposal().get(id)).toMatchObject({ verdict: "maybe", viability_score: 3 });
+  });
+
+  it("refuses a report for any other idea", async () => {
+    const running = approvedIdea();
+    const other = approvedIdea();
+    store.markActStarted(running);
+    const res = await invoke("mcp__memory__report_submit", args(other));
+    expect(res.text).toContain("Not saved");
+    expect(store.listReportsForProposal(other)).toEqual([]);
+  });
+
+  it("refuses a stub body and a non-URL source", async () => {
+    const id = approvedIdea();
+    store.markActStarted(id);
+    expect((await invoke("mcp__memory__report_submit", { ...args(id), body: "## Summary\nshort" })).text).toContain("Not saved");
+    expect(
+      (await invoke("mcp__memory__report_submit", { ...args(id), sources: [{ title: "notes", url: "memory" }] })).text
+    ).toContain("Not saved");
+    expect(store.listReportsForProposal(id)).toEqual([]);
   });
 });

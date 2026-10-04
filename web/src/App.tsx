@@ -1,10 +1,11 @@
-import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
+import { Suspense, lazy, useEffect, useState } from 'react'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { App as AntApp, Badge, Button, Layout, Menu, Spin, Tag, Tooltip, Typography } from 'antd'
+import { Badge, Button, Layout, Menu, Spin, Tag, Tooltip, Typography } from 'antd'
 import {
   BulbOutlined,
-  BuildOutlined,
   CodeOutlined,
+  FileSearchOutlined,
+  HourglassOutlined,
   AimOutlined,
   ControlOutlined,
   SettingOutlined,
@@ -13,7 +14,6 @@ import {
   FileTextOutlined,
   FundOutlined,
   MoonOutlined,
-  RocketOutlined,
   SearchOutlined,
   SunOutlined,
   ThunderboltOutlined,
@@ -38,10 +38,12 @@ import type { OutcomeRow, ProposalRow, StatusResponse } from './types'
  * add a request round-trip in front of the first paint.
  */
 const LiveFeedPage = lazy(() => import('./pages/LiveFeedPage').then((m) => ({ default: m.LiveFeedPage })))
-const BuildsPage = lazy(() => import('./pages/BuildsPage').then((m) => ({ default: m.BuildsPage })))
+const DeepDiveQueuePage = lazy(() =>
+  import('./pages/DeepDiveQueuePage').then((m) => ({ default: m.DeepDiveQueuePage })),
+)
 const ProposalsPage = lazy(() => import('./pages/ProposalsPage').then((m) => ({ default: m.ProposalsPage })))
+const ReportsPage = lazy(() => import('./pages/ReportsPage').then((m) => ({ default: m.ReportsPage })))
 const ActionsPage = lazy(() => import('./pages/ActionsPage').then((m) => ({ default: m.ActionsPage })))
-const DeliverablesPage = lazy(() => import('./pages/DeliverablesPage').then((m) => ({ default: m.DeliverablesPage })))
 const LessonsPage = lazy(() => import('./pages/LessonsPage').then((m) => ({ default: m.LessonsPage })))
 const ResearchPage = lazy(() => import('./pages/ResearchPage').then((m) => ({ default: m.ResearchPage })))
 const EconomicsPage = lazy(() => import('./pages/EconomicsPage').then((m) => ({ default: m.EconomicsPage })))
@@ -55,9 +57,9 @@ const CommandPalette = lazy(() => import('./components/CommandPalette').then((m)
 type PageKey =
   | 'dashboard'
   | 'live'
-  | 'builds'
+  | 'queue'
   | 'proposals'
-  | 'deliverables'
+  | 'reports'
   | 'actions'
   | 'economics'
   | 'lessons'
@@ -70,9 +72,11 @@ type PageKey =
 const PAGE_PATHS: Record<PageKey, string> = {
   dashboard: '/',
   live: '/live',
-  builds: '/builds',
+  queue: '/queue',
+  // The path keeps its old name: ideas are stored as proposals, and every deep link and
+  // bookmark to /proposals/:id still has to land.
   proposals: '/proposals',
-  deliverables: '/deliverables',
+  reports: '/reports',
   actions: '/actions',
   economics: '/economics',
   lessons: '/lessons',
@@ -92,7 +96,6 @@ function PageFallback() {
 }
 
 function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme: () => void }) {
-  const { message } = AntApp.useApp()
   const socket = useAgentSocket()
   const navigate = useNavigate()
   const location = useLocation()
@@ -106,7 +109,7 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
   const [needsToken, setNeedsToken] = useState(false)
   const [authVersion, setAuthVersion] = useState(0)
 
-  // The first path segment picks the nav item, so /proposals/12 still highlights Proposals.
+  // The first path segment picks the nav item, so /proposals/12 still highlights Ideas.
   const segment = `/${location.pathname.split('/')[1] ?? ''}`
   const page = (Object.keys(PAGE_PATHS) as PageKey[]).find((key) => PAGE_PATHS[key] === segment) ?? 'dashboard'
 
@@ -145,18 +148,6 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
 
   const pendingCount = Math.max(proposals.filter((p) => p.status === 'pending').length, socket.pendingProposals.length)
 
-  const setProposalReview = useCallback(
-    async (id: number, reviewStatus: ProposalRow['review_status']) => {
-      try {
-        await api.setProposalReview(id, reviewStatus)
-        setProposals((prev) => prev.map((p) => (p.id === id ? { ...p, review_status: reviewStatus } : p)))
-      } catch (err) {
-        message.error(err instanceof Error ? err.message : 'Review update failed')
-      }
-    },
-    [message],
-  )
-
   if (needsToken && !getToken()) {
     return <TokenGate onSubmit={() => setAuthVersion((v) => v + 1)} />
   }
@@ -183,17 +174,17 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
           items={[
             { key: 'dashboard', icon: <DashboardOutlined />, label: 'Dashboard' },
             { key: 'live', icon: <CodeOutlined />, label: 'Live feed' },
-            { key: 'builds', icon: <BuildOutlined />, label: 'Build queue' },
+            { key: 'queue', icon: <HourglassOutlined />, label: 'Deep-dive queue' },
             {
               key: 'proposals',
               icon: <FileTextOutlined />,
               label: (
                 <Badge count={pendingCount} size="small" offset={[8, 0]}>
-                  <span>Proposals</span>
+                  <span>Ideas</span>
                 </Badge>
               ),
             },
-            { key: 'deliverables', icon: <RocketOutlined />, label: 'Deliverables' },
+            { key: 'reports', icon: <FileSearchOutlined />, label: 'Reports' },
             { key: 'actions', icon: <ThunderboltOutlined />, label: 'Actions' },
             { key: 'economics', icon: <FundOutlined />, label: 'Economics' },
             { key: 'lessons', icon: <BulbOutlined />, label: 'Lessons' },
@@ -247,7 +238,6 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
                     <DashboardPage
                       pendingProposals={socket.pendingProposals}
                       proposals={proposals}
-                      outcomes={outcomes}
                       totalCostUsd={status?.totalCostUsd ?? 0}
                       feed={socket.feed}
                       onOpenLiveFeed={() => navigate(PAGE_PATHS.live)}
@@ -256,41 +246,26 @@ function App({ themeMode, onToggleTheme }: { themeMode: ThemeMode; onToggleTheme
                 />
                 <Route path="/live" element={<LiveFeedPage feed={socket.feed} />} />
                 <Route
-                  path="/builds"
-                  element={<BuildsPage feed={socket.feed} historyVersion={socket.historyVersion} />}
+                  path="/queue"
+                  element={<DeepDiveQueuePage feed={socket.feed} historyVersion={socket.historyVersion} />}
                 />
+                {/* Old paths from build mode, so bookmarks still land somewhere sensible. */}
+                <Route path="/builds" element={<Navigate to="/queue" replace />} />
+                <Route path="/deliverables" element={<Navigate to="/reports" replace />} />
                 <Route path="/proposals" element={<ProposalsPage proposals={proposals} outcomes={outcomes} />} />
                 <Route path="/proposals/:id" element={<ProposalsPage proposals={proposals} outcomes={outcomes} />} />
-                <Route
-                  path="/deliverables"
-                  element={
-                    <DeliverablesPage
-                      historyVersion={socket.historyVersion}
-                      proposals={proposals}
-                      onSetReview={setProposalReview}
-                    />
-                  }
-                />
+                <Route path="/reports" element={<ReportsPage historyVersion={socket.historyVersion} />} />
+                <Route path="/reports/:id" element={<ReportsPage historyVersion={socket.historyVersion} />} />
                 <Route
                   path="/actions"
                   element={
-                    <ActionsPage
-                      historyVersion={socket.historyVersion}
-                      proposals={proposals}
-                      outcomes={outcomes}
-                      onSetReview={setProposalReview}
-                    />
+                    <ActionsPage historyVersion={socket.historyVersion} proposals={proposals} outcomes={outcomes} />
                   }
                 />
                 <Route
                   path="/actions/:id"
                   element={
-                    <ActionsPage
-                      historyVersion={socket.historyVersion}
-                      proposals={proposals}
-                      outcomes={outcomes}
-                      onSetReview={setProposalReview}
-                    />
+                    <ActionsPage historyVersion={socket.historyVersion} proposals={proposals} outcomes={outcomes} />
                   }
                 />
                 <Route

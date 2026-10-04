@@ -4,15 +4,15 @@
 // as the orchestrator (started from mainLoop) so it shares one SQLite
 // connection -- no multi-process file locking, no polling files.
 //
-// REST: read history (proposals, outcomes, lessons, research, runs), curate
-// the agent's memory, drive runtime controls, and submit review decisions.
+// REST: read history (ideas, reports, lessons, research, runs), curate the
+// agent's memory, drive runtime controls, and submit review decisions.
 // WebSocket: live rebroadcast of AgentEvents as the agent works, so the UI
 // updates without refreshing.
 //
 // Auth: everything under /api and the WebSocket upgrade sit behind a shared
 // token when AGENT_API_TOKEN is set. It's a single shared secret, not real
-// user auth -- enough to stop a device on the same network from approving a
-// side-effecting proposal, not enough to expose this to the internet. The
+// user auth -- enough to stop a device on the same network from approving
+// spend on your behalf, not enough to expose this to the internet. The
 // bind address defaults to loopback for the same reason.
 
 import express, { type NextFunction, type Request, type Response } from "express";
@@ -29,16 +29,16 @@ import {
   type MemoryStore,
   type Priority,
   type ProposalRow,
+  REPORT_VERDICTS,
+  parseSources,
 } from "./memory-server.js";
 import { emitAgentEvent, onAgentEvent, type AgentEvent } from "./events.js";
 import { submitDecision, hasPendingDecision } from "./review-gateway.js";
-import { fireReactiveTrigger } from "./reactive-triggers.js";
-import { ALL_GRANTABLE_TOOLS, toolRisk } from "./tool-catalog.js";
-import { configuredConnectorTools, connectorOperation, connectorStatus } from "./connectors/load.js";
+import { connectorStatus } from "./connectors/load.js";
 import { getSetting, listSettings, updateSettings } from "./settings.js";
 import { PROVIDERS, PROVIDER_IDS, resolveLlmClients } from "./llm/index.js";
 import { getSearchConfig } from "./search/index.js";
-import { buildDeliverables, type DeliverableOutcomeRow } from "./deliverables.js";
+import { buildLandscape } from "./landscape.js";
 import { isConsoleOnlyMode } from "./console-mode.js";
 import { CONSOLE_ONLY_WRITABLE_ROUTES, type ControlSettingsWriter } from "./control-settings-writer.js";
 import {
@@ -132,7 +132,7 @@ export function startServer(
   //
   // The allowlist is routes, not a general "control endpoints are fine": run-now and abort
   // are control endpoints too, and both would answer 200 while doing nothing at all in this
-  // mode (no loop is sleeping for run-now to wake, and no act phase is running to abort).
+  // mode (no loop is sleeping for run-now to wake, and no deep dive is running to abort).
   // A button that reports success and has no effect is worse than one that refuses. The
   // writer behind these routes enforces the same narrow vocabulary independently -- see
   // control-settings-writer.ts.
@@ -164,25 +164,6 @@ export function startServer(
       // write button and letting each one fail with a 403 toast once clicked.
       consoleOnly: isConsoleOnlyMode(),
     });
-  });
-
-  /**
-   * The tool catalog, so the console can badge which requested tools actually touch the world.
-   *
-   * `configured` is only ever false for a connector whose credential is missing. It's here
-   * because that's a fact the operator needs at decision time -- approving a proposal fenced
-   * to a tool with no key behind it produces an act phase that can only fail -- and the
-   * catalog is where the console already looks.
-   */
-  app.get("/api/tools", (_req, res) => {
-    const configured = new Set(configuredConnectorTools());
-    res.json(
-      ALL_GRANTABLE_TOOLS.map((name) => ({
-        name,
-        risk: toolRisk(name),
-        configured: !connectorOperation(name) || configured.has(name),
-      }))
-    );
   });
 
   /** Which connectors exist and which are still missing a key, for the Agent control page. */
@@ -249,8 +230,47 @@ export function startServer(
     res.json({ ok: true, settings: listSettings() });
   });
 
+  /** Every idea, each carrying its latest report's summary (no body) so tables need no second fetch. */
   app.get("/api/proposals", (_req, res) => {
-    res.json(store.listAllProposals());
+    const reports = store.latestReportsByProposal();
+    res.json(store.listAllProposals().map((p) => ({ ...p, latest_report: reports.get(p.id) ?? null })));
+  });
+
+  app.get("/api/proposals/:id/reports", (req, res) => {
+    res.json(store.listReportsForProposal(Number(req.params.id)).map((r) => ({ ...r, sources: parseSources(r) })));
+  });
+
+  // ---- reports (read-only: only the deep dive's report_submit writes these) -----
+
+  app.get("/api/reports", (req, res) => {
+    const goalId = req.query.goalId !== undefined ? Number(req.query.goalId) : undefined;
+    const verdict = typeof req.query.verdict === "string" ? req.query.verdict : undefined;
+    if (goalId !== undefined && !Number.isInteger(goalId)) {
+      res.status(400).json({ error: "`goalId` must be an integer." });
+      return;
+    }
+    if (verdict !== undefined && !(REPORT_VERDICTS as readonly string[]).includes(verdict)) {
+      res.status(400).json({ error: `\`verdict\` must be one of: ${REPORT_VERDICTS.join(", ")}.` });
+      return;
+    }
+    res.json(store.listReports({ goalId, verdict: verdict as (typeof REPORT_VERDICTS)[number] | undefined }));
+  });
+
+  app.get("/api/reports/:id", (req, res) => {
+    const report = store.getReport(Number(req.params.id));
+    if (!report) {
+      res.status(404).json({ error: "No such report." });
+      return;
+    }
+    const proposal = store.getProposal(report.proposal_id);
+    const goal = report.goal_id !== null ? store.getGoal(report.goal_id) : undefined;
+    res.json({
+      ...report,
+      sources: parseSources(report),
+      proposal_domain: proposal?.domain ?? null,
+      proposal_description: proposal?.description ?? null,
+      goal_title: goal?.title ?? null,
+    });
   });
 
   app.get("/api/proposals/:id/actions", (req, res) => {
@@ -271,7 +291,6 @@ export function startServer(
     scheduledAt?: string | null;
     recurrenceMs?: number | null;
     editedDescription?: string;
-    editedRequiredTools?: string[];
   }
 
   /** Shared by the single and bulk decision endpoints. Returns an error string, or null if valid. */
@@ -286,24 +305,6 @@ export function startServer(
     if (body.recurrenceMs != null && (!Number.isFinite(body.recurrenceMs) || body.recurrenceMs < MIN_RECURRENCE_MS)) {
       return `\`recurrenceMs\` must be at least ${MIN_RECURRENCE_MS}ms (5 minutes).`;
     }
-    if (body.editedRequiredTools !== undefined) {
-      if (
-        !Array.isArray(body.editedRequiredTools) ||
-        body.editedRequiredTools.some((t) => typeof t !== "string" || !t.trim())
-      ) {
-        return "`editedRequiredTools` must be an array of non-blank tool names.";
-      }
-      // A name outside the catalog is allowed through rather than rejected. It cannot
-      // grant anything -- agent-loop.ts dispatches by exact name, so an unrecognized
-      // entry simply never matches a tool -- and refusing it blocked legitimate cases
-      // (a catalog fetched before a tool was added, an operator who knows the name).
-      // The console badges it as unknown; this logs it so the same surprise is visible
-      // to anyone tailing stdout rather than watching the UI.
-      const unknown = body.editedRequiredTools.filter((t) => !ALL_GRANTABLE_TOOLS.includes(t.trim()));
-      if (unknown.length > 0) {
-        console.warn(`[server] approved required_tools include names not in the catalog: ${unknown.join(", ")}`);
-      }
-    }
     if (body.editedDescription !== undefined && typeof body.editedDescription !== "string") {
       return "`editedDescription` must be a string.";
     }
@@ -313,7 +314,7 @@ export function startServer(
   app.post("/api/proposals/:id/decision", (req, res) => {
     const id = Number(req.params.id);
     if (!hasPendingDecision(id)) {
-      res.status(409).json({ error: "No pending decision for this proposal (already decided, or not up for review)." });
+      res.status(409).json({ error: "No pending decision for this idea (already decided, or not up for review)." });
       return;
     }
     const body = req.body as DecisionBody;
@@ -326,7 +327,7 @@ export function startServer(
     res.json({ ok: true });
   });
 
-  /** Approve or reject several pending proposals at once -- same validation, applied per id. */
+  /** Approve or reject several pending ideas at once -- same validation, applied per id. */
   app.post("/api/proposals/bulk-decision", (req, res) => {
     const { ids, ...rest } = req.body as DecisionBody & { ids?: number[] };
     if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => !Number.isInteger(id))) {
@@ -338,7 +339,7 @@ export function startServer(
       res.status(400).json({ error });
       return;
     }
-    // Scope edits are per-proposal by nature, so they're not accepted in bulk.
+    // Description edits are per-idea by nature, so they're not accepted in bulk.
     const decided: number[] = [];
     const skipped: number[] = [];
     for (const id of ids) {
@@ -352,78 +353,6 @@ export function startServer(
     res.json({ ok: true, decided, skipped });
   });
 
-  /**
-   * Edit an approved proposal's scope before it runs.
-   *
-   * Approving used to be the only moment scope was editable, which made a scheduled or
-   * queued proposal un-narrowable: the operator could see it was about to do something
-   * slightly wrong and their only lever was cancelling the schedule. This reopens that
-   * window for exactly as long as it's meaningful -- until an act phase has actually
-   * started. After that, narrowing can't un-commit anything and widening would authorise
-   * work retroactively, so it stays closed.
-   *
-   * Pending proposals don't come through here: their scope travels with the approval
-   * decision (POST /decision), which applies edits before the status flips so a proposal
-   * is never approved while still carrying its pre-edit fence.
-   */
-  app.post("/api/proposals/:id/scope", (req, res) => {
-    const id = Number(req.params.id);
-    const proposal = store.getProposal(id);
-    if (!proposal) {
-      res.status(404).json({ error: "No such proposal." });
-      return;
-    }
-    if (proposal.status !== "approved") {
-      res.status(409).json({
-        error:
-          proposal.status === "pending"
-            ? "Edit a pending proposal's scope as part of approving it, not here."
-            : `Cannot edit scope on a ${proposal.status} proposal.`,
-      });
-      return;
-    }
-    if (getControlState().runningProposalId === id) {
-      res.status(409).json({ error: "This proposal's act phase is running; abort it first." });
-      return;
-    }
-    if (store.hasActed(id)) {
-      res.status(409).json({ error: "This proposal has already acted; its scope can no longer be changed." });
-      return;
-    }
-
-    const { description, requiredTools } = req.body as { description?: string; requiredTools?: string[] };
-    if (description === undefined && requiredTools === undefined) {
-      res.status(400).json({ error: "Body must include `description` and/or `requiredTools`." });
-      return;
-    }
-    if (description !== undefined && (typeof description !== "string" || !description.trim())) {
-      res.status(400).json({ error: "`description` must be a non-blank string." });
-      return;
-    }
-    if (
-      requiredTools !== undefined &&
-      (!Array.isArray(requiredTools) || requiredTools.some((t) => typeof t !== "string" || !t.trim()))
-    ) {
-      res.status(400).json({ error: "`requiredTools` must be an array of non-blank tool names." });
-      return;
-    }
-    if (requiredTools) {
-      // Same rule as at approval time: an uncatalogued name is allowed but noted, since
-      // it can't grant anything the loop will actually dispatch.
-      const unknown = requiredTools.filter((t) => !ALL_GRANTABLE_TOOLS.includes(t.trim()));
-      if (unknown.length > 0) {
-        console.warn(`[server] proposal #${id} scope edited to include uncatalogued tools: ${unknown.join(", ")}`);
-      }
-    }
-
-    store.applyProposalEdits(id, { description, requiredTools });
-    const updated = store.getProposal(id)!;
-    // Same event the approval path emits, so the console's tables and any open dialog
-    // refresh through the existing historyVersion path rather than needing a new one.
-    emitAgentEvent({ type: "proposal_decided", proposal: updated });
-    res.json({ ok: true, proposal: updated });
-  });
-
   app.post("/api/proposals/:id/cancel-schedule", (req, res) => {
     const id = Number(req.params.id);
     if (!store.getProposal(id)) {
@@ -435,13 +364,9 @@ export function startServer(
   });
 
   /**
-   * Put an approved proposal back in the run queue.
-   *
-   * The manual half of `reapAfterUncleanShutdown`: a proposal whose act phase was interrupted
-   * or didn't finish is descheduled at startup rather than silently re-run, because re-running
-   * repeats real side effects. This is how it resumes, once a human has looked at what the
-   * previous attempt actually left behind. It only re-triggers already-approved work -- the
-   * approval itself is untouched, so this grants nothing.
+   * Put an approved idea back in the deep-dive queue: a retry after an unfinished deep dive, or
+   * a fresh report on one already investigated (filed beside the old one, which is kept). Only
+   * approved ideas qualify -- a deep dive costs money, and only an approval authorizes that.
    *
    * Not in CONSOLE_ONLY_WRITABLE_ROUTES on purpose, same reason as run-now: it needs a running
    * loop, and answering 200 while nothing is listening is worse than refusing.
@@ -454,39 +379,22 @@ export function startServer(
       return;
     }
     if (proposal.act_status === "running") {
-      res.status(409).json({ error: `Proposal #${id} is executing right now -- wait for it to finish, or abort it first.` });
+      res.status(409).json({ error: `Idea #${id} is being investigated right now -- wait for it to finish, or abort it first.` });
       return;
     }
     if (!store.requeueApprovedProposal(id)) {
-      res.status(409).json({ error: `Proposal #${id} is ${proposal.status}, not approved -- only approved work can be re-run.` });
+      res.status(409).json({ error: `Idea #${id} is ${proposal.status}, not approved -- only approved ideas get a deep dive.` });
       return;
     }
     const requeued = store.getProposal(id)!;
-    // Announced so the console reflects it: this is the event that says "this proposal has a run
+    // Announced so the console reflects it: this is the event that says "this idea has a run
     // due", the same one a future-dated approval emits, and it's in the set that invalidates the
     // REST caches -- without it the button would work and the page would look unchanged.
     emitAgentEvent({ type: "proposal_scheduled", proposal: requeued });
     res.json({ ok: true, proposal: requeued });
   });
 
-  app.post("/api/proposals/:id/review", (req, res) => {
-    const id = Number(req.params.id);
-    const { reviewStatus } = req.body as { reviewStatus?: "mvp_done" | "needs_refinement" | null };
-    if (reviewStatus !== null && reviewStatus !== "mvp_done" && reviewStatus !== "needs_refinement") {
-      res.status(400).json({ error: "Body must include `reviewStatus`: 'mvp_done', 'needs_refinement', or null." });
-      return;
-    }
-    if (!store.getProposal(id)) {
-      res.status(404).json({ error: "No such proposal." });
-      return;
-    }
-    store.setProposalReview(id, reviewStatus);
-    if (reviewStatus === "needs_refinement") {
-      fireReactiveTrigger({ proposalId: id, reason: "needs_refinement" });
-    }
-    res.json({ ok: true });
-  });
-
+  /** Legacy: outcomes recorded by build-mode act phases. Nothing writes these any more. */
   app.get("/api/outcomes", (_req, res) => {
     res.json(store.listOutcomes());
   });
@@ -605,35 +513,18 @@ export function startServer(
     res.json(store.listActionsForApprovedProposals());
   });
 
-  /**
-   * What the agent has actually built, one record per approved proposal that produced
-   * something reachable. Derived on read from the same action rows the Actions page
-   * shows -- no separate state to keep in step -- but the heavy JSON (committed file
-   * contents, fetched pages) is parsed here and never crosses the wire.
-   */
-  app.get("/api/deliverables", (_req, res) => {
-    res.json(
-      buildDeliverables(
-        store.listDeliverableActions(),
-        store.listAllProposals(),
-        store.listOutcomes() as unknown as DeliverableOutcomeRow[],
-        store.actActionCounts()
-      )
-    );
-  });
-
   // ---- runtime control ------------------------------------------------------
   //
   // Everything here either reduces what the agent does (pause, abort) or changes
-  // what it researches (domains, directive, interval). None of it can approve a
-  // proposal or widen the act-phase fence -- those stay with the review flow.
+  // what it researches (domains, directive, interval). None of it can approve an
+  // idea -- that stays with the review flow.
 
   app.get("/api/control", (_req, res) => {
     res.json(getControlState());
   });
 
   /**
-   * What is building, what is next, and roughly how long it takes.
+   * Which deep dive is running, what is next, and roughly how long one takes.
    *
    * Assembled from two sources that answer different halves. The in-memory control state knows
    * what this process is *doing* -- which proposal the worker holds and which ids are queued
@@ -666,18 +557,17 @@ export function startServer(
 
     // Due later and not yet handed to the worker. `schedulerTick` moves these across when their
     // time arrives, so from the operator's side it's the same queue one step further out --
-    // showing only the in-memory half would hide every scheduled and recurring build.
+    // showing only the in-memory half would hide every scheduled and recurring deep dive.
     const inFlight = new Set([...control.queuedProposalIds, control.runningProposalId]);
     const scheduled = store
       .listAllProposals()
       .filter((p) => p.status === "approved" && p.next_run_at && !inFlight.has(p.id))
       .sort(compareByPriorityThenDue);
 
-    // Approved work with nothing scheduling it: an act phase that was interrupted or didn't
-    // finish is descheduled rather than silently re-run, which means it will sit here forever
-    // until a human says so. That is the intended behaviour and it is also the easiest state to
-    // forget about, so the queue view names it rather than leaving it to be inferred from an
-    // absence.
+    // Approved ideas with nothing scheduling them: a deep dive that ended without a report (or
+    // was interrupted by a graceful shutdown) sits here until a human re-runs it. It is the
+    // easiest state to forget about, so the queue view names it rather than leaving it to be
+    // inferred from an absence.
     const stalled = store.listStalledBuilds().filter((p) => !inFlight.has(p.id));
 
     res.json({
@@ -687,7 +577,7 @@ export function startServer(
       queued: queued.map(summarize),
       scheduled: scheduled.map(summarize),
       stalled: stalled.map(summarize),
-        // Scoped when an act-phase model is pinned, unfiltered otherwise -- `actModel` is empty
+      // Scoped when a deep-dive model is pinned, unfiltered otherwise -- `actModel` is empty
       // whenever the phase just uses AGENT_MODEL, and filtering on "" would match nothing.
       forecast: store.actDurationStats({ model: actModel }),
       forecastAllModels: store.actDurationStats({}),
@@ -717,11 +607,11 @@ export function startServer(
     const { proposalId } = req.body as { proposalId?: number };
     const running = getControlState().runningProposalId;
     if (running === null) {
-      res.status(409).json({ error: "No act phase is currently running." });
+      res.status(409).json({ error: "No deep dive is currently running." });
       return;
     }
     if (proposalId !== undefined && proposalId !== running) {
-      res.status(409).json({ error: `Proposal #${proposalId} is not the one currently running (#${running}).` });
+      res.status(409).json({ error: `Idea #${proposalId} is not the one currently being investigated (#${running}).` });
       return;
     }
     requestAbort(running);
@@ -736,6 +626,29 @@ export function startServer(
 
   app.get("/api/goals", (_req, res) => {
     res.json({ goals: store.listGoals(), health: store.goalHealth() });
+  });
+
+  /**
+   * One goal's market landscape: its notes grouped by kind, its ideas with their market blocks
+   * and latest reports, and the competitors those ideas named. Only rows filed under the goal
+   * (`goal_id`) -- legacy unassigned notes aren't guessed into it.
+   */
+  app.get("/api/goals/:id/landscape", (req, res) => {
+    const id = Number(req.params.id);
+    const goal = store.getGoal(id);
+    if (!goal) {
+      res.status(404).json({ error: "No such goal." });
+      return;
+    }
+    res.json({
+      goal,
+      health: store.goalHealth().find((h) => h.goal_id === id) ?? null,
+      ...buildLandscape({
+        notes: store.listResearchNotesForGoal(id),
+        proposals: store.listProposalsForGoal(id),
+        reports: store.latestReportsByProposal(),
+      }),
+    });
   });
 
   app.post("/api/goals", (req, res) => {

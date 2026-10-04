@@ -250,8 +250,9 @@ export function SettingsPage() {
                     children: (
                       <>
                         <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
-                          The phases want different things: research is long and wide, act writes real code with no
-                          build step to catch a mistake, reflect is two short memory calls. Anything left empty
+                          The phases want different things: research is long and wide, the deep dive is the longest
+                          and most source-heavy and its report is what you act on, reflect is two short memory calls.
+                          Anything left empty
                           inherits the base provider and model above.
                         </Typography.Paragraph>
                         {overrideSettings.map(field)}

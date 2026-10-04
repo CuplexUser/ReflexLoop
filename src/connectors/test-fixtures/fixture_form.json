@@ -1,0 +1,39 @@
+{
+  "id": "fixture_form",
+  "label": "Fixture (form-encoded)",
+  "baseUrl": "https://api.fixture.example",
+  "auth": { "type": "bearer", "envVar": "FIXTURE_FORM_TOKEN" },
+  "encoding": "form",
+  "operations": [
+    {
+      "name": "fixture_form_post",
+      "risk": "read",
+      "description": "Test fixture: a form-encoded POST whose params go out under bracketed wire names.",
+      "method": "POST",
+      "path": "/v1/orders",
+      "params": {
+        "priceId": { "type": "string", "in": "body", "as": "line_items[0][price]", "required": true },
+        "quantity": { "type": "integer", "in": "body", "as": "line_items[0][quantity]", "default": 1 }
+      }
+    },
+    {
+      "name": "fixture_form_list",
+      "risk": "read",
+      "description": "Test fixture: a plain GET.",
+      "method": "GET",
+      "path": "/v1/products"
+    },
+    {
+      "name": "fixture_form_typed",
+      "risk": "read",
+      "description": "Test fixture: typed params.",
+      "method": "POST",
+      "path": "/v1/prices",
+      "params": {
+        "product": { "type": "string", "in": "body", "required": true },
+        "unitAmount": { "type": "integer", "in": "body", "as": "unit_amount", "required": true },
+        "currency": { "type": "string", "in": "body", "required": true }
+      }
+    }
+  ]
+}

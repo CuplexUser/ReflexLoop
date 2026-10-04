@@ -13,9 +13,9 @@ import { READ_ONLY_HINT, useConsoleOnly } from '../consoleOnly'
  * proposals rather than any one that already exists (which the review flow already handles, with a
  * reason that becomes a lesson).
  *
- * Both levers here only redirect what the agent *researches*. Neither approves a proposal nor
- * widens the act-phase fence — a "make this happen" button would break the invariant the rest of
- * the design assumes, so the strongest thing on this card is a sentence handed to a prompt.
+ * Both levers here only redirect what the agent *researches*. Neither approves an idea — a
+ * "make this happen" button would break the invariant the rest of the design assumes, so the
+ * strongest thing on this card is a sentence handed to a prompt.
  *
  * The two differ in how long they last, which is a real choice and so is made explicit rather than
  * picked silently:
