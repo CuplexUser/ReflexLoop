@@ -13,9 +13,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "smoke-test": "tsx src/smoke-test.ts",
-    "web:dev": "npm run -w web dev",
-    "web:build": "npm run -w web build",
-    "web:lint": "npm run -w web lint"
+    "dev": "npm run -w web dev",
+    "build": "npm run -w web build",
+    "web": "npm run -w web lint"
   },
   "keywords": [],
   "author": "",
